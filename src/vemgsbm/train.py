@@ -1,0 +1,359 @@
+"""Paired conditional variational GSBM: CondSOC followed by neural drift matching.
+
+The empirical LR/HR pairing stays fixed. This is the paired restoration
+specialization, not the upstream unpaired alternating endpoint-coupling solver.
+No IPF or invertible-coordinate bridge is used.
+"""
+import argparse
+import copy
+import json
+import math
+from pathlib import Path
+
+import torch
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
+
+from .datasets import training_data
+from .distributed import initialize_distributed, ValidationShardSampler
+from .metric import Representation, representation_loss, fit_metric, metric_payload, metric_from_payload
+from .bridge import reconstruct
+from .network import DriftNetwork, integrate
+from .paths import optimize_path, sample_path
+from .runtime import read_config, project_path, setup, atomic_save, load_checkpoint, sampling_geometry_guidance
+
+
+class RepresentationObjective(nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, hr):
+        return representation_loss(self.encoder, hr)
+
+
+class MatchingObjective(nn.Module):
+    def __init__(self, model, metric_weight=0.0, ramp_power=0.0):
+        super().__init__()
+        self.model = model
+        self.metric_weight = metric_weight
+        self.ramp_power = ramp_power
+
+    def forward(self, state, base, mask, time, forward_target, backward_target, geometry=None):
+        free = 1 - mask
+        denom = free.sum().clamp_min(1)
+        forward = self.model(state, base, mask, time, "forward")
+        backward = self.model(state, base, mask, time, "backward")
+        ef, eb = forward - forward_target, backward - backward_target
+        lf = (ef.square() * free).sum() / denom
+        lb = (eb.square() * free).sum() / denom
+        terms = {"loss": (lf + lb) / 2, "forward_matching": lf, "backward_matching": lb}
+        if self.metric_weight:
+            if geometry is None:
+                raise ValueError("Metric drift matching requires a bound MLS chart mixture")
+            weight = time.pow(self.ramp_power)
+            metric_forward, metric_backward = geometry.drift_costs(state, ef * free, eb * free)
+            metric_loss = ((metric_forward + metric_backward) * weight).mean() / 2
+            terms["metric_matching"] = metric_loss
+            terms["loss"] = terms["loss"] + self.metric_weight * metric_loss
+        return terms
+
+
+def _collect_metric(encoder, loader, cfg, context):
+    limit = cfg["representation"].get("bank_samples", 1024)
+    local_limit = max(1, (limit + context.world_size - 1) // context.world_size)
+    features = []
+    count = 0
+    encoder.eval()
+    with torch.no_grad():
+        for batch in loader:
+            value = encoder(batch["hr"].to(context.device))
+            features.append(value[:local_limit - count].cpu())
+            count += len(features[-1])
+            if count >= local_limit:
+                break
+    local = torch.cat(features)
+    if context.is_distributed:
+        gathered = [None] * context.world_size
+        torch.distributed.all_gather_object(gathered, local)
+    else:
+        gathered = [local]
+
+    def fit():
+        bank = torch.cat(gathered)[:limit].to(context.device)
+        metric = fit_metric(encoder, bank, clusters=cfg["representation"].get("clusters", 32),
+                            seed=cfg["train"]["seed"])
+        return metric_payload(metric)
+    return context.main_call(fit, broadcast_result=True)
+
+
+def run_training(config_path, stage="bridge", device_name="auto", resume=None, case_inventory=None):
+    cfg = read_config(config_path)
+    atlas_options = cfg.get("atlas")
+    online_guidance = sampling_geometry_guidance(cfg)
+    source_routing = bool(atlas_options and atlas_options.get("source_routing"))
+    matching_weight = float(cfg["train"].get("metric_matching_weight", 0.0))
+    if not math.isfinite(matching_weight) or matching_weight < 0 or (matching_weight and not source_routing):
+        raise ValueError("metric_matching_weight must be nonnegative and requires LR chart routing")
+    if cfg["mode"] != "gsbm" and not (atlas_options and stage == "representation"):
+        raise ValueError("Use vemgsbm.momentum.train for momentum configs")
+    if stage not in {"representation", "bridge"}:
+        raise ValueError("Unknown stage")
+    cfg["train"]["epochs"] = cfg["train"].get(stage + "_epochs", cfg["train"]["epochs"])
+    context = initialize_distributed(device_name)
+    run_dir = project_path(cfg["run_dir"]) / stage
+    lock = None
+
+    def prepare():
+        nonlocal lock
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if (run_dir / "last.pt").exists() and not resume:
+            raise FileExistsError("Existing run requires --resume or a new run_dir")
+        lock = (run_dir / ".training.lock").open("x")
+        atomic_save(cfg, run_dir / "config.json", json_file=True)
+
+    try:
+        context.assert_same((cfg, stage, resume), "config/stage/resume")
+        context.main_call(prepare)
+        device = setup(cfg["train"]["seed"], str(context.device), cfg["train"].get("threads", 4))
+        if case_inventory is None:
+            prepared = context.main_call(lambda: training_data(cfg), broadcast_result=True)
+        else:
+            # The Slurm preflight ran before NCCL. Each rank reads the compact
+            # inventory locally instead of broadcasting millions of paths.
+            prepared, error = None, None
+            try:
+                prepared = training_data(cfg, case_inventory)
+            except Exception as exc:
+                error = f"Prepared MRI inventory: {type(exc).__name__}: {exc}"
+            context.check_errors(error)
+        train_set, val_set, digest, identity = prepared
+        if case_inventory is not None:
+            context.assert_same(digest, "MRI inventory identity")
+        if len(train_set) % context.world_size:
+            raise ValueError("Global patch budget must divide WORLD_SIZE")
+        sampler = DistributedSampler(train_set, context.world_size, context.rank, seed=cfg["train"]["seed"]) if context.is_distributed else None
+        loader = DataLoader(train_set, batch_size=cfg["train"]["batch_size"], sampler=sampler,
+                            shuffle=sampler is None, num_workers=cfg["train"].get("workers", 0),
+                            generator=torch.Generator().manual_seed(cfg["train"]["seed"]),
+                            pin_memory=device.type == "cuda")
+        val_loader = DataLoader(val_set, batch_size=cfg["train"]["batch_size"],
+                               sampler=ValidationShardSampler(val_set, context.rank, context.world_size), num_workers=0)
+        encoder = Representation(width=cfg["representation"]["width"],
+                                 feature_dim=cfg["representation"]["feature_dim"],
+                                 packed_xy=bool(atlas_options)).to(device)
+        model, metric = None, None
+        atlas_payload = None
+        if stage == "representation":
+            objective = RepresentationObjective(encoder)
+        else:
+            if atlas_options:
+                from .atlas_geometry import load_mri_atlas
+                atlas_payload, metric = load_mri_atlas(cfg, digest, identity, device)
+            else:
+                saved_rep = load_checkpoint(project_path(cfg["representation"]["checkpoint"]))
+                if saved_rep.get("stage") != "representation" or saved_rep.get("metric") is None:
+                    raise ValueError("Bridge training requires a completed representation checkpoint with a fitted metric")
+                if saved_rep["manifest_sha256"] != digest or saved_rep["data_identity"] != identity:
+                    raise ValueError("Representation data identity differs")
+                if saved_rep["config"]["data"] != cfg["data"]:
+                    raise ValueError("Representation input contract differs")
+                metric = metric_from_payload(saved_rep["metric"], device=device)
+            model = DriftNetwork(cfg["model"]["width"]).to(device)
+            objective = MatchingObjective(model, matching_weight,
+                                          cfg["path"].get("geometry_ramp_power", 0.0))
+        parameters = list(objective.parameters())
+        optimizer = torch.optim.AdamW(parameters, lr=cfg["train"]["learning_rate"], weight_decay=1e-5)
+        start, best = 0, float("inf")
+        if resume:
+            old = load_checkpoint(project_path(resume))
+            if old["training_stage"] != stage or old["manifest_sha256"] != digest or old["data_identity"] != identity:
+                raise ValueError("Resume identity differs")
+            if old["world_size"] != context.world_size:
+                raise ValueError("Resume requires the same WORLD_SIZE")
+            current, previous = copy.deepcopy(cfg), copy.deepcopy(old["config"])
+            for value in (current, previous):
+                for key in ("epochs", "representation_epochs", "bridge_epochs"):
+                    value["train"].pop(key, None)
+            if current != previous:
+                raise ValueError("Resume config changed beyond epoch budget")
+            if atlas_payload is not None:
+                fields = ("atlas_version", "source_routing_version")
+                if any(old["metric"]["diagnostics"].get(key) != atlas_payload["diagnostics"].get(key)
+                       for key in fields):
+                    raise ValueError("Resume requires the original MRI atlas and LR chart routing")
+            (encoder if stage == "representation" else model).load_state_dict(old["model"])
+            optimizer.load_state_dict(old["optimizer"])
+            start, best = old["epoch"], old["best"]
+        raw_objective = objective
+        if context.is_distributed:
+            objective = DistributedDataParallel(objective, device_ids=[context.local_rank] if device.type == "cuda" else None,
+                                                broadcast_buffers=False)
+        if context.is_main:
+            print(json.dumps({"stage": stage, "world_size": context.world_size,
+                              "per_rank_batch": cfg["train"]["batch_size"],
+                              "global_patches": len(train_set), "method": "paired conditional variational GSBM",
+                              "geometry": "source_conditioned_mls" if source_routing else ("mls" if atlas_options else "land"),
+                              "atlas": atlas_payload["diagnostics"] if atlas_payload else None}), flush=True)
+        for epoch in range(start, cfg["train"]["epochs"]):
+            torch.manual_seed(cfg["train"]["seed"] + epoch + 100003 * context.rank)
+            loader.generator.manual_seed(cfg["train"]["seed"] + epoch)
+            train_set.set_epoch(epoch)
+            if sampler:
+                sampler.set_epoch(epoch)
+            objective.train()
+            totals = {}
+            count = 0
+            iterator = iter(loader)
+            for iteration in range(len(loader)):
+                error = None
+                try:
+                    batch = next(iterator)
+                    hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
+                    path_diagnostics = {}
+                    if stage == "bridge":
+                        geometry = metric.bind(base if source_routing else hr) if atlas_options else metric
+                        path, path_diagnostics = optimize_path(base, hr, mask, geometry, cfg["path"])
+                        cutoff = cfg["train"].get("matching_time_min", 0.02)
+                        times = torch.rand(len(hr), device=device) * (1 - 2 * cutoff) + cutoff
+                        noise = torch.randn_like(hr)
+                        state, forward_target = sample_path(path, times, noise=noise, direction="forward")
+                        _, backward_target = sample_path(path, times, noise=noise, direction="backward")
+                except Exception as exc:
+                    error = f"Batch/path: {type(exc).__name__}: {exc}"
+                context.check_errors(error)
+                optimizer.zero_grad(set_to_none=True)
+                error = None
+                try:
+                    terms = objective(hr) if stage == "representation" else objective(
+                        state.detach(), base, mask, times, forward_target.detach(), backward_target.detach(),
+                        geometry=geometry if source_routing else None)
+                    loss = terms["loss"]
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError("Nonfinite matching/representation loss")
+                except Exception as exc:
+                    error = f"Forward: {type(exc).__name__}: {exc}"
+                context.check_errors(error)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+                optimizer.step()
+                for key, value in terms.items():
+                    totals[key] = totals.get(key, 0.0) + float(value.detach()) * len(hr)
+                for key, value in path_diagnostics.items():
+                    if isinstance(value, (int, float)):
+                        totals["path_" + key] = totals.get("path_" + key, 0.0) + value * len(hr)
+                count += len(hr)
+            keys = sorted(totals)
+            reduced = context.sum([count] + [totals[k] for k in keys])
+            count, values = int(reduced[0]), reduced[1:]
+            if count != len(train_set):
+                raise RuntimeError("DDP training sample count mismatch")
+            record = {"epoch": epoch + 1, "train_items": count, "world_size": context.world_size,
+                      **{k: v / count for k, v in zip(keys, values)}}
+            raw_objective.eval()
+            total, unguided_total, guidance_delta, items, error = 0.0, 0.0, 0.0, 0, None
+            try:
+                val_seed = cfg["train"]["seed"] + 12345 + context.rank
+                torch.manual_seed(val_seed)
+                if online_guidance and stage == "bridge":
+                    guided_rng = torch.Generator(device=device).manual_seed(val_seed)
+                    unguided_rng = torch.Generator(device=device).manual_seed(val_seed)
+                with torch.no_grad():
+                    for batch in val_loader:
+                        hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
+                        if stage == "representation":
+                            value = representation_loss(encoder, hr)["loss"]
+                        elif online_guidance:
+                            steps, sigma = cfg["sampling"]["steps"], cfg["sampling"]["sigma"]
+                            prediction = reconstruct(model, base, mask, geometry=metric, steps=steps, sigma=sigma,
+                                                     generator=guided_rng, terminal_noise=False,
+                                                     geometry_guidance=online_guidance)
+                            unguided = integrate(model, base, base, mask, steps, sigma,
+                                                 generator=unguided_rng, terminal_noise=False)
+                            free = 1 - mask
+                            denom = free.sum().clamp_min(1)
+                            value = ((prediction.clamp(0, 1) - hr).square() * free).sum() / denom
+                            reference = ((unguided.clamp(0, 1) - hr).square() * free).sum() / denom
+                            unguided_total += float(reference) * len(hr)
+                            delta = ((prediction - unguided).square() * free).sum() / denom
+                            guidance_delta += float(delta) * len(hr)
+                        else:
+                            prediction = integrate(model, base, base, mask,
+                                                   cfg["sampling"]["steps"], cfg["sampling"]["sigma"],
+                                                   terminal_noise=not atlas_options)
+                            value = ((prediction.clamp(0, 1) - hr).square() * (1 - mask)).sum() / (1 - mask).sum().clamp_min(1)
+                        total += float(value) * len(hr)
+                        items += len(hr)
+            except Exception as exc:
+                error = f"Validation: {type(exc).__name__}: {exc}"
+            context.check_errors(error)
+            total, items, unguided_total, guidance_delta = context.sum([total, items, unguided_total, guidance_delta])
+            if int(items) != len(val_set) or not all(map(math.isfinite, (total, unguided_total, guidance_delta))):
+                raise RuntimeError("Invalid validation accounting/score")
+            validation = total / items
+            improved = validation < best
+            best = min(best, validation)
+            record.update(validation=validation, validation_items=int(items))
+            if online_guidance and stage == "bridge":
+                record["validation_without_online_guidance"] = unguided_total / items
+                record["validation_guidance_delta_rms"] = math.sqrt(guidance_delta / items)
+            # Fit only on distributed TRAIN HR features; validation selects the
+            # encoder checkpoint, never contributes centers or metric statistics.
+            payload = atlas_payload
+            if stage == "representation":
+                if atlas_options:
+                    from .atlas_geometry import collect_features, fit_mri_atlas
+                    limit = cfg["representation"]["bank_samples"]
+                    local_limit = (limit + context.world_size - 1) // context.world_size
+                    features = collect_features(encoder, loader, local_limit, context, paired=source_routing)
+                    bank, sources = features if source_routing else (features, None)
+                    bank = bank[:limit]
+                    held_out = collect_features(encoder, val_loader, len(val_set), context)
+                    payload = context.main_call(
+                        lambda: fit_mri_atlas(encoder, bank, held_out, atlas_options, cfg["train"]["seed"],
+                                              source_features=sources[:limit] if sources is not None else None),
+                        broadcast_result=True,
+                    )
+                    record["atlas"] = payload["diagnostics"]
+                else:
+                    payload = _collect_metric(encoder, loader, cfg, context)
+            elif not atlas_options:
+                payload = metric_payload(metric)
+
+            def save():
+                checkpoint = {"format_version": 2, "algorithm": "paired_conditional_variational_gsbm",
+                              "stage": "representation" if stage == "representation" else "reconstruction",
+                              "training_stage": stage, "config": cfg, "epoch": epoch + 1,
+                              "model": (encoder if stage == "representation" else model).state_dict(),
+                              "optimizer": optimizer.state_dict(), "best": best, "world_size": context.world_size,
+                              "manifest_sha256": digest, "data_identity": identity,
+                              "metric": payload}
+                atomic_save(checkpoint, run_dir / "last.pt")
+                if improved:
+                    atomic_save(checkpoint, run_dir / "best.pt")
+                with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record) + "\n")
+                print(json.dumps(record), flush=True)
+            context.main_call(save)
+        return run_dir
+    finally:
+        if lock is not None:
+            lock.close()
+            (run_dir / ".training.lock").unlink(missing_ok=True)
+        context.cleanup()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--stage", choices=["representation", "bridge"], default="bridge")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--resume")
+    parser.add_argument("--case-inventory")
+    args = parser.parse_args()
+    run_training(args.config, args.stage, args.device, args.resume, args.case_inventory)
+
+
+if __name__ == "__main__":
+    main()

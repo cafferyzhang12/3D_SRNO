@@ -1,0 +1,84 @@
+mode: momentum
+run_dir: runs/mri/mri_x4_momentum_tdm
+data:
+  kind: paired_mri_png
+  degradation: paired_xy
+  scale: 4
+  patch_size:
+  - 5
+  - 128
+  - 128
+  channel_policy: identical_rgb_to_gray
+  scan_workers: 4
+  train:
+    root_lq: data/MRI_SR/train/LQ/X4_png
+    root_hq: data/MRI_SR/train/HQ_png
+  val:
+    root_lq: data/MRI_SR/val_small/LQ/X4_png
+    root_hq: data/MRI_SR/val_small/HQ_png
+  test:
+    root_lq: data/MRI_SR/test/LQ/X4_png
+    root_hq: data/MRI_SR/test/HQ_png
+  scan_cache:
+    train: reports/mri/momentum_tdm_x4/index_train.json
+    val: reports/mri/momentum_tdm_x4/index_val.json
+    test: reports/mri/momentum_tdm_x4/index_test.json
+  legacy_scan_cache:
+    train: data/private/scan_train.json
+    val: data/private/scan_val.json
+    test: data/private/scan_test.json
+model:
+  width: 24
+path:
+  sigma: 0.15
+  iterations: 5
+  quadrature: 5
+  lr: 0.08
+  backtracking_steps: 5
+  state_weight: 0.005
+  normal_weight: 0.002
+  max_shift: 0.5
+train:
+  epochs: 40
+  batch_size: 4
+  train_samples: 1
+  val_samples: 1
+  samples_per_epoch: 4096
+  val_samples_per_epoch: 64
+  learning_rate: 0.0001
+  workers: 2
+  threads: 4
+  seed: 42
+  validate_every: 1
+  bridge_epochs: 40
+sampling:
+  steps: 20
+  sigma: 0.15
+test:
+  fraction: 0.1
+  subset_seed: 20261110
+  save_volume_limit: 8
+atlas:
+  charts: 48
+  neighborhoods:
+  - 48
+  - 144
+  - 384
+  dim_candidates:
+  - 2
+  - 3
+  - 4
+  - 6
+  mls:
+    degree: 2
+    neighbors: 128
+    anchor_limit: 24
+    ridge: 0.0001
+  bank_patches: 1024
+  source_routing:
+    candidates: 3
+    correction_limit: 0.5
+chart_momentum:
+  warp_strength: 0.75
+  normal_noise_ratio: 0.75
+  scale_floor: 0.015

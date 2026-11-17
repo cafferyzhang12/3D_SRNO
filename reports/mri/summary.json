@@ -1,0 +1,21 @@
+{
+  "evaluation": "paired MRI XY x4 held-out test",
+  "results": {
+    "endpoint": {
+      "cases": 84,
+      "test_fraction": 0.15,
+      "total_slices": 14991,
+      "all_mse": 0.0009482135597346183,
+      "all_psnr_db": 30.230938384329935,
+      "mean_slice_ssim": 0.8631643731271176
+    },
+    "momentum": {
+      "cases": 84,
+      "test_fraction": 0.15,
+      "total_slices": 14991,
+      "all_mse": 0.00199127266932376,
+      "all_psnr_db": 27.00869267006919,
+      "mean_slice_ssim": 0.8326765667601025
+    }
+  }
+}

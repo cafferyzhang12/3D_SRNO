@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "vem-gsbm"
+version = "0.2.0"
+description = "Paired 3D MRI super-resolution with conditional Schrodinger bridges"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.3", "numpy>=1.24", "PyYAML>=6", "Pillow>=9.5", "scikit-image>=0.20", "tifffile", "h5py"]
+
+[project.optional-dependencies]
+atlas = ["neural-atlas-lab==0.1.0"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vemgsbm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

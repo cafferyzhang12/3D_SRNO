@@ -1,0 +1,70 @@
+# Relative paths resolve from the isolated vem_gsbm project directory.
+mode: gsbm
+run_dir: runs/mri/mri_x4_gsbm
+data:
+  kind: paired_mri_png
+  degradation: paired_xy
+  scale: 4
+  patch_size: [5, 128, 128]
+  channel_policy: identical_rgb_to_gray
+  scan_workers: 4
+  train:
+    root_lq: data/MRI_SR/train/LQ/X4_png
+    root_hq: data/MRI_SR/train/HQ_png
+  val:
+    root_lq: data/MRI_SR/val_small/LQ/X4_png
+    root_hq: data/MRI_SR/val_small/HQ_png
+  test:
+    root_lq: data/MRI_SR/test/LQ/X4_png
+    root_hq: data/MRI_SR/test/HQ_png
+  scan_cache:
+    train: reports/mri/x4/index_train.json
+    val: reports/mri/x4/index_val.json
+    test: reports/mri/x4/index_test.json
+  # Read-only version-1 scanner caches with an entries field.
+  legacy_scan_cache:
+    train: data/private/scan_train.json
+    val: data/private/scan_val.json
+    test: data/private/scan_test.json
+model:
+  width: 16
+representation:
+  width: 8
+  feature_dim: 32
+  clusters: 32
+  bank_samples: 1024
+  checkpoint: null
+path:
+  knots: 5
+  iterations: 5
+  lr: 0.02
+  quadrature: 5
+  optimize_std: true
+  std_bound: 0.75
+  sigma: 0.1
+  state_weight: 0.01
+  metric_weight: 0.01
+  control_weight: 1.0
+  max_correction: 0.25
+train:
+  representation_epochs: 10
+  bridge_epochs: 40
+  epochs: 40
+  batch_size: 4
+  train_samples: 1
+  val_samples: 1
+  samples_per_epoch: 4096
+  val_samples_per_epoch: 64
+  learning_rate: 0.0001
+  matching_time_min: 0.02
+  workers: 2
+  threads: 4
+  seed: 42
+  validate_every: 1
+sampling:
+  steps: 20
+  sigma: 0.1
+test:
+  fraction: 0.15
+  subset_seed: 20261110
+  save_volume_limit: 8
