@@ -47,7 +47,13 @@ def prepare_inventory(config_path, output_path):
 def load_inventory(path, data, splits):
     with gzip.open(project_path(path), "rt", encoding="utf-8") as stream:
         payload = json.load(stream)
-    if payload.get("version") != 1 or payload.get("data") != data:
+    # Cache filenames can differ between historical methods on the same images.
+    # Roots, scale, normalization, patch and debug limits remain part of the contract.
+    def data_contract(settings):
+        return {key: value for key, value in settings.items()
+                if key not in {"scan_cache", "legacy_scan_cache"}}
+
+    if payload.get("version") != 1 or data_contract(payload["data"]) != data_contract(data):
         raise ValueError("MRI case inventory and configured data contract differ")
     cases, identity = {}, []
     for split, rows in payload["splits"].items():

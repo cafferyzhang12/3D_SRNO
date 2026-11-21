@@ -8,6 +8,7 @@ import argparse
 import copy
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 
@@ -92,14 +93,14 @@ def _collect_metric(encoder, loader, cfg, context):
     return context.main_call(fit, broadcast_result=True)
 
 
-def _whole_case_validation(model, cases, cfg, context, run_dir, epoch):
+def _whole_case_validation(model, cases, cfg, context, run_dir, epoch, atlas=None):
     from .mri_infer import _infer_case
 
     records, error = [], None
     try:
         for case in cases[context.rank::context.world_size]:
             with tempfile.TemporaryDirectory(dir=run_dir) as temp:
-                _, row = _infer_case(case, Path(temp) / case.id, model, None,
+                _, row = _infer_case(case, Path(temp) / case.id, model, atlas,
                                      {**cfg, "inference_variant": "endpoint_safe"}, context.device,
                                      cfg["train"].get("validation_seed", 42), cfg["sampling"]["steps"], 1)
             records.append({key: value for key, value in row.items() if key != "slices"})
@@ -120,9 +121,42 @@ def _whole_case_validation(model, cases, cfg, context, run_dir, epoch):
             / n_ssim if n_ssim else None)
     metrics = {"val_pooled_mse": mse, "val_pooled_psnr_db": -10 * math.log10(mse) if mse else None,
                "val_mean_slice_ssim": ssim, "val_pixel_count": pixels, "val_case_count": len(records)}
+    edge_voxels = sum(row["edge_voxels"] for row in records)
+    metrics["val_edge_mse"] = (sum(row["edge_sse"] for row in records) / edge_voxels if edge_voxels else None)
     context.main_call(lambda: atomic_save({"cases": records, **metrics},
                                           run_dir / "whole_val" / f"epoch_{epoch:04}.json", json_file=True))
     return metrics
+
+
+def _prepare_spatial_bank(cfg, dataset, identity, device, run_dir):
+    """Build once on rank zero or verify a prebuilt bank against the TRAIN cohort and A."""
+    from .spatial_atlas import bank_provenance, build_spatial_atlas
+
+    options = cfg["spatial_atlas"]
+    path = project_path(options["direct_checkpoint"])
+    checkpoint = load_checkpoint(path)
+    train_identity = [row for row in identity if row["split"] == "train"]
+    if (checkpoint.get("format_version") != 3 or checkpoint.get("algorithm") != "haar_direct"
+            or [row for row in checkpoint["data_identity"] if row["split"] == "train"] != train_identity):
+        raise ValueError("Spatial descriptors require A trained on exactly the same TRAIN cohort")
+    # Fit records deterministically across bridge seeds; routing/curvature settings
+    # stay explicit so a cached fit cannot silently enter a different ablation.
+    provenance = bank_provenance(path, identity, options)
+    cached_path = project_path(options["bank"]) if options.get("bank") else None
+    gate_bank = run_dir.parent / "smoke" / "spatial_bank.pt"
+    if cached_path is None and run_dir.name == "bridge" and gate_bank.is_file():
+        cached_path = gate_bank
+    if cached_path is not None:
+        cached = load_checkpoint(cached_path)
+        if cached.get("provenance") != provenance:
+            raise ValueError("Spatial bank identity, settings or descriptor checkpoint differs")
+        payload = cached["payload"]
+    else:
+        bank_set = copy.copy(dataset)
+        bank_set.seed = options.get("seed", 42)
+        bank_set.set_epoch(0)
+        payload = build_spatial_atlas(checkpoint, bank_set, options, device)
+    atomic_save({"provenance": provenance, "payload": payload}, run_dir / "spatial_bank.pt")
 
 
 def run_training(config_path, stage="bridge", device_name="auto", resume=None, case_inventory=None):
@@ -152,13 +186,20 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
     context = initialize_distributed(device_name)
     run_dir = project_path(cfg["run_dir"]) / stage
     lock = None
+    lock_dir_fd = None
 
     def prepare():
-        nonlocal lock
+        nonlocal lock, lock_dir_fd
         run_dir.mkdir(parents=True, exist_ok=True)
         if (run_dir / "last.pt").exists() and not resume:
             raise FileExistsError("Existing run requires --resume or a new run_dir")
-        lock = (run_dir / ".training.lock").open("x")
+        if haar and os.name == "posix":
+            # Slurm preemption releases this kernel lock without leaving a stale sentinel.
+            import fcntl
+            lock_dir_fd = os.open(run_dir, os.O_RDONLY)
+            fcntl.flock(lock_dir_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            lock = (run_dir / ".training.lock").open("x")
         atomic_save(cfg, run_dir / "config.json", json_file=True)
 
     try:
@@ -193,9 +234,21 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                                                    packed_xy=bool(atlas_options)).to(device)
         model, metric = None, None
         atlas_payload = None
+        spatial_payload = None
+        old = load_checkpoint(project_path(resume)) if resume else None
         if haar:
             model = make_haar_model(cfg).to(device)
-            objective = HaarObjective(model, cfg)
+            if cfg.get("spatial_atlas"):
+                from .spatial_atlas import load_spatial_atlas
+
+                if old is not None:
+                    spatial_payload = old["spatial_atlas"]
+                else:
+                    context.main_call(lambda: _prepare_spatial_bank(cfg, train_set, identity, device, run_dir))
+                    spatial_payload = load_checkpoint(run_dir / "spatial_bank.pt")["payload"]
+                metric = load_spatial_atlas(spatial_payload, cfg["spatial_atlas"]).to(device).requires_grad_(False)
+                metric.eval()
+            objective = HaarObjective(model, cfg, metric)
         elif stage == "representation":
             objective = RepresentationObjective(encoder)
         else:
@@ -214,11 +267,10 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             model = DriftNetwork(cfg["model"]["width"]).to(device)
             objective = MatchingObjective(model, matching_weight,
                                           cfg["path"].get("geometry_ramp_power", 0.0))
-        parameters = list(objective.parameters())
+        parameters = [p for p in objective.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(parameters, lr=cfg["train"]["learning_rate"], weight_decay=1e-5)
         start, best, stale_epochs = 0, float("inf"), 0
         if resume:
-            old = load_checkpoint(project_path(resume))
             if old["training_stage"] != stage or old["manifest_sha256"] != digest or old["data_identity"] != identity:
                 raise ValueError("Resume identity differs")
             if old["world_size"] != context.world_size:
@@ -246,15 +298,21 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             print(json.dumps({"stage": stage, "world_size": context.world_size,
                               "per_rank_batch": cfg["train"]["batch_size"],
                               "global_patches": len(train_set), "method": cfg["mode"] if haar else "paired conditional variational GSBM",
-                              "geometry": "none" if haar else ("source_conditioned_mls" if source_routing else ("mls" if atlas_options else "land")),
+                              "geometry": (cfg.get("spatial_atlas", {}).get("method", "none") if haar else
+                                           ("source_conditioned_mls" if source_routing else ("mls" if atlas_options else "land"))),
                               "atlas": atlas_payload["diagnostics"] if atlas_payload else None}), flush=True)
         for epoch in range(start, cfg["train"]["epochs"]):
+            if (selection_metric == "pooled_psnr" and cfg["train"].get("whole_val_patience") is not None
+                    and stale_epochs >= cfg["train"]["whole_val_patience"]):
+                break
             torch.manual_seed(cfg["train"]["seed"] + epoch + 100003 * context.rank)
             loader.generator.manual_seed(cfg["train"]["seed"] + epoch)
             train_set.set_epoch(epoch)
             if sampler:
                 sampler.set_epoch(epoch)
             objective.train()
+            if spatial_payload is not None:
+                metric.eval()
             totals = {}
             count = 0
             iterator = iter(loader)
@@ -282,7 +340,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 error = None
                 try:
                     if haar:
-                        terms = objective(lr, base, hr)
+                        terms = objective(lr, base, hr, batch["id"])
                     elif stage == "representation":
                         terms = objective(hr)
                     else:
@@ -324,7 +382,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                         hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
                         if haar:
                             prediction = model.restore(batch["lr"].to(device), base, cfg["sampling"]["steps"],
-                                                       inference_sigma).clamp(0, 1)
+                                                       inference_sigma, atlas=metric).clamp(0, 1)
                             value = (prediction - hr).square().mean()
                         elif stage == "representation":
                             value = representation_loss(encoder, hr)["loss"]
@@ -370,7 +428,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             validation = total / items
             score = 1 - ssim_total / items if stage == "bridge" and selection_metric == "ssim" else validation
             if selection_metric == "pooled_psnr":
-                whole_metrics = _whole_case_validation(model, val_set.all_cases, cfg, context, run_dir, epoch + 1)
+                whole_metrics = _whole_case_validation(model, val_set.all_cases, cfg, context, run_dir, epoch + 1,
+                                                      atlas=metric)
                 record.update(whole_metrics)
                 score = whole_metrics["val_pooled_mse"]
             improved = score < best
@@ -413,7 +472,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 payload = metric_payload(metric)
 
             def save():
-                checkpoint = {"format_version": 3 if haar else 2,
+                checkpoint = {"format_version": 4 if spatial_payload is not None else (3 if haar else 2),
                               "algorithm": cfg["mode"] if haar else "paired_conditional_variational_gsbm",
                               "stage": "representation" if stage == "representation" else "reconstruction",
                               "training_stage": stage, "config": cfg, "epoch": epoch + 1,
@@ -421,18 +480,19 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                               "optimizer": optimizer.state_dict(), "best": best, "world_size": context.world_size,
                               "manifest_sha256": digest, "data_identity": identity,
                               "metric": payload, "stale_epochs": stale_epochs}
-                atomic_save(checkpoint, run_dir / "last.pt")
+                if spatial_payload is not None:
+                    checkpoint["spatial_atlas"] = spatial_payload
                 if improved:
                     atomic_save(checkpoint, run_dir / "best.pt")
+                atomic_save(checkpoint, run_dir / "last.pt")
                 with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(record) + "\n")
                 print(json.dumps(record), flush=True)
             context.main_call(save)
-            patience = cfg["train"].get("whole_val_patience")
-            if selection_metric == "pooled_psnr" and patience is not None and stale_epochs >= patience:
-                break
         return run_dir
     finally:
+        if lock_dir_fd is not None:
+            os.close(lock_dir_fd)
         if lock is not None:
             lock.close()
             (run_dir / ".training.lock").unlink(missing_ok=True)

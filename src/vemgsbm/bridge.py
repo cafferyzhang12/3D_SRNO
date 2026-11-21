@@ -51,12 +51,15 @@ def _atlas_guidance(chart, options):
 
 def reconstruct(model, base, mask, mode="gsbm", geometry=None, steps=20,
                 sigma=0.1, generator=None, terminal_noise=True, geometry_guidance=None,
-                momentum_guidance=None, native_lr=None):
+                momentum_guidance=None, native_lr=None, noise_steps=None):
     options = geometry_guidance_options(geometry_guidance)
-    if mode in {"haar_direct", "haar_bridge"}:
+    if mode in {"haar_direct", "haar_bridge", "external_2d"}:
         if native_lr is None or bool(mask.any()) or options or momentum_guidance:
-            raise ValueError("Haar MRI requires native LR and paired XY reconstruction")
-        return model.restore(native_lr, base, steps, sigma, generator)
+            raise ValueError("This MRI model requires native LR and paired XY reconstruction")
+        if mode == "external_2d":
+            return model.restore(native_lr, base, steps, sigma, generator)
+        extra = {"noise_steps": noise_steps} if noise_steps is not None else {}
+        return model.restore(native_lr, base, steps, sigma, generator, atlas=geometry, **extra)
     if mode == "momentum":
         if options is not None:
             raise ValueError("Online MLS guidance requires a GSBM model")

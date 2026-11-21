@@ -58,6 +58,7 @@ train:
   whole_val_patience: 12
   endpoint_weight: 1.0
 sampling:
+  tile_batch: 8
   steps: 20
   sigma: 0.1
   inference_sigma: 0.05

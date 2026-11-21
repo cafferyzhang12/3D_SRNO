@@ -1,4 +1,4 @@
-"""Paired whole-case bootstrap for differences in pooled PSNR and slice-weighted SSIM."""
+"""Paired whole-case bootstrap for pooled PSNR, MSE and slice-weighted SSIM differences."""
 
 import argparse
 import json
@@ -53,7 +53,8 @@ def paired_comparison(reference, candidate, seed=42, resamples=10000):
         # Equal voxel and slice counts were checked case by case above.
         ref, cand = (arm[index].sum(axis=1).T for arm in totals)
         with np.errstate(divide="ignore", invalid="ignore"):
-            return np.stack((10 * np.log10(ref[0] / cand[0]), (cand[2] - ref[2]) / ref[3]), axis=-1)
+            return np.stack((10 * np.log10(ref[0] / cand[0]), (cand[0] - ref[0]) / ref[1],
+                             (cand[2] - ref[2]) / ref[3]), axis=-1)
 
     count = len(metrics[0])
     observed = differences(np.arange(count)[None])[0]
@@ -62,7 +63,7 @@ def paired_comparison(reference, candidate, seed=42, resamples=10000):
                             for i in range(0, resamples, 128)])
     result = {"number_of_cases": count, "seed": seed, "resamples": resamples, "level": .95,
               "difference": "candidate minus reference", "input_fingerprints_checked": fingerprints_checked}
-    for i, name in enumerate(("pooled_psnr_db", "mean_slice_ssim")):
+    for i, name in enumerate(("pooled_psnr_db", "pooled_mse", "mean_slice_ssim")):
         ci = np.percentile(draws[:, i], [2.5, 97.5]).tolist() if np.isfinite(draws[:, i]).all() else None
         result[name] = {"difference": float(observed[i]) if np.isfinite(observed[i]) else None, "ci95": ci}
     return result

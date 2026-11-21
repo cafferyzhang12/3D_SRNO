@@ -243,8 +243,12 @@ def _objective(path: PathBatch, metric: Any, times: Tensor, noise: Tensor,
             valid = (missing.flatten(1).sum(1) > 0).to(residual.dtype)
             variance_costs.append(residual * valid)
         if metric is not None and float(config.get("state_weight", 0.1)) != 0:
-            state, _ = sample_path(path, t, noise=noise[:, index])
-            value = metric.state_cost(state)
+            if hasattr(metric, "mean_state_cost"):
+                mean, _ = path.mean_and_velocity(t)
+                value = metric.mean_state_cost(mean, t)
+            else:
+                state, _ = sample_path(path, t, noise=noise[:, index])
+                value = metric.state_cost(state)
             if value.shape != (batch,):
                 raise ValueError("metric.state_cost must return one scalar per image")
             state_costs.append(value * t.pow(ramp_power))
@@ -254,9 +258,12 @@ def _objective(path: PathBatch, metric: Any, times: Tensor, noise: Tensor,
     kinetic = control.new_zeros(())
     if metric is not None and float(config.get("metric_weight", 0.05)) != 0:
         step = 1 / (knots.shape[1] - 1)
-        values = [metric.kinetic(knots[:, i], knots[:, i + 1], step)
-                  * ((i + 0.5) * step) ** ramp_power
-                  for i in range(knots.shape[1] - 1)]
+        values = []
+        for i in range(knots.shape[1] - 1):
+            midtime = (i + .5) * step
+            pair = (knots[:, i], knots[:, i + 1], step)
+            motion = metric.kinetic_time(*pair, midtime) if hasattr(metric, "kinetic_time") else metric.kinetic(*pair)
+            values.append(motion * midtime**ramp_power)
         if any(value.shape != (batch,) for value in values):
             raise ValueError("metric.kinetic must return one scalar per image")
         kinetic = 0.5 * torch.stack(values, dim=1).mean()

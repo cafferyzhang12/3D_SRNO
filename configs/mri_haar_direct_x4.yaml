@@ -57,6 +57,7 @@ train:
   selection_metric: pooled_psnr
   whole_val_patience: 12
 sampling:
+  tile_batch: 8
   steps: 1
   sigma: 0.1
   inference_sigma: 0.05

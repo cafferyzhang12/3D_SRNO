@@ -37,6 +37,16 @@ def read_config(path):
         raise ValueError("Path and SDE reference diffusion sigma must agree and be finite")
     sampling_noise(cfg)
     data = cfg["data"]
+    if cfg.get("spatial_atlas") is not None:
+        options = cfg["spatial_atlas"]
+        if (cfg["mode"] != "haar_bridge" or options.get("method") not in {"mean", "pca", "mls"}
+                or options.get("query", "endpoint") not in {"state", "endpoint"}
+                or options.get("reference", "identity") not in {"identity", "geometry", "shuffled"}
+                or options.get("dim") not in {2, 4, 6, 8}):
+            raise ValueError("Invalid spatial atlas method, reference, query, or local dimension")
+        if options.get("path_geometry") and (cfg["path"]["iterations"] < 1 or
+                                             min(cfg["path"]["state_weight"], cfg["path"]["metric_weight"]) <= 0):
+            raise ValueError("Geometry path optimization requires positive iterations and geometry weights")
     if cfg["mode"] in {"haar_direct", "haar_bridge"}:
         if data.get("kind") != "paired_mri_png" or data.get("scale") != 4:
             raise ValueError("Haar residual MRI requires XY×4 paired PNGs")
@@ -127,7 +137,11 @@ def atomic_save(value, path, *, json_file=False):
 
 
 def fingerprint(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_checkpoint(path):
@@ -138,12 +152,20 @@ def build_models(checkpoint, device):
     cfg = checkpoint["config"]
     guidance = sampling_geometry_guidance(cfg)
     geometry = None
-    if cfg["mode"] in {"haar_direct", "haar_bridge"}:
+    if cfg["mode"] == "external_2d":
+        from .mri_external import SlicePredictor
+
+        model = SlicePredictor(cfg["external"]["name"]).to(device)
+    elif cfg["mode"] in {"haar_direct", "haar_bridge"}:
         from .haar_residual import make_haar_model
 
-        if checkpoint.get("format_version") != 3:
-            raise ValueError("Expected v3 native-LR Haar MRI checkpoint")
+        if checkpoint.get("format_version") != (4 if cfg.get("spatial_atlas") else 3):
+            raise ValueError("Unsupported native-LR Haar MRI checkpoint version")
         model = make_haar_model(cfg).to(device)
+        if cfg.get("spatial_atlas"):
+            from .spatial_atlas import load_spatial_atlas
+
+            geometry = load_spatial_atlas(checkpoint["spatial_atlas"], cfg["spatial_atlas"]).to(device).eval()
     elif cfg["mode"] == "momentum":
         from .momentum.model import AccelerationNetwork
         from .momentum.trivialized import ChartMomentumAtlas, chart_momentum_options

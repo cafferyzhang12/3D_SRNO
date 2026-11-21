@@ -37,11 +37,12 @@ class LRConditionEncoder(nn.Module):
 
 
 class HaarResidualNetwork(nn.Module):
-    def __init__(self, mode, widths=(48, 96, 128), readout="integral"):
+    def __init__(self, mode, widths=(48, 96, 128), readout="integral", spatial=None):
         super().__init__()
         if mode not in HAAR_MODES or readout not in {"integral", "endpoint"}:
             raise ValueError("Unknown Haar MRI model or readout")
         self.mode, self.readout = mode, readout
+        self.spatial = spatial
         self.codec = HaarXY()
         self.lr_encoder = LRConditionEncoder(widths)
         a, b, c = widths
@@ -59,12 +60,20 @@ class HaarResidualNetwork(nn.Module):
         self.up1 = _TimeResidualBlock(b + a, a, embedding)
         self.endpoint = nn.Conv3d(a, 16, 3, padding=1)
         self.drift = nn.Conv3d(a, 16, 3, padding=1) if mode == "haar_bridge" else None
+        if spatial is not None:
+            # Learn corrections to both unconstrained heads in residual space.
+            # Start from the ungated identity map, including in low-support regions.
+            self.geometry_embedding = nn.Sequential(nn.Conv3d(65, a, 1), nn.SiLU())
+            self.geometry_delta = nn.Conv3d(a, 32, 1)
+            self.geometry_gate = nn.Conv3d(2 * a, 32, 1)
+            nn.init.zeros_(self.geometry_delta.weight)
+            nn.init.zeros_(self.geometry_delta.bias)
         for head in (self.endpoint, self.drift):
             if head is not None:
                 nn.init.zeros_(head.weight)
                 nn.init.zeros_(head.bias)
 
-    def forward(self, state, condition, time, direction=0):
+    def forward(self, state, condition, time, direction=0, bound=None):
         angles = batch_time(time, state)[:, None] * self.frequencies.to(state)
         embedding = self.time(torch.cat((angles.sin(), angles.cos()), dim=1))
         embedding = embedding + self.direction.weight[direction]
@@ -76,7 +85,18 @@ class HaarResidualNetwork(nn.Module):
             return torch.cat((F.interpolate(x, size=skip.shape[-3:], mode="trilinear",
                                             align_corners=False), skip), dim=1)
         hidden = self.up1(align(self.up2(align(c, b), embedding), a), embedding)
-        return self.endpoint(hidden), self.drift(hidden) if self.drift is not None else None
+        clean = self.endpoint(hidden)
+        drift = self.drift(hidden) if self.drift is not None else None
+        if self.spatial is not None:
+            if bound is None:
+                raise ValueError("Spatial Haar bridge requires an LR-conditioned chart")
+            query = state if self.spatial.get("query", "endpoint") == "state" else clean
+            spatial = self.geometry_embedding(bound.features(bound.unwhiten(query)))
+            gate = self.geometry_gate(torch.cat((hidden, spatial), dim=1)).sigmoid()
+            dc, dd = (gate * self.geometry_delta(spatial)).chunk(2, dim=1)
+            clean = clean + bound.whiten(dc)
+            drift = drift + bound.whiten(dd)
+        return clean, drift
 
     def zero_state(self, lr, base):
         if lr is None or lr.shape != (*base.shape[:3], base.shape[-2] // 4, base.shape[-1] // 4):
@@ -84,32 +104,35 @@ class HaarResidualNetwork(nn.Module):
         return lr.new_zeros((len(lr), 16, *lr.shape[2:]))
 
     @torch.no_grad()
-    def restore(self, lr, base, steps, sigma, generator=None):
+    def restore(self, lr, base, steps, sigma, generator=None, atlas=None, noise_steps=None):
         if not isinstance(steps, int) or steps < 1 or not math.isfinite(sigma) or sigma < 0:
             raise ValueError("Invalid Haar bridge sampler steps or sigma")
         state = self.zero_state(lr, base)
         condition = self.lr_encoder(lr)
+        bound = atlas.bind(lr) if atlas is not None else None
         if self.mode == "haar_direct":
             residual, _ = self(state, condition, 0.)
         else:
             for i in range(steps):
                 time = max(.02, min(.98, i / steps))
-                endpoint, drift = self(state, condition, time)
+                endpoint, drift = self(state, condition, time, bound=bound)
                 state = state + drift / steps
                 if i + 1 < steps and sigma:
-                    state = state + torch.randn(state.shape, dtype=state.dtype, device=state.device,
-                                                generator=generator) * (sigma / math.sqrt(steps))
+                    noise = (torch.randn(state.shape, dtype=state.dtype, device=state.device, generator=generator)
+                             if noise_steps is None else noise_steps[i])
+                    state = state + noise * (sigma / math.sqrt(steps))
             residual = endpoint if self.readout == "endpoint" else state
-        return base + self.codec.decode(residual)
+        return base + self.codec.decode(bound.unwhiten(residual) if bound is not None else residual)
 
 
 class HaarObjective(nn.Module):
-    def __init__(self, model, config):
+    def __init__(self, model, config, atlas=None):
         super().__init__()
         self.model = model
         self.config = config
+        self.atlas = atlas
 
-    def forward(self, lr, base, hr):
+    def forward(self, lr, base, hr, case_ids=None):
         model = self.model
         condition = model.lr_encoder(lr)
         zero = model.zero_state(lr, base)
@@ -118,22 +141,36 @@ class HaarObjective(nn.Module):
             mse = F.mse_loss(base + model.codec.decode(clean), hr)
             return {"loss": mse, "endpoint_pixel_mse": mse}
         target = model.codec.encode(hr - base)
-        path, diagnostics = optimize_path(zero, target, torch.zeros_like(zero), None, self.config["path"])
+        bound, path_metric = None, None
+        if self.atlas is not None:
+            if case_ids is None:
+                raise ValueError("TRAIN spatial queries require case IDs for held-out fold routing")
+            bound = self.atlas.bind(lr, case_ids)
+            target = bound.whiten(target)
+            if model.spatial.get("path_geometry", False):
+                path_metric = bound.path_metric()
+        path, diagnostics = optimize_path(zero, target, torch.zeros_like(zero), path_metric, self.config["path"])
         cutoff = self.config["train"].get("matching_time_min", .02)
         t = torch.rand(len(hr), device=hr.device) * (1 - 2 * cutoff) + cutoff
         noise = torch.randn_like(target)
         state, f = sample_path(path, t, noise, "forward")
         _, r = sample_path(path, t, noise, "backward")
-        clean, forward = model(state, condition, t, 0)
-        _, reverse = model(state, condition, t, 1)
+        clean, forward = model(state, condition, t, 0, bound)
+        _, reverse = model(state, condition, t, 1, bound)
         fm, rm = F.mse_loss(forward, f), F.mse_loss(reverse, r)
-        mse = F.mse_loss(base + model.codec.decode(clean), hr)
+        mse = F.mse_loss(base + model.codec.decode(bound.unwhiten(clean) if bound is not None else clean), hr)
         weight = self.config["train"].get("endpoint_weight", 1.)
-        return {"loss": (fm + rm) * .5 + weight * mse, "endpoint_pixel_mse": mse,
-                "forward_matching": fm, "backward_matching": rm,
-                "path_mean_correction_rms": hr.new_tensor(diagnostics["mean_correction_rms"])}
+        terms = {"loss": (fm + rm) * .5 + weight * mse, "endpoint_pixel_mse": mse,
+                 "forward_matching": fm, "backward_matching": rm,
+                 "path_mean_correction_rms": hr.new_tensor(diagnostics["mean_correction_rms"])}
+        if bound is not None:
+            terms.update({key: torch.as_tensor(value, device=hr.device) for key, value in bound.diagnostics().items()})
+            rms = target.square().mean().sqrt().clamp_min(1.e-8)
+            terms["path_relative_correction_rms"] = terms["path_mean_correction_rms"] / rms
+            terms["path_accepted_steps"] = hr.new_tensor(diagnostics["accepted_steps"])
+        return terms
 
 
 def make_haar_model(config):
     return HaarResidualNetwork(config["mode"], config["model"]["widths"],
-                               config["sampling"].get("readout", "integral"))
+                               config["sampling"].get("readout", "integral"), config.get("spatial_atlas"))

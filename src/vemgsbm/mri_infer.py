@@ -22,7 +22,7 @@ from time import perf_counter
 import time
 
 import numpy as np
-from scipy.ndimage import gaussian_laplace
+from scipy.ndimage import gaussian_laplace, sobel
 from skimage.metrics import structural_similarity
 import torch
 import torch.nn.functional as functional
@@ -97,6 +97,7 @@ def _psnr(mse):
 
 METRIC_PROTOCOL = {
     "foreground": "HR > 2/255 in normalized intensity units",
+    "edge_mse": "foreground voxels with nonzero XY Sobel magnitude >= per-slice foreground p90",
     "hfen": "pooled L2(XY LoG(pred-HR)) / L2(XY LoG(HR)), sigma 1.5 HR pixels, reflect",
     "z_difference_mse": "voxel MSE of first differences over consecutive original slice indices",
     "all_psnr_db": "10 log10(1 / pooled normalized voxel MSE)",
@@ -109,6 +110,7 @@ def _regional_metrics(totals):
                       if totals["foreground_voxels"] else None)
     return {
         "foreground_mse": foreground_mse,
+        "edge_mse": totals["edge_sse"] / totals["edge_voxels"] if totals["edge_voxels"] else None,
         "foreground_psnr_db": _psnr(foreground_mse) if foreground_mse is not None else None,
         "hfen": (math.sqrt(totals["log_error_energy"] / totals["log_reference_energy"])
                  if totals["log_reference_energy"] > 0 else None),
@@ -118,7 +120,7 @@ def _regional_metrics(totals):
 
 
 def _region_totals():
-    return {"foreground_voxels": 0, "foreground_sse": 0., "log_error_energy": 0.,
+    return {"foreground_voxels": 0, "foreground_sse": 0., "edge_voxels": 0, "edge_sse": 0., "log_error_energy": 0.,
             "log_reference_energy": 0., "z_difference_sse": 0., "z_difference_voxels": 0}
 
 
@@ -147,6 +149,11 @@ def case_metrics(prediction, case):
         foreground = reference > float(np.float32(2 / 255))
         regional["foreground_voxels"] += int(foreground.sum())
         regional["foreground_sse"] += float(error[foreground].sum())
+        if foreground.any():
+            gradient = np.hypot(sobel(reference, axis=0), sobel(reference, axis=1))
+            edges = foreground & (gradient > 0) & (gradient >= np.quantile(gradient[foreground], .9))
+            regional["edge_voxels"] += int(edges.sum())
+            regional["edge_sse"] += float(error[edges].sum())
         regional["log_error_energy"] += float(np.square(gaussian_laplace(residual, 1.5)).sum())
         regional["log_reference_energy"] += float(np.square(gaussian_laplace(reference, 1.5)).sum())
         if previous_error is not None and original_index == case.indices[z - 1] + 1:
@@ -196,12 +203,14 @@ def _validate_mri_checkpoint(checkpoint):
 @torch.no_grad()
 def _infer_case(case, folder, model, geometry, config, device, seed, steps, samples):
     scale = config["data"]["scale"]
-    patch = tuple(config["data"]["patch_size"])
+    patch = tuple(config.get("external", {}).get("eval_patch_zyx", config["data"]["patch_size"]))
     guidance = sampling_geometry_guidance(config)
     momentum_guidance = sampling_momentum_guidance(config)
     sigma = sampling_noise(config)
     improved = guidance is not None or config.get("inference_variant") == "endpoint_safe" or config["mode"] == "momentum"
     shape = (len(case.lq), case.lr_shape[0] * scale, case.lr_shape[1] * scale)
+    if config.get("external"):
+        patch = (1, min(patch[1], shape[1]), min(patch[2], shape[2]))
     folder.mkdir()
     mean = np.lib.format.open_memmap(folder / "mean.npy", mode="w+", dtype="float32", shape=shape)
     variance = np.lib.format.open_memmap(folder / "variance.npy", mode="w+", dtype="float32", shape=shape)
@@ -209,7 +218,7 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
     variance[:] = 0
     axes = [np.hanning(n + 2)[1:-1].astype("float32") for n in patch]
     window = axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
-    native_input = config["mode"] in {"haar_direct", "haar_bridge"}
+    native_input = config["mode"] in {"haar_direct", "haar_bridge", "external_2d"}
     def spatial_starts(length, size):
         unit = scale if native_input else 1
         return [i * unit for i in tile_starts(length // unit, size // unit, max(1, size // unit // 2))]
@@ -219,6 +228,37 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
     @lru_cache(maxsize=max(1, patch[0] * 2))
     def reader(index):
         return _read_lq(case, index)
+
+    tile_batch = config.get("sampling", {}).get("tile_batch", 1) if config["mode"] in {"haar_direct", "haar_bridge"} else 1
+    if type(tile_batch) is not int or tile_batch < 1:
+        raise ValueError("tile_batch must be a positive integer")
+
+    def predict_tiles(run, starts, generator):
+        while group := list(itertools.islice(starts, tile_batch)):
+            inputs = [make_mri_tile(case, run, start, patch, scale, reader=reader,
+                                    with_native_lr=native_input) for start in group]
+            bases, masks, *native = [torch.cat(tensors).to(device) for tensors in zip(*inputs, strict=True)]
+            if config.get("predictor") == "bilinear":
+                predictions = bases
+            else:
+                options = {}
+                if native:
+                    options["native_lr"] = native[0]
+                if momentum_guidance is not None:
+                    options["momentum_guidance"] = momentum_guidance
+                if len(group) > 1 and config["mode"] == "haar_bridge" and steps > 1 and sigma:
+                    # Draw in the historical tile-major order, with identical tensor sizes.
+                    # CUDA Philox offsets depend on the shape of each individual draw.
+                    noise_shape = (1, 16, *native[0].shape[2:])
+                    by_tile = [[torch.randn(noise_shape, dtype=bases.dtype, device=device, generator=generator)
+                                for _ in range(steps - 1)] for _ in group]
+                    options["noise_steps"] = [torch.cat(step) for step in zip(*by_tile, strict=True)]
+                predictions = reconstruct(model, bases, masks, config["mode"], geometry=geometry,
+                                          steps=steps, sigma=sigma, generator=generator, terminal_noise=not improved,
+                                          geometry_guidance=guidance, **options)
+            if not improved:
+                predictions = predictions.clamp(0, 1)
+            yield from zip(group, predictions[:, 0].cpu().numpy(), strict=True)
 
     try:
         for sample in range(samples):
@@ -231,18 +271,8 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
                 for run in case.runs:
                     run_length = run[1] - run[0]
                     z_starts = tile_starts(run_length, patch[0], max(1, patch[0] // 2))
-                    for start in itertools.product(z_starts, y_starts, x_starts):
-                        base, mask, *native = make_mri_tile(case, run, start, patch, scale,
-                                                           reader=reader, with_native_lr=native_input)
-                        prediction = base if config.get("predictor") == "bilinear" else reconstruct(
-                            model, base.to(device), mask.to(device), config["mode"], geometry=geometry,
-                            steps=steps, sigma=sigma, generator=generator,
-                            terminal_noise=not improved, geometry_guidance=guidance,
-                            **({"native_lr": native[0].to(device)} if native else {}),
-                            **({"momentum_guidance": momentum_guidance} if momentum_guidance is not None else {}),
-                        )
-                        tile = prediction[0, 0] if improved else prediction[0, 0].clamp(0, 1)
-                        array = tile.cpu().numpy()
+                    starts = itertools.product(z_starts, y_starts, x_starts)
+                    for start, array in predict_tiles(run, starts, generator):
                         valid = tuple(min(p, length - offset) for p, length, offset in zip(patch, (run_length, *shape[1:]), start))
                         global_start = (run[0] + start[0], start[1], start[2])
                         region = tuple(slice(offset, offset + size) for offset, size in zip(global_start, valid))
@@ -321,6 +351,9 @@ def _write_case(case, staged, model, geometry, config, device, seed, steps, samp
         "intensity_output": "overlap blended then clipped to [0,1]" if improved else "per-patch clipped to [0,1], overlap blended",
     }
     metadata.update(_gsbm_sampler_metadata(config, steps))
+    if config.get("external"):
+        metadata["external"] = config["external"]
+        metadata.update(inference_variant=config["external"]["name"], terminal_position_noise=False)
     metadata["predictor"] = config.get("predictor", "model")
     if metadata["predictor"] == "bilinear":
         metadata.update(inference_variant="bilinear", terminal_position_noise=False)
@@ -460,6 +493,8 @@ def _checked_rank_call(context, function):
 def _gsbm_sampler_metadata(config, steps):
     if config.get("predictor") == "bilinear":
         return {"drift_network_calls_per_tile_sample": 0}
+    if config["mode"] == "external_2d":
+        return {"network_calls_per_tile_sample": steps, "input_dimensionality": "2D"}
     if config["mode"] != "gsbm":
         return {}
     sampler = config["sampling"].get("drift_sampler", "forward")
@@ -494,7 +529,8 @@ def infer_mri(
         test_fraction = 1.0 if split == "val" else 0.15
     if inference_variant not in {"legacy", "endpoint_safe"}:
         raise ValueError("Unknown inference variant")
-    if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int) or steps < 1):
+    if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int)
+                              or steps < (0 if predictor == "bilinear" else 1)):
         raise ValueError("steps must be a positive integer")
     if max_cases is not None and (isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases < 1):
         raise ValueError("max_cases must be a positive integer")
@@ -548,15 +584,15 @@ def infer_mri(
         if predictor == "bilinear":
             sampling.update(inference_sigma=0., geometry_guidance=None, momentum_geometry=None)
             config.update(inference_variant="endpoint_safe", chart_momentum=None)
-            return config, device, None, None
+            return config, device, None, None, checkpoint.get("data_identity")
         model, geometry = build_models({**checkpoint, "config": config}, device)
         if sampler == "diffusion_corrected":
             model = diffusion_adjusted_model(model, sampling["sigma"], sampling_noise(config))
-        return config, device, model, geometry
+        return config, device, model, geometry, checkpoint.get("data_identity")
 
     try:
         staged = Path(context.main_call(prepare_output, broadcast_result=True))
-        config, device, model, geometry = _checked_rank_call(context, load_models)
+        config, device, model, geometry, fitted_identity = _checked_rank_call(context, load_models)
         data = config["data"]
         steps = config["sampling"]["steps"] if steps is None else steps
         if predictor == "bilinear":
@@ -582,6 +618,8 @@ def infer_mri(
                 if split == "test" and (max_cases is not None or data.get("debug_case_limit") is not None):
                     raise ValueError("Prepared MRI test inventory requires the full paired test input contract")
                 indexed, identity = load_inventory(case_inventory, data, (split,))
+                if fitted_identity is not None and fitted_identity != identity:
+                    raise ValueError("Prepared MRI case fingerprints differ from the fitted checkpoint")
                 all_ids = [row["id"].casefold() for row in identity]
                 if len(all_ids) != len(set(all_ids)):
                     raise ValueError("Prepared MRI inventory contains duplicate case IDs across splits")
@@ -641,6 +679,8 @@ def infer_mri(
                 summary["momentum_geometry"] = momentum_guidance
             if predictor == "bilinear":
                 summary["inference_variant"] = "bilinear"
+            elif config.get("external"):
+                summary.update(inference_variant=config["external"]["name"], external=config["external"])
             atomic_save(subset, staged / "subset_manifest.json", json_file=True)
             atomic_save(summary, staged / "summary.json", json_file=True)
             write_metrics_csv(staged, summary)
