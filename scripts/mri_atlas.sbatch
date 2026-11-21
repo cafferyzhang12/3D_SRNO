@@ -14,8 +14,6 @@ cd "${GSBM_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 source scripts/mri_common.sh
 gsbm_environment
 : "${CONFIG:?Set CONFIG to an MRI MLS template}"
-export SUBSET_MANIFEST="${SUBSET_MANIFEST:-$PWD/data/private/mri_x4_test15.json}"
-[[ -s "$SUBSET_MANIFEST" ]]
 mkdir -p runs/mri
 mkdir "runs/mri/$RUN_ID"
 unset REPRESENTATION_CHECKPOINT RESUME
@@ -37,24 +35,6 @@ for profile in validate formal; do
     echo "Preparing MRI inventory before torchrun ($profile)"
     "$GSBM_PYTHON" -m vemgsbm.mri_inventory --config "$representation_config" --output "$inventory"
     inventory_option=(--case-inventory "$inventory")
-    if [[ "$profile" == formal ]]; then
-        "$GSBM_PYTHON" - "$representation_config" "$inventory" "$SUBSET_MANIFEST" <<'PY'
-import json
-import sys
-from vemgsbm.mri_infer import checked_test_subset
-from vemgsbm.mri_inventory import load_inventory
-from vemgsbm.runtime import read_config
-
-config_path, inventory, locked_manifest = sys.argv[1:]
-cfg = read_config(config_path)
-indexed, _ = load_inventory(inventory, cfg["data"], ("test",))
-test = cfg.get("test", {})
-selected, subset = checked_test_subset(indexed["test"], float(test.get("fraction", .15)),
-                                       int(test.get("subset_seed", 20261110)), locked_manifest)
-print(json.dumps({"locked_test_cases": subset["selected_cases"],
-                  "locked_test_slices": sum(len(case.stems) for case in selected)}), flush=True)
-PY
-    fi
     gsbm_torchrun -m vemgsbm.train --config "$representation_config" --stage representation --device cuda "${inventory_option[@]}"
     export REPRESENTATION_CHECKPOINT="$run/representation/best.pt"
     bridge_config=$(gsbm_config "$CONFIG" bridge "$profile")
@@ -77,7 +57,7 @@ PY
 )
         [[ "${#validation[@]}" == 3 ]]
         gsbm_torchrun -m vemgsbm.mri_infer --checkpoint "$CHECKPOINT" \
-            --root-lq "${validation[0]}" --root-hq "${validation[1]}" \
+            --split val --root-lq "${validation[0]}" --root-hq "${validation[1]}" \
             --scan-cache "$run/index/val_inference.json" \
             --output-root "outputs/mri/${RUN_ID}_validation_smoke" --device cuda \
             --max-cases 1 --test-fraction 1 --steps "${validation[2]}" --save-volume-limit 0 \
@@ -86,5 +66,4 @@ PY
     unset REPRESENTATION_CHECKPOINT
 done
 export MRI_CASE_INVENTORY="$inventory"
-export INFERENCE_VARIANT=endpoint_safe
-exec bash scripts/mri_test.sbatch
+source scripts/mri_whole_val.sh

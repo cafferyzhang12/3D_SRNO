@@ -144,16 +144,22 @@ def fit_feature_atlas(train_features, val_features, options, seed, source_featur
     return payload
 
 
-def route_features(source, bank, chart_probabilities, settings):
-    """Select chart candidates from TRAIN-paired LR descriptor likelihoods."""
+def source_chart_distribution(source, bank, chart_probabilities, settings):
+    """Full LR-conditioned chart distribution before top-k truncation."""
     distance = torch.cdist(source, bank).square() / source.shape[-1]
     bandwidth = settings["bandwidth"]
     weights = (-distance / (2 * bandwidth**2 * settings["temperature"])).softmax(-1)
     probability = weights @ chart_probabilities
+    confidence = (1 + distance.amin(-1) / bandwidth**2).reciprocal()
+    return probability, confidence
+
+
+def route_features(source, bank, chart_probabilities, settings):
+    """Select chart candidates from TRAIN-paired LR descriptor likelihoods."""
+    probability, confidence = source_chart_distribution(source, bank, chart_probabilities, settings)
     count = min(settings["candidates"], chart_probabilities.shape[1])
     prior, ids = probability.topk(count, dim=-1)
     prior = prior / prior.sum(-1, keepdim=True).clamp_min(1e-12)
-    confidence = (1 + distance.amin(-1) / bandwidth**2).reciprocal()
     return ids, prior, confidence
 
 

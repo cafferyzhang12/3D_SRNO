@@ -14,6 +14,8 @@ gsbm_environment() {
         }
     fi
     export PYTHONPATH="$PWD/src${NEURAL_ATLAS_SRC:+:$NEURAL_ATLAS_SRC}${PYTHONPATH:+:$PYTHONPATH}"
+    export MRI_GPUS="${MRI_GPUS:-${SLURM_GPUS_ON_NODE:-4}}"
+    [[ "$MRI_GPUS" == 1 || "$MRI_GPUS" == 4 ]] || { echo "Expected one or four GPUs" >&2; return 2; }
     export PYTHONUNBUFFERED=1
     export OMP_NUM_THREADS=4
     export MKL_NUM_THREADS=4
@@ -28,9 +30,10 @@ import os, sys
 if sys.version_info < (3, 10):
     raise RuntimeError('vem_gsbm requires Python >= 3.10')
 import torch
-if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
-    raise RuntimeError('Exactly four Slurm-assigned CUDA GPUs must be visible')
-names = [torch.cuda.get_device_name(i) for i in range(4)]
+count = int(os.environ['MRI_GPUS'])
+if not torch.cuda.is_available() or torch.cuda.device_count() != count:
+    raise RuntimeError('Visible GPUs must match the Slurm allocation')
+names = [torch.cuda.get_device_name(i) for i in range(count)]
 if any('A800' not in name for name in names):
     raise RuntimeError(f'Expected A800 GPUs: {names}')
 print({'job_id': os.environ['SLURM_JOB_ID'], 'python': sys.executable,
@@ -60,7 +63,8 @@ if cfg['data']['scale'] != 4:
     raise ValueError('This pipeline uses the supplied X4 test data')
 cfg['run_dir'] = str(Path('runs/mri') / os.environ['RUN_ID'])
 cfg['train']['epochs'] = cfg['train'].get(stage + '_epochs', cfg['train']['epochs'])
-if os.environ.get('REPRESENTATION_CHECKPOINT'):
+native_haar = cfg['mode'] in ('haar_direct', 'haar_bridge')
+if os.environ.get('REPRESENTATION_CHECKPOINT') and not native_haar:
     cfg['representation']['checkpoint'] = os.environ['REPRESENTATION_CHECKPOINT']
 for env_name, key in [('BATCH_SIZE', 'batch_size'), ('EPOCHS', 'epochs'),
                        ('SAMPLES_PER_EPOCH', 'samples_per_epoch'),
@@ -71,7 +75,7 @@ for env_name, key in [('BATCH_SIZE', 'batch_size'), ('EPOCHS', 'epochs'),
             raise ValueError(f'{env_name} must be positive')
         cfg['train'][key] = value
 if profile == 'validate':
-    if cfg.get('atlas'):
+    if cfg.get('atlas') or native_haar:
         cfg['run_dir'] = str(Path(cfg['run_dir']) / 'smoke')
     cfg['data']['debug_case_limit'] = 2
     cfg['data']['scan_cache'] = {
@@ -85,21 +89,24 @@ if profile == 'validate':
         cfg['train'].update(samples_per_epoch=32, val_samples_per_epoch=8)
         cfg['atlas'].update(bank_patches=24, charts=4, neighborhoods=[12, 24, 48], dim_candidates=[2, 3])
         cfg['atlas']['mls'].update(degree=1, neighbors=24, anchor_limit=6)
-    else:
+    elif not native_haar:
         cfg['representation'].update(width=4, feature_dim=8, clusters=4, bank_samples=8)
     if cfg.get('atlas') and cfg.get('chart_momentum') is None:
         cfg['train'].update(samples_per_epoch=32, val_samples_per_epoch=8)
         cfg['representation']['bank_samples'] = 32
         cfg['atlas'].update(charts=2, neighborhoods=[8, 16, 32], dim_candidates=[2])
         cfg['atlas']['mls'].update(degree=1, neighbors=24, anchor_limit=4)
-    cfg['model']['width'] = 4
+    if native_haar:
+        cfg['model']['widths'] = [4, 8, 12]
+    else:
+        cfg['model']['width'] = 4
     cfg['path']['iterations'] = 2
     geometry_sampling = any(cfg['sampling'].get(key) for key in ('geometry_guidance', 'momentum_geometry'))
     cfg['sampling']['steps'] = 3 if geometry_sampling else 2
 elif profile != 'formal':
     raise ValueError('Unknown config profile')
 cfg['train'][stage + '_epochs'] = cfg['train']['epochs']
-if (stage == 'bridge' and cfg.get('chart_momentum') is None
+if (stage == 'bridge' and not native_haar and cfg.get('chart_momentum') is None
         and not cfg['representation'].get('checkpoint') and not os.environ.get('RESUME')):
     raise ValueError('Set REPRESENTATION_CHECKPOINT to the matching representation/best.pt')
 folder = Path('reports/mri/run_configs')
@@ -114,5 +121,5 @@ PY
 
 gsbm_torchrun() {
     "$GSBM_PYTHON" -m torch.distributed.run --standalone --nnodes=1 \
-        --nproc-per-node=4 --max-restarts=0 "$@"
+        --nproc-per-node="$MRI_GPUS" --max-restarts=0 "$@"
 }

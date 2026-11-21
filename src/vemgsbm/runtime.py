@@ -12,7 +12,7 @@ import torch
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MODES = {"gsbm", "momentum"}
+MODES = {"gsbm", "momentum", "haar_direct", "haar_bridge"}
 
 
 def project_path(value):
@@ -24,7 +24,7 @@ def read_config(path):
     with Path(path).open(encoding="utf-8") as stream:
         cfg = yaml.safe_load(stream)
     if cfg.get("mode") not in MODES:
-        raise ValueError("Expected mode=gsbm or mode=momentum")
+        raise ValueError(f"Unsupported mode, expected one of {sorted(MODES)}")
     patch = cfg["data"]["patch_size"]
     if len(patch) != 3 or any(not isinstance(v, int) or isinstance(v, bool) or v < 3 for v in patch):
         raise ValueError("patch_size must be ZYX")
@@ -37,6 +37,19 @@ def read_config(path):
         raise ValueError("Path and SDE reference diffusion sigma must agree and be finite")
     sampling_noise(cfg)
     data = cfg["data"]
+    if cfg["mode"] in {"haar_direct", "haar_bridge"}:
+        if data.get("kind") != "paired_mri_png" or data.get("scale") != 4:
+            raise ValueError("Haar residual MRI requires XY×4 paired PNGs")
+        widths = cfg["model"]["widths"]
+        if len(widths) != 3 or any(type(v) is not int or v < 2 for v in widths):
+            raise ValueError("Expected three positive model widths >=2")
+        weight = cfg["train"].get("endpoint_weight", 1.)
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("Invalid endpoint_weight")
+        if cfg["train"].get("matching_time_min", .02) != .02:
+            raise ValueError("Haar MRI sampler uses matching_time_min=.02")
+        if cfg["mode"] == "haar_bridge" and weight == 0 and cfg["sampling"].get("readout") == "endpoint":
+            raise ValueError("Endpoint readout requires endpoint supervision")
     if cfg.get("atlas") and (data.get("kind") != "paired_mri_png" or any(p % 4 for p in patch[1:])):
         raise ValueError("The MRI MLS atlas requires paired MRI and XY patches divisible by four")
     sampling_geometry_guidance(cfg)
@@ -125,7 +138,13 @@ def build_models(checkpoint, device):
     cfg = checkpoint["config"]
     guidance = sampling_geometry_guidance(cfg)
     geometry = None
-    if cfg["mode"] == "momentum":
+    if cfg["mode"] in {"haar_direct", "haar_bridge"}:
+        from .haar_residual import make_haar_model
+
+        if checkpoint.get("format_version") != 3:
+            raise ValueError("Expected v3 native-LR Haar MRI checkpoint")
+        model = make_haar_model(cfg).to(device)
+    elif cfg["mode"] == "momentum":
         from .momentum.model import AccelerationNetwork
         from .momentum.trivialized import ChartMomentumAtlas, chart_momentum_options
 

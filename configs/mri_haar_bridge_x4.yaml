@@ -1,0 +1,68 @@
+mode: haar_bridge
+run_dir: runs/mri/haar_bridge_x4
+data:
+  kind: paired_mri_png
+  degradation: paired_xy
+  scale: 4
+  patch_size:
+  - 5
+  - 128
+  - 128
+  channel_policy: identical_rgb_to_gray
+  scan_workers: 4
+  train:
+    root_lq: data/MRI_SR/train/LQ/X4_png
+    root_hq: data/MRI_SR/train/HQ_png
+  val:
+    root_lq: data/MRI_SR/val_small/LQ/X4_png
+    root_hq: data/MRI_SR/val_small/HQ_png
+  test:
+    root_lq: data/MRI_SR/test/LQ/X4_png
+    root_hq: data/MRI_SR/test/HQ_png
+  scan_cache:
+    train: reports/mri/gsbm_mls_x4/index_train.json
+    val: reports/mri/gsbm_mls_x4/index_val.json
+    test: reports/mri/gsbm_mls_x4/index_test.json
+  legacy_scan_cache:
+    train: data/private/scan_train.json
+    val: data/private/scan_val.json
+    test: data/private/scan_test.json
+model:
+  widths:
+  - 48
+  - 96
+  - 128
+path:
+  knots: 5
+  iterations: 0
+  quadrature: 5
+  optimize_std: true
+  sigma: 0.1
+  state_weight: 0
+  metric_weight: 0
+  control_weight: 1
+train:
+  epochs: 160
+  batch_size: 4
+  train_samples: 1
+  val_samples: 1
+  samples_per_epoch: 4096
+  val_samples_per_epoch: 64
+  learning_rate: 0.0001
+  matching_time_min: 0.02
+  workers: 2
+  threads: 4
+  seed: 42
+  validation_seed: 42
+  selection_metric: pooled_psnr
+  whole_val_patience: 12
+  endpoint_weight: 1.0
+sampling:
+  steps: 20
+  sigma: 0.1
+  inference_sigma: 0.05
+  readout: endpoint
+test:
+  fraction: 0.15
+  subset_seed: 20261110
+  save_volume_limit: 8

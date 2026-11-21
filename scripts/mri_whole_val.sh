@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+: "${CHECKPOINT:?Set CHECKPOINT}"
+mapfile -t val < <("$GSBM_PYTHON" - "$CHECKPOINT" <<'PY'
+import sys
+from vemgsbm.runtime import load_checkpoint, project_path
+cfg = load_checkpoint(sys.argv[1])['config']
+for key in ('root_lq', 'root_hq'):
+    print(project_path(cfg['data']['val'][key]))
+PY
+)
+[[ "${#val[@]}" == 2 ]]
+args=()
+if [[ -n "${MRI_CASE_INVENTORY:-}" ]]; then args+=(--case-inventory "$MRI_CASE_INVENTORY"); fi
+gsbm_torchrun -m vemgsbm.mri_infer --split val --test-fraction 1 --checkpoint "$CHECKPOINT" \
+    --root-lq "${val[0]}" --root-hq "${val[1]}" --output-root "${OUTPUT_ROOT:-outputs/mri/${RUN_ID}_val}" \
+    --device cuda --inference-variant endpoint_safe --save-volume-limit 0 "${args[@]}"

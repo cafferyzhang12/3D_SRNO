@@ -17,6 +17,34 @@ class DriftNetwork(nn.Module):
         return (prediction - base) * (1 - mask)
 
 
+def diffusion_drift_weights(reference_sigma, inference_sigma):
+    """Weights for a new diffusion with the trained one-time marginals.
+
+    Both drifts use positive simulation time. Current velocity is (f-r)/2
+    and the score multiplied by reference_sigma**2 is f+r.
+    """
+    if not math.isfinite(reference_sigma) or reference_sigma <= 0:
+        raise ValueError("Diffusion correction requires positive finite training sigma")
+    if not math.isfinite(inference_sigma) or inference_sigma < 0:
+        raise ValueError("Inference sigma must be finite and nonnegative")
+    ratio = (inference_sigma / reference_sigma) ** 2
+    return (1 + ratio) / 2, (ratio - 1) / 2
+
+
+def diffusion_adjusted_model(model, reference_sigma, inference_sigma):
+    own, opposite = diffusion_drift_weights(reference_sigma, inference_sigma)
+    if opposite == 0:
+        return model
+
+    def drift(state, base, mask, time, direction):
+        other_direction = "backward" if direction == "forward" else "forward"
+        forward_time = model(state, base, mask, time, direction)
+        reversed_time = model(state, base, mask, time, other_direction)
+        return own * forward_time + opposite * reversed_time
+
+    return drift
+
+
 @torch.no_grad()
 def integrate(model, initial, base, mask, steps=20, sigma=0.1, direction="forward", generator=None,
               terminal_noise=True, state_guidance=None, transition_guidance=None):

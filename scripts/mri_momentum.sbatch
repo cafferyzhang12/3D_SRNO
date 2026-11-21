@@ -60,7 +60,7 @@ PY
 )
 [[ "${#val_roots[@]}" == 2 ]] || { echo 'Could not read validation roots' >&2; exit 2; }
 gsbm_torchrun -m vemgsbm.mri_infer --checkpoint "runs/mri/$RUN_ID/smoke/momentum/best.pt" \
-    --root-lq "${val_roots[0]}" \
+    --split val --root-lq "${val_roots[0]}" \
     --root-hq "${val_roots[1]}" \
     --scan-cache "runs/mri/$RUN_ID/smoke/index/val_inference.json" \
     --output-root "outputs/mri/${RUN_ID}_validation_smoke" --device cuda \
@@ -68,4 +68,4 @@ gsbm_torchrun -m vemgsbm.mri_infer --checkpoint "runs/mri/$RUN_ID/smoke/momentum
 gsbm_torchrun -m vemgsbm.momentum.train --config "${configs[1]}" --device cuda
 export CHECKPOINT="$PWD/runs/mri/$RUN_ID/momentum/best.pt"
 export INFERENCE_VARIANT=endpoint_safe
-exec bash scripts/mri_test.sbatch
+source scripts/mri_whole_val.sh

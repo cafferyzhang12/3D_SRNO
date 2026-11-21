@@ -35,7 +35,7 @@ PY
 )
 [[ "${#roots[@]}" == 3 ]] || { echo 'Could not read validation roots' >&2; exit 2; }
 gsbm_torchrun -m vemgsbm.mri_infer --checkpoint "runs/mri/$RUN_ID/bridge/best.pt" \
-    --root-lq "${roots[0]}" --root-hq "${roots[1]}" --scan-cache "${roots[2]}" \
+    --split val --root-lq "${roots[0]}" --root-hq "${roots[1]}" --scan-cache "${roots[2]}" \
     --output-root "outputs/mri/${RUN_ID}_validation_smoke" --device cuda \
     --max-cases 1 --test-fraction 1 --steps 2 --save-volume-limit 0
 printf 'VALIDATION_PASSED run_id=%s job_id=%s\n' "$RUN_ID" "$SLURM_JOB_ID"

@@ -9,6 +9,7 @@ Under torchrun, ranks reconstruct disjoint cases and publish one complete result
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 from functools import lru_cache
 import itertools
@@ -17,8 +18,11 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from time import perf_counter
+import time
 
 import numpy as np
+from scipy.ndimage import gaussian_laplace
 from skimage.metrics import structural_similarity
 import torch
 import torch.nn.functional as functional
@@ -27,6 +31,7 @@ from .bridge import reconstruct
 from .distributed import initialize_distributed
 from .infer import tile_starts
 from .mri_data import index_cases, read_plane
+from .network import diffusion_adjusted_model
 from .runtime import (atomic_save, build_models, fingerprint, load_checkpoint, project_path,
                       sampling_geometry_guidance, sampling_momentum_guidance, sampling_noise, setup)
 
@@ -42,7 +47,7 @@ def _read_lq(case, index):
     return plane
 
 
-def make_mri_tile(case, run, start, patch, scale, reader=None):
+def make_mri_tile(case, run, start, patch, scale, reader=None, with_native_lr=False):
     """Build a zero-mask HR-grid tile solely from a contiguous run of real LR.
 
     A one-pixel LR halo preserves global align_corners=False bilinear values at
@@ -73,12 +78,48 @@ def make_mri_tile(case, run, start, patch, scale, reader=None):
     upsampled = upsampled[:, 0, local_y:local_y + dy, local_x:local_x + dx][None, None]
     padding = (0, dx - upsampled.shape[-1], 0, dy - upsampled.shape[-2], 0, dz - upsampled.shape[-3])
     base = functional.pad(upsampled, padding, mode="replicate")
-    return base, torch.zeros_like(base)
+    result = (base, torch.zeros_like(base))
+    if not with_native_lr:
+        return result
+    if any(value % scale for value in (y, x, dy, dx)):
+        raise ValueError("Native LR tile boundaries must align with the LR grid")
+    ly, lx = y // scale - y0, x // scale - x0
+    native = lr[:, 0, ly:ly + dy // scale, lx:lx + dx // scale][None, None]
+    pad = (0, dx // scale - native.shape[-1], 0, dy // scale - native.shape[-2],
+           0, dz - native.shape[-3])
+    return (*result, functional.pad(native, pad, mode="replicate"))
 
 
 def _psnr(mse):
     # JSON-safe representation of the infinite PSNR of a perfect reconstruction.
     return -10 * math.log10(mse) if mse > 0 else None
+
+
+METRIC_PROTOCOL = {
+    "foreground": "HR > 2/255 in normalized intensity units",
+    "hfen": "pooled L2(XY LoG(pred-HR)) / L2(XY LoG(HR)), sigma 1.5 HR pixels, reflect",
+    "z_difference_mse": "voxel MSE of first differences over consecutive original slice indices",
+    "all_psnr_db": "10 log10(1 / pooled normalized voxel MSE)",
+    "mean_slice_ssim": "arithmetic mean of slice SSIM at unit data range",
+}
+
+
+def _regional_metrics(totals):
+    foreground_mse = (totals["foreground_sse"] / totals["foreground_voxels"]
+                      if totals["foreground_voxels"] else None)
+    return {
+        "foreground_mse": foreground_mse,
+        "foreground_psnr_db": _psnr(foreground_mse) if foreground_mse is not None else None,
+        "hfen": (math.sqrt(totals["log_error_energy"] / totals["log_reference_energy"])
+                 if totals["log_reference_energy"] > 0 else None),
+        "z_difference_mse": (totals["z_difference_sse"] / totals["z_difference_voxels"]
+                             if totals["z_difference_voxels"] else None),
+    }
+
+
+def _region_totals():
+    return {"foreground_voxels": 0, "foreground_sse": 0., "log_error_energy": 0.,
+            "log_reference_energy": 0., "z_difference_sse": 0., "z_difference_voxels": 0}
 
 
 def case_metrics(prediction, case):
@@ -88,6 +129,8 @@ def case_metrics(prediction, case):
     if prediction.shape[0] != len(case.hq):
         raise ValueError("Prediction must cover every retained HQ slice exactly once")
     records, squared_error, pixel_count = [], 0.0, 0
+    regional = _region_totals()
+    previous_error = None
     for z, (stem, original_index, reference_path) in enumerate(zip(case.stems, case.indices, case.hq)):
         reference = read_plane(
             reference_path, normalization_scale=case.normalization_scale,
@@ -99,7 +142,17 @@ def case_metrics(prediction, case):
             raise ValueError(f"Prediction/HQ XY shapes differ for {case.id}/{stem}")
         if not np.isfinite(pred).all() or pred.min() < 0 or pred.max() > 1:
             raise ValueError("Metric inputs must be normalized finite values in [0, 1]")
-        error = np.square(pred - reference)
+        residual = pred - reference
+        error = np.square(residual)
+        foreground = reference > float(np.float32(2 / 255))
+        regional["foreground_voxels"] += int(foreground.sum())
+        regional["foreground_sse"] += float(error[foreground].sum())
+        regional["log_error_energy"] += float(np.square(gaussian_laplace(residual, 1.5)).sum())
+        regional["log_reference_energy"] += float(np.square(gaussian_laplace(reference, 1.5)).sum())
+        if previous_error is not None and original_index == case.indices[z - 1] + 1:
+            regional["z_difference_sse"] += float(np.square(residual - previous_error).sum())
+            regional["z_difference_voxels"] += residual.size
+        previous_error = residual
         mse = float(error.mean())
         squared_error += float(error.sum())
         pixel_count += error.size
@@ -120,6 +173,7 @@ def case_metrics(prediction, case):
         "perfect_match": mse == 0,
         "mean_slice_ssim": float(np.mean(ssim_values)) if ssim_values else None,
         "ssim_slice_count": len(ssim_values), "slices": records,
+        **regional, **_regional_metrics(regional),
     }
 
 
@@ -155,8 +209,12 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
     variance[:] = 0
     axes = [np.hanning(n + 2)[1:-1].astype("float32") for n in patch]
     window = axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
-    y_starts = tile_starts(shape[1], patch[1], max(1, patch[1] // 2))
-    x_starts = tile_starts(shape[2], patch[2], max(1, patch[2] // 2))
+    native_input = config["mode"] in {"haar_direct", "haar_bridge"}
+    def spatial_starts(length, size):
+        unit = scale if native_input else 1
+        return [i * unit for i in tile_starts(length // unit, size // unit, max(1, size // unit // 2))]
+    y_starts = spatial_starts(shape[1], patch[1])
+    x_starts = spatial_starts(shape[2], patch[2])
 
     @lru_cache(maxsize=max(1, patch[0] * 2))
     def reader(index):
@@ -174,11 +232,13 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
                     run_length = run[1] - run[0]
                     z_starts = tile_starts(run_length, patch[0], max(1, patch[0] // 2))
                     for start in itertools.product(z_starts, y_starts, x_starts):
-                        base, mask = make_mri_tile(case, run, start, patch, scale, reader=reader)
-                        prediction = reconstruct(
+                        base, mask, *native = make_mri_tile(case, run, start, patch, scale,
+                                                           reader=reader, with_native_lr=native_input)
+                        prediction = base if config.get("predictor") == "bilinear" else reconstruct(
                             model, base.to(device), mask.to(device), config["mode"], geometry=geometry,
                             steps=steps, sigma=sigma, generator=generator,
                             terminal_noise=not improved, geometry_guidance=guidance,
+                            **({"native_lr": native[0].to(device)} if native else {}),
                             **({"momentum_guidance": momentum_guidance} if momentum_guidance is not None else {}),
                         )
                         tile = prediction[0, 0] if improved else prediction[0, 0].clamp(0, 1)
@@ -221,15 +281,18 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
 def _write_case(case, staged, model, geometry, config, device, seed, steps, samples,
                 checkpoint_hash, root_lq, root_hq, save_volume=True):
     folder = staged / case.id
+    started = perf_counter()
     # Each case resets its generators to seed + sample. Keeping this original
     # convention makes stochastic predictions independent of rank assignment.
+    started = time.perf_counter()
     shape, metrics = _infer_case(case, folder, model, geometry, config, device, seed, steps, samples)
+    elapsed = time.perf_counter() - started
     variant = config.get("inference_variant", "legacy")
     momentum = config["mode"] == "momentum"
     guidance = sampling_geometry_guidance(config)
     improved = guidance is not None or variant == "endpoint_safe" or momentum
     metadata = {
-        "case_id": case.id, "checkpoint_sha256": checkpoint_hash,
+        "case_id": case.id, "checkpoint_sha256": checkpoint_hash, "evaluation_seconds": elapsed,
         "root_lq": str(Path(root_lq).resolve()),
         "root_hq": str(Path(root_hq).resolve()) if root_hq else None,
         "shape_zyx": list(shape), "scale_xy": config["data"]["scale"], "scale_z": 1,
@@ -244,6 +307,7 @@ def _write_case(case, staged, model, geometry, config, device, seed, steps, samp
         "normalization_offset": case.normalization_offset, "channel_policy": case.channel_policy,
         "mode": config["mode"], "seed": seed, "steps": steps, "samples": samples,
         "sampling_sigma": sampling_noise(config), "reference_sigma": config["sampling"]["sigma"],
+        "inference_and_metrics_seconds": perf_counter() - started,
         "base": "real LR, per-slice bilinear XY, align_corners=False", "observed_mask": "all_zero",
         "volume_exported": save_volume,
         "mean_file": "mean.npy" if save_volume else None,
@@ -256,6 +320,10 @@ def _write_case(case, staged, model, geometry, config, device, seed, steps, samp
         "terminal_position_noise": not improved,
         "intensity_output": "overlap blended then clipped to [0,1]" if improved else "per-patch clipped to [0,1], overlap blended",
     }
+    metadata.update(_gsbm_sampler_metadata(config, steps))
+    metadata["predictor"] = config.get("predictor", "model")
+    if metadata["predictor"] == "bilinear":
+        metadata.update(inference_variant="bilinear", terminal_position_noise=False)
     if guidance is not None:
         metadata["geometry_guidance"] = guidance
     momentum_guidance = sampling_momentum_guidance(config)
@@ -320,6 +388,7 @@ def _collect_summary(staged, cases, checkpoint_hash, exported_case_ids=None):
                 raise RuntimeError(f"Incomplete MRI result metrics: {case.id}")
         case_summaries.append({
             "case_id": case.id, "slices": shape[0],
+            "input_fingerprint": case.fingerprint, "evaluation_seconds": metadata["evaluation_seconds"],
             "metrics": {key: value for key, value in metrics.items() if key != "slices"} if metrics else None,
         })
     summary = {"cases": case_summaries, "total_slices": sum(case["slices"] for case in case_summaries)}
@@ -330,8 +399,25 @@ def _collect_summary(staged, cases, checkpoint_hash, exported_case_ids=None):
         ssim_count = sum(value["ssim_slice_count"] for value in available_metrics)
         ssim_sum = sum((value["mean_slice_ssim"] or 0) * value["ssim_slice_count"] for value in available_metrics)
         summary.update(all_mse=mse, all_psnr_db=_psnr(mse), perfect_match=mse == 0,
+                       pixel_count=pixels, ssim_slice_count=ssim_count,
                        mean_slice_ssim=ssim_sum / ssim_count if ssim_count else None)
+        regional = {key: sum(row[key] for row in available_metrics) for key in _region_totals()}
+        summary.update(regional, **_regional_metrics(regional), metric_protocol=METRIC_PROTOCOL)
     return summary
+
+
+def write_metrics_csv(staged, summary):
+    """Write spreadsheet-readable views of the same verified statistics."""
+    if "all_mse" not in summary:
+        return
+    cases = [{"evaluation_seconds": case["evaluation_seconds"], **case["metrics"]} for case in summary["cases"]]
+    row = {k: v for k, v in summary.items() if v is None or isinstance(v, (str, float, int))}
+    row["case_count"] = len(cases)
+    for name, rows in (("per_case.csv", cases), ("summary.csv", [row])):
+        with (staged / name).open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def select_case_subset(cases, fraction=0.15, seed=20261110):
@@ -371,11 +457,22 @@ def _checked_rank_call(context, function):
     return result
 
 
+def _gsbm_sampler_metadata(config, steps):
+    if config.get("predictor") == "bilinear":
+        return {"drift_network_calls_per_tile_sample": 0}
+    if config["mode"] != "gsbm":
+        return {}
+    sampler = config["sampling"].get("drift_sampler", "forward")
+    doubled = sampler == "diffusion_corrected" and sampling_noise(config) != config["sampling"]["sigma"]
+    return {"drift_sampler": sampler, "drift_network_calls_per_tile_sample": steps * (1 + int(doubled))}
+
+
 def infer_mri(
     checkpoint_path, root_lq, output_root, root_hq=None, device_name="auto", seed=42,
     steps=None, samples=1, case_ids=None, max_cases=None, scan_cache=None,
-    channel_policy="identical_rgb_to_gray", save_volume_limit=None, test_fraction=0.15, subset_seed=20261110,
-    inference_variant="legacy", subset_manifest=None, case_inventory=None,
+    channel_policy="identical_rgb_to_gray", save_volume_limit=None, test_fraction=None, subset_seed=20261110,
+    inference_variant="legacy", subset_manifest=None, case_inventory=None, split=None, predictor="model",
+    drift_sampler=None, inference_sigma=None, disable_guidance=False, readout=None,
 ):
     """Publish all cases atomically; torchrun assigns each case to exactly one rank.
 
@@ -387,6 +484,14 @@ def infer_mri(
     """
     if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
         raise ValueError("samples must be a positive integer")
+    if split not in {None, "val", "test"}:
+        raise ValueError("MRI evaluation split must be val or test")
+    if predictor not in {"model", "bilinear"}:
+        raise ValueError("Unknown MRI predictor")
+    if case_inventory is not None and split is None:
+        split = "test"  # Legacy inventory callers always evaluated the test split.
+    if test_fraction is None:
+        test_fraction = 1.0 if split == "val" else 0.15
     if inference_variant not in {"legacy", "endpoint_safe"}:
         raise ValueError("Unknown inference variant")
     if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int) or steps < 1):
@@ -418,9 +523,35 @@ def infer_mri(
     def load_models():
         checkpoint = load_checkpoint(checkpoint_path)
         config = _validate_mri_checkpoint(checkpoint)
-        config = {**config, "inference_variant": inference_variant}
+        sampling = dict(config["sampling"])
+        if readout is not None:
+            if config["mode"] != "haar_bridge" or readout not in {"integral", "endpoint"}:
+                raise ValueError("Readout override requires a Haar residual bridge")
+            if readout == "endpoint" and config["train"].get("endpoint_weight", 1.) == 0:
+                raise ValueError("Endpoint readout requires endpoint supervision")
+            sampling["readout"] = readout
+        if drift_sampler is not None:
+            sampling["drift_sampler"] = drift_sampler
+        if disable_guidance:
+            sampling["geometry_guidance"] = None
+        if inference_sigma is not None:
+            sampling["inference_sigma"] = inference_sigma
+        sampler = sampling.get("drift_sampler", "forward")
+        if sampler not in {"forward", "diffusion_corrected"}:
+            raise ValueError("Unknown drift sampler")
+        if (disable_guidance or drift_sampler is not None or sampler != "forward") and config["mode"] != "gsbm":
+            raise ValueError("Drift sampler and online guidance overrides require GSBM")
+        config = {**config, "sampling": sampling, "inference_variant": inference_variant, "predictor": predictor}
+        if config["mode"] in {"haar_direct", "haar_bridge"}:
+            config["inference_variant"] = "endpoint_safe"
         device = setup(seed, str(context.device), config["train"].get("threads", 4))
-        model, geometry = build_models(checkpoint, device)
+        if predictor == "bilinear":
+            sampling.update(inference_sigma=0., geometry_guidance=None, momentum_geometry=None)
+            config.update(inference_variant="endpoint_safe", chart_momentum=None)
+            return config, device, None, None
+        model, geometry = build_models({**checkpoint, "config": config}, device)
+        if sampler == "diffusion_corrected":
+            model = diffusion_adjusted_model(model, sampling["sigma"], sampling_noise(config))
         return config, device, model, geometry
 
     try:
@@ -428,8 +559,16 @@ def infer_mri(
         config, device, model, geometry = _checked_rank_call(context, load_models)
         data = config["data"]
         steps = config["sampling"]["steps"] if steps is None else steps
+        if predictor == "bilinear":
+            steps = 0
 
         def prepare_cases():
+            if split is not None:
+                roots = data[split]
+                if (root_hq is None or Path(root_lq).expanduser().resolve() != project_path(roots["root_lq"])
+                        or Path(root_hq).expanduser().resolve() != project_path(roots["root_hq"])
+                        or channel_policy != data.get("channel_policy", "identical_rgb_to_gray")):
+                    raise ValueError(f"MRI {split} evaluation requires its configured paired data roots and channel policy")
             if case_inventory is None:
                 cases = index_cases(
                     root_lq, root_hq=root_hq, scale=data["scale"], cache_path=scan_cache,
@@ -440,14 +579,13 @@ def infer_mri(
             else:
                 from .mri_inventory import load_inventory
 
-                roots = data["test"]
-                if (max_cases is not None or root_hq is None or data.get("debug_case_limit") is not None
-                        or Path(root_lq).expanduser().resolve() != project_path(roots["root_lq"])
-                        or Path(root_hq).expanduser().resolve() != project_path(roots["root_hq"])
-                        or channel_policy != data.get("channel_policy", "identical_rgb_to_gray")):
+                if split == "test" and (max_cases is not None or data.get("debug_case_limit") is not None):
                     raise ValueError("Prepared MRI test inventory requires the full paired test input contract")
-                indexed, _ = load_inventory(case_inventory, data, ("test",))
-                cases = indexed["test"]
+                indexed, identity = load_inventory(case_inventory, data, (split,))
+                all_ids = [row["id"].casefold() for row in identity]
+                if len(all_ids) != len(set(all_ids)):
+                    raise ValueError("Prepared MRI inventory contains duplicate case IDs across splits")
+                cases = indexed[split][:max_cases]
             if case_ids:
                 requested = set(case_ids)
                 found = {case.id for case in cases}
@@ -482,8 +620,14 @@ def infer_mri(
         def publish():
             summary = _collect_summary(staged, cases, checkpoint_hash, exported_case_ids)
             summary["subset"] = subset
-            summary["inference_variant"] = "momentum_bridge" if config["mode"] == "momentum" else inference_variant
+            summary.update(split=split or "custom", checkpoint_sha256=checkpoint_hash,
+                           predictor=predictor, steps=steps, samples=samples, seed=seed)
+            summary["inference_variant"] = "momentum_bridge" if config["mode"] == "momentum" else config["inference_variant"]
+            if config["mode"] in {"haar_direct", "haar_bridge"} and predictor == "model":
+                summary["readout"] = config["sampling"].get("readout", "integral")
+                summary["network_calls_per_tile_sample"] = steps if config["mode"] == "haar_bridge" else 1
             summary["sampling_sigma"] = sampling_noise(config)
+            summary.update(_gsbm_sampler_metadata(config, steps))
             summary["reference_sigma"] = config["sampling"]["sigma"]
             if config.get("chart_momentum") is not None:
                 summary["inference_variant"] = "chart_trivialized_momentum_bridge"
@@ -495,8 +639,11 @@ def infer_mri(
             if momentum_guidance is not None:
                 summary["inference_variant"] = "mls_guided_momentum_bridge"
                 summary["momentum_geometry"] = momentum_guidance
+            if predictor == "bilinear":
+                summary["inference_variant"] = "bilinear"
             atomic_save(subset, staged / "subset_manifest.json", json_file=True)
             atomic_save(summary, staged / "summary.json", json_file=True)
+            write_metrics_csv(staged, summary)
             if output_root.exists():
                 raise FileExistsError(f"MRI output appeared before publication: {output_root}")
             os.rename(staged, output_root)
@@ -533,10 +680,18 @@ def main():
         "Keep mean/variance volumes only for the first N naturally sorted selected cases; "
         "0 keeps only metrics/metadata. All cases are evaluated; omitting volumes requires HQ."
     ))
-    parser.add_argument("--test-fraction", type=float, default=0.15)
+    parser.add_argument("--split", choices=["val", "test"], help="Validate paired roots against this checkpoint split")
+    parser.add_argument("--predictor", choices=["model", "bilinear"], default="model",
+                        help="Use the checkpoint protocol and the selected reconstruction method")
+    parser.add_argument("--fraction", "--test-fraction", type=float, dest="test_fraction",
+                        help="Whole-case sampling fraction (VAL 1, TEST 0.15 by default)")
     parser.add_argument("--subset-seed", type=int, default=20261110)
     parser.add_argument("--subset-manifest")
     parser.add_argument("--inference-variant", choices=["legacy", "endpoint_safe"], default="legacy")
+    parser.add_argument("--drift-sampler", choices=["forward", "diffusion_corrected"])
+    parser.add_argument("--inference-sigma", type=float)
+    parser.add_argument("--disable-guidance", action="store_true")
+    parser.add_argument("--readout", choices=["integral", "endpoint"])
     parser.add_argument("--scan-cache")
     parser.add_argument("--case-inventory")
     parser.add_argument("--channel-policy", default="identical_rgb_to_gray")
@@ -547,7 +702,8 @@ def main():
         max_cases=args.max_cases, scan_cache=args.scan_cache, channel_policy=args.channel_policy,
         save_volume_limit=args.save_volume_limit, test_fraction=args.test_fraction, subset_seed=args.subset_seed,
         inference_variant=args.inference_variant, subset_manifest=args.subset_manifest,
-        case_inventory=args.case_inventory,
+        drift_sampler=args.drift_sampler, inference_sigma=args.inference_sigma, disable_guidance=args.disable_guidance,
+        case_inventory=args.case_inventory, split=args.split, predictor=args.predictor, readout=args.readout,
     )
     if int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps({"output_root": str(output)}, ensure_ascii=False), flush=True)

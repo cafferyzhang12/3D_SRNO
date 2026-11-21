@@ -257,6 +257,23 @@ def test_prepared_inventory_reuses_pairing_and_test_subset(trained_pipeline, tmp
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert summary["subset"]["selected_cases"] == 3
     assert summary["total_slices"] == 9
+    val = cfg["data"]["val"]
+    common = dict(root_hq=val["root_hq"], device_name="cpu", steps=2, predictor="bilinear",
+                  case_inventory=inventory, split="val")
+    with pytest.raises(ValueError, match="configured paired data roots"):
+        infer_mri(bridge / "best.pt", roots["root_lq"], tmp_path / "bad_root", **common)
+    val_out = tmp_path / "inventory_val"
+    infer_mri(bridge / "best.pt", val["root_lq"], val_out, **common)
+    val_summary = json.loads((val_out / "summary.json").read_text())
+    assert val_summary["subset"]["case_ids"] == ["val_00", "val_01"]
+    assert val_summary["split"] == "val" and val_summary["subset"]["fraction"] == 1
+    assert val_summary["pixel_count"] == 2 * 3 * 8**2 and val_summary["ssim_slice_count"] == 6
+    assert val_summary["steps"] == val_summary["drift_network_calls_per_tile_sample"] == 0
+    assert len((val_out / "per_case.csv").read_text().splitlines()) == 3
+    assert (val_out / "summary.csv").exists()
+    smoke = tmp_path / "inventory_smoke"
+    infer_mri(bridge / "best.pt", val["root_lq"], smoke, max_cases=1, **common)
+    assert json.loads((smoke / "summary.json").read_text())["subset"]["case_ids"] == ["val_00"]
     cfg["data"]["debug_case_limit"] = 1
     with pytest.raises(ValueError, match="data contract differ"):
         training_data(cfg, inventory)

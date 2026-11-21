@@ -9,6 +9,7 @@ import copy
 import json
 import math
 from pathlib import Path
+import tempfile
 
 import torch
 from torch import nn
@@ -22,6 +23,7 @@ from .bridge import reconstruct
 from .mri_metrics import mean_xy_ssim
 from .network import DriftNetwork, integrate
 from .paths import optimize_path, sample_path
+from .haar_residual import HAAR_MODES, HaarObjective, make_haar_model
 from .runtime import (read_config, project_path, setup, atomic_save, load_checkpoint,
                       sampling_geometry_guidance, sampling_noise)
 
@@ -90,20 +92,56 @@ def _collect_metric(encoder, loader, cfg, context):
     return context.main_call(fit, broadcast_result=True)
 
 
+def _whole_case_validation(model, cases, cfg, context, run_dir, epoch):
+    from .mri_infer import _infer_case
+
+    records, error = [], None
+    try:
+        for case in cases[context.rank::context.world_size]:
+            with tempfile.TemporaryDirectory(dir=run_dir) as temp:
+                _, row = _infer_case(case, Path(temp) / case.id, model, None,
+                                     {**cfg, "inference_variant": "endpoint_safe"}, context.device,
+                                     cfg["train"].get("validation_seed", 42), cfg["sampling"]["steps"], 1)
+            records.append({key: value for key, value in row.items() if key != "slices"})
+    except Exception as exc:
+        error = f"Whole-case VAL: {type(exc).__name__}: {exc}"
+    context.check_errors(error)
+    if context.is_distributed:
+        gathered = [None] * context.world_size
+        torch.distributed.all_gather_object(gathered, records)
+        records = [row for shard in gathered for row in shard]
+    records.sort(key=lambda row: row["case_id"])
+    if [row["case_id"] for row in records] != sorted(case.id for case in cases):
+        raise RuntimeError("Incomplete whole-case validation")
+    pixels = sum(row["pixel_count"] for row in records)
+    mse = sum(row["squared_error_sum"] for row in records) / pixels
+    n_ssim = sum(row["ssim_slice_count"] for row in records)
+    ssim = (sum((row["mean_slice_ssim"] or 0.) * row["ssim_slice_count"] for row in records)
+            / n_ssim if n_ssim else None)
+    metrics = {"val_pooled_mse": mse, "val_pooled_psnr_db": -10 * math.log10(mse) if mse else None,
+               "val_mean_slice_ssim": ssim, "val_pixel_count": pixels, "val_case_count": len(records)}
+    context.main_call(lambda: atomic_save({"cases": records, **metrics},
+                                          run_dir / "whole_val" / f"epoch_{epoch:04}.json", json_file=True))
+    return metrics
+
+
 def run_training(config_path, stage="bridge", device_name="auto", resume=None, case_inventory=None):
     cfg = read_config(config_path)
+    haar = cfg["mode"] in HAAR_MODES
+    if haar and (stage != "bridge" or cfg.get("atlas")):
+        raise ValueError("Train native LR residual models with stage=bridge and no legacy atlas")
     atlas_options = cfg.get("atlas")
     online_guidance = sampling_geometry_guidance(cfg)
     source_routing = bool(atlas_options and atlas_options.get("source_routing"))
     matching_weight = float(cfg["train"].get("metric_matching_weight", 0.0))
     if not math.isfinite(matching_weight) or matching_weight < 0 or (matching_weight and not source_routing):
         raise ValueError("metric_matching_weight must be nonnegative and requires LR chart routing")
-    if cfg["mode"] != "gsbm" and not (atlas_options and stage == "representation"):
+    if not haar and cfg["mode"] != "gsbm" and not (atlas_options and stage == "representation"):
         raise ValueError("Use vemgsbm.momentum.train for momentum configs")
     if stage not in {"representation", "bridge"}:
         raise ValueError("Unknown stage")
     selection_metric = cfg["train"].get("selection_metric", "mse")
-    if selection_metric not in ("mse", "ssim"):
+    if selection_metric not in ("mse", "ssim") and not (haar and selection_metric == "pooled_psnr"):
         raise ValueError("train.selection_metric must be mse or ssim")
     paired_mri = cfg["data"].get("kind") == "paired_mri_png"
     if selection_metric == "ssim" and not paired_mri:
@@ -150,12 +188,15 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                             pin_memory=device.type == "cuda")
         val_loader = DataLoader(val_set, batch_size=cfg["train"]["batch_size"],
                                sampler=ValidationShardSampler(val_set, context.rank, context.world_size), num_workers=0)
-        encoder = Representation(width=cfg["representation"]["width"],
-                                 feature_dim=cfg["representation"]["feature_dim"],
-                                 packed_xy=bool(atlas_options)).to(device)
+        encoder = None if haar else Representation(width=cfg["representation"]["width"],
+                                                   feature_dim=cfg["representation"]["feature_dim"],
+                                                   packed_xy=bool(atlas_options)).to(device)
         model, metric = None, None
         atlas_payload = None
-        if stage == "representation":
+        if haar:
+            model = make_haar_model(cfg).to(device)
+            objective = HaarObjective(model, cfg)
+        elif stage == "representation":
             objective = RepresentationObjective(encoder)
         else:
             if atlas_options:
@@ -175,7 +216,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                                           cfg["path"].get("geometry_ramp_power", 0.0))
         parameters = list(objective.parameters())
         optimizer = torch.optim.AdamW(parameters, lr=cfg["train"]["learning_rate"], weight_decay=1e-5)
-        start, best = 0, float("inf")
+        start, best, stale_epochs = 0, float("inf"), 0
         if resume:
             old = load_checkpoint(project_path(resume))
             if old["training_stage"] != stage or old["manifest_sha256"] != digest or old["data_identity"] != identity:
@@ -196,6 +237,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             (encoder if stage == "representation" else model).load_state_dict(old["model"])
             optimizer.load_state_dict(old["optimizer"])
             start, best = old["epoch"], old["best"]
+            stale_epochs = old.get("stale_epochs", 0)
         raw_objective = objective
         if context.is_distributed:
             objective = DistributedDataParallel(objective, device_ids=[context.local_rank] if device.type == "cuda" else None,
@@ -203,8 +245,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
         if context.is_main:
             print(json.dumps({"stage": stage, "world_size": context.world_size,
                               "per_rank_batch": cfg["train"]["batch_size"],
-                              "global_patches": len(train_set), "method": "paired conditional variational GSBM",
-                              "geometry": "source_conditioned_mls" if source_routing else ("mls" if atlas_options else "land"),
+                              "global_patches": len(train_set), "method": cfg["mode"] if haar else "paired conditional variational GSBM",
+                              "geometry": "none" if haar else ("source_conditioned_mls" if source_routing else ("mls" if atlas_options else "land")),
                               "atlas": atlas_payload["diagnostics"] if atlas_payload else None}), flush=True)
         for epoch in range(start, cfg["train"]["epochs"]):
             torch.manual_seed(cfg["train"]["seed"] + epoch + 100003 * context.rank)
@@ -222,7 +264,9 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     batch = next(iterator)
                     hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
                     path_diagnostics = {}
-                    if stage == "bridge":
+                    if haar:
+                        lr = batch["lr"].to(device)
+                    elif stage == "bridge":
                         geometry = metric.bind(base if source_routing else hr) if atlas_options else metric
                         path, path_diagnostics = optimize_path(base, hr, mask, geometry, cfg["path"])
                         path_diagnostics["updated"] = float(path_diagnostics["accepted_steps"] > 0)
@@ -237,9 +281,13 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 optimizer.zero_grad(set_to_none=True)
                 error = None
                 try:
-                    terms = objective(hr) if stage == "representation" else objective(
-                        state.detach(), base, mask, times, forward_target.detach(), backward_target.detach(),
-                        geometry=geometry if source_routing else None)
+                    if haar:
+                        terms = objective(lr, base, hr)
+                    elif stage == "representation":
+                        terms = objective(hr)
+                    else:
+                        terms = objective(state.detach(), base, mask, times, forward_target.detach(),
+                                          backward_target.detach(), geometry=geometry if source_routing else None)
                     loss = terms["loss"]
                     if not torch.isfinite(loss):
                         raise FloatingPointError("Nonfinite matching/representation loss")
@@ -274,7 +322,11 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 with torch.no_grad():
                     for batch in val_loader:
                         hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
-                        if stage == "representation":
+                        if haar:
+                            prediction = model.restore(batch["lr"].to(device), base, cfg["sampling"]["steps"],
+                                                       inference_sigma).clamp(0, 1)
+                            value = (prediction - hr).square().mean()
+                        elif stage == "representation":
                             value = representation_loss(encoder, hr)["loss"]
                         elif online_guidance:
                             steps = cfg["sampling"]["steps"]
@@ -317,7 +369,12 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 raise RuntimeError("Invalid validation accounting/score")
             validation = total / items
             score = 1 - ssim_total / items if stage == "bridge" and selection_metric == "ssim" else validation
+            if selection_metric == "pooled_psnr":
+                whole_metrics = _whole_case_validation(model, val_set.all_cases, cfg, context, run_dir, epoch + 1)
+                record.update(whole_metrics)
+                score = whole_metrics["val_pooled_mse"]
             improved = score < best
+            stale_epochs = 0 if improved else stale_epochs + 1
             best = min(best, score)
             record.update(validation=validation, validation_items=int(items), selection_score=score,
                           selection_metric=selection_metric if stage == "bridge" else "representation_loss")
@@ -352,17 +409,18 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     record["atlas"] = payload["diagnostics"]
                 else:
                     payload = _collect_metric(encoder, loader, cfg, context)
-            elif not atlas_options:
+            elif not atlas_options and not haar:
                 payload = metric_payload(metric)
 
             def save():
-                checkpoint = {"format_version": 2, "algorithm": "paired_conditional_variational_gsbm",
+                checkpoint = {"format_version": 3 if haar else 2,
+                              "algorithm": cfg["mode"] if haar else "paired_conditional_variational_gsbm",
                               "stage": "representation" if stage == "representation" else "reconstruction",
                               "training_stage": stage, "config": cfg, "epoch": epoch + 1,
                               "model": (encoder if stage == "representation" else model).state_dict(),
                               "optimizer": optimizer.state_dict(), "best": best, "world_size": context.world_size,
                               "manifest_sha256": digest, "data_identity": identity,
-                              "metric": payload}
+                              "metric": payload, "stale_epochs": stale_epochs}
                 atomic_save(checkpoint, run_dir / "last.pt")
                 if improved:
                     atomic_save(checkpoint, run_dir / "best.pt")
@@ -370,6 +428,9 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     stream.write(json.dumps(record) + "\n")
                 print(json.dumps(record), flush=True)
             context.main_call(save)
+            patience = cfg["train"].get("whole_val_patience")
+            if selection_metric == "pooled_psnr" and patience is not None and stale_epochs >= patience:
+                break
         return run_dir
     finally:
         if lock is not None:

@@ -37,7 +37,7 @@ PY
 )
         [[ "${#validation[@]}" == 3 ]]
         gsbm_torchrun -m vemgsbm.mri_infer --checkpoint "$CHECKPOINT" \
-            --root-lq "${validation[0]}" --root-hq "${validation[1]}" \
+            --split val --root-lq "${validation[0]}" --root-hq "${validation[1]}" \
             --scan-cache "$run/index/val_inference.json" \
             --output-root "outputs/mri/${RUN_ID}_validation_smoke" --device cuda \
             --max-cases 1 --test-fraction 1 --steps "${validation[2]}" --save-volume-limit 0 \
@@ -45,4 +45,4 @@ PY
     fi
 done
 export MRI_CASE_INVENTORY="$inventory" INFERENCE_VARIANT=endpoint_safe
-exec bash scripts/mri_test.sbatch
+source scripts/mri_whole_val.sh
