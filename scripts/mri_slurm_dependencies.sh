@@ -72,33 +72,47 @@ mri_slurm_dependencies() {
 }
 
 mri_slurm_submit() {
-    local dependencies="$1" live retry job
+    local dependencies="$1" live retry job errfile diagnostic line
     shift
-    local -a options
+    local -a options ids
     live=$(mri_slurm_dependencies "$dependencies") || return 1
     for retry in 0 1; do
         options=()
         if [[ -n "$live" ]]; then options+=(--dependency="afterok:$live" --kill-on-invalid-dep=yes); fi
-        if job=$(sbatch --parsable --export=ALL "${options[@]}" "$@" 2>&1); then
-            # A successful parsable submission returns JobID or JobID;cluster.
-            if [[ ! "$job" =~ ^([0-9]+)(\;[^[:space:]]+)?$ ]]; then
-                echo "Unexpected sbatch reply: $job. Check the queue before resubmitting." >&2
+        errfile=$(mktemp) || return 1
+        if job=$(sbatch --parsable --export=ALL "${options[@]}" "$@" 2>"$errfile"); then
+            cat "$errfile" >&2
+            rm -f "$errfile"
+            # Site wrappers also print informational messages on stdout. Only a
+            # complete line containing JobID or JobID;cluster identifies a job.
+            ids=()
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^[[:space:]]*([0-9]+)(\;[^\;[:space:]]+)?[[:space:]]*$ ]]; then
+                    ids+=("${BASH_REMATCH[1]}")
+                elif [[ -n "$line" ]]; then
+                    printf '%s\n' "$line" >&2
+                fi
+            done <<< "$job"
+            if [[ "${#ids[@]}" != 1 ]]; then
+                echo "Expected one standalone job ID in successful sbatch reply: $job. Check the queue before resubmitting." >&2
                 return 1
             fi
-            echo "${BASH_REMATCH[1]}"
+            echo "${ids[0]}"
             return 0
         fi
+        diagnostic=$(<"$errfile")
+        rm -f "$errfile"
         # A remaining job can complete and be purged between squeue and sbatch.
         # Retry only after an explicit dependency rejection and a changed live set.
         if [[ $retry == 0 && -n "$live" ]]; then
-            case "${job,,}" in
+            case "${diagnostic,,}" in
                 *"job dependency problem"*|*"invalid job id"*|*"invalid dependency"*)
                     local refreshed
                     refreshed=$(mri_slurm_dependencies "$dependencies") || return 1
                     if [[ "$refreshed" != "$live" ]]; then live="$refreshed"; continue; fi ;;
             esac
         fi
-        echo "$job" >&2
+        echo "$diagnostic" >&2
         return 1
     done
 }

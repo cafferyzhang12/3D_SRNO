@@ -38,6 +38,7 @@ cat "db/$2.acct" 2>/dev/null
 """,
         "sbatch": """
 echo "$*" >> db/submitted
+echo 'sbatch: warning: mock partition message' >&2
 if [[ "$*" == *"afterok:107"* && -f db/107.race ]]; then
     rm db/107.race db/107.queue
     echo '107|COMPLETED|0:0' > db/107.acct
@@ -46,6 +47,7 @@ if [[ "$*" == *"afterok:107"* && -f db/107.race ]]; then
 fi
 job=$((600 + $(wc -l < db/submitted)))
 echo "$job|PENDING" > "db/$job.queue"
+if [[ -f db/wrapper_stdout ]]; then cat db/wrapper_stdout; exit 0; fi
 echo "$job;cluster"
 """,
     }.items():
@@ -62,8 +64,25 @@ echo "$job;cluster"
         env = dict(os.environ, SLURM_LOOKUP_ATTEMPTS="2",SLURM_LOOKUP_DELAY="0",**settings)
         # Let Bash put POSIX mock executables before the real scheduler.
         return subprocess.run([bash,"-c","export PATH=\"$PWD/mockbin:$PATH\"; "+command],
-                              env=env,cwd=tmp_path, text=True,capture_output=True,timeout=20)
+                              env=env,cwd=tmp_path, text=True,encoding="utf-8",capture_output=True,timeout=20)
     return run,db
+
+
+@pytest.mark.parametrize("reply,expected", [
+    ("sbatch: 提示：本作业申请 1 张 A800\n===== 高优先队列 =====\n  5290001  \n", "5290001"),
+    ("队列 42 已就绪\n5290002;gpu-cluster\nsbatch: 提交成功\n", "5290002"),
+    ("sbatch: 提示\n5290001\n5290002;gpu-cluster\n", None),
+    ("sbatch: 状态代码 200，任务已提交\n=====\n", None),
+])
+def test_wrapper_multiline_stdout(scheduler,reply,expected):
+    run,db = scheduler
+    (db/"wrapper_stdout").write_text(reply,encoding="utf-8",newline="\n")
+    result = run("source scripts/mri_slurm_dependencies.sh; mri_slurm_submit '' job.sh")
+    assert len((db/"submitted").read_text().splitlines()) == 1
+    if expected is None:
+        assert result.returncode != 0 and "Check the queue" in result.stderr and not result.stdout
+    else:
+        assert result.returncode == 0 and result.stdout.strip() == expected
 
 
 def test_submission_filters_controller_and_accounting(scheduler):
