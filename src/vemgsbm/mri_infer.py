@@ -514,6 +514,7 @@ def infer_mri(
     channel_policy="identical_rgb_to_gray", save_volume_limit=None, test_fraction=None, subset_seed=20261110,
     inference_variant="legacy", subset_manifest=None, case_inventory=None, split=None, predictor="model",
     drift_sampler=None, inference_sigma=None, disable_guidance=False, readout=None, resume_cases=False,
+    archive_confirmation=None,
 ):
     """Publish all cases atomically; torchrun assigns each case to exactly one rank.
 
@@ -525,6 +526,9 @@ def infer_mri(
     """
     if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
         raise ValueError("samples must be a positive integer")
+    if archive_confirmation is not None and (not resume_cases or split is not None or case_inventory is not None
+            or root_hq is None or test_fraction != 1 or case_ids is not None or max_cases is not None):
+        raise ValueError("Archive confirmation requires the complete independent paired cohort and case commits")
     if split not in {None, "val", "test"}:
         raise ValueError("MRI evaluation split must be val or test")
     if predictor not in {"model", "bilinear"}:
@@ -670,7 +674,7 @@ def infer_mri(
                                  if loaded_hash != checkpoint_hash else None)
             def prepare_resume():
                 frozen = evaluation_identity(config, cases, subset, exported_case_ids, checkpoint_hash,
-                                             root_lq, root_hq, split, seed, steps, samples, device)
+                                             root_lq, root_hq, split, seed, steps, samples, device, archive_confirmation)
                 return frozen, bind_cache(cache, frozen, output_root)
             identity, published = context.main_call(prepare_resume, broadcast_result=True)
             key = identity_key(identity)
@@ -689,7 +693,8 @@ def infer_mri(
                     _write_case(case, directory, model, geometry, config, device, seed, steps, samples,
                                 checkpoint_hash, root_lq, root_hq, save_volume=case.id in exported_case_ids)
                 if resume_cases:
-                    commit_case(cache, case, key, case.id in exported_case_ids, image_hashes[case.id], write)
+                    commit_case(cache, case, key, case.id in exported_case_ids, image_hashes[case.id], write,
+                                paired=archive_confirmation is not None)
                 else:
                     write(staged)
 
@@ -702,6 +707,8 @@ def infer_mri(
             summary["subset"] = subset
             summary.update(split=split or "custom", checkpoint_sha256=checkpoint_hash,
                            predictor=predictor, steps=steps, samples=samples, seed=seed)
+            if archive_confirmation is not None:
+                summary.update(archive_confirmation.metadata())
             if predictor == "model":
                 summary["training_seed"] = config["train"].get("seed")
             if predictor == "bilinear":

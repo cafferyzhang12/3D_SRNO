@@ -26,9 +26,11 @@ class LRConditionEncoder(nn.Module):
             for cin, cout, stride in ((1, a, 1), (a, b, (1, 2, 2)), (b, c, (1, 2, 2)))
         ])
 
-    def forward(self, lr):
+    def forward(self, lr, *, descriptor_only=False):
         if lr.ndim != 5 or lr.shape[1] != 1:
             raise ValueError("Expected native LR of shape (B,1,Z,Y,X)")
+        if descriptor_only:
+            return self.layers[0](lr)
         features = []
         for layer in self.layers:
             lr = layer(lr)

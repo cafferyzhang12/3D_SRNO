@@ -10,7 +10,7 @@ from torch.nn.parallel import DistributedDataParallel
 import yaml
 
 from .datasets import training_data
-from .distributed import initialize_distributed
+from .distributed import DistributedContext, initialize_distributed
 from .haar_residual import HaarObjective, make_haar_model
 from .runtime import atomic_save, load_checkpoint, project_path, read_config, setup
 from .train import _prepare_spatial_bank, _whole_case_validation
@@ -75,12 +75,17 @@ def overfit(config_path, inventory, directory, steps, device_name):
                                              broadcast_buffers=False) if ctx.is_distributed else raw)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["learning_rate"])
         # Prefer a nontrivial training patch (paired residual energy above machine precision).
-        for idx in range(ctx.rank, len(train), ctx.world_size):
-            row = train[idx]
-            if float((row["hr"] - row["base"]).square().mean()) > 1.e-8:
-                break
-        else:
-            raise ValueError("No nontrivial paired training patch found on this rank")
+        error = None
+        try:
+            for idx in range(ctx.rank, len(train), ctx.world_size):
+                row = train[idx]
+                if float((row["hr"] - row["base"]).square().mean()) > 1.e-8:
+                    break
+            else:
+                raise ValueError("No nontrivial paired training patch found on this rank")
+        except Exception as exc:
+            error = str(exc)
+        ctx.check_errors(error)
         lr, base, hr = (row[key][None].to(device) for key in ("lr", "base", "hr"))
         benchmark = {}
         if atlas is not None:
@@ -108,8 +113,7 @@ def overfit(config_path, inventory, directory, steps, device_name):
             torch.manual_seed(20261110 + ctx.rank)
             optimizer.zero_grad(set_to_none=True)
             loss = objective(lr, base, hr, [row["id"]])["loss"]
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Nonfinite overfit loss")
+            ctx.check_errors(None if torch.isfinite(loss) else "Nonfinite overfit loss")
             losses.append(ctx.sum([float(loss.detach())])[0] / ctx.world_size)
             if iteration < steps:
                 loss.backward()
@@ -117,13 +121,18 @@ def overfit(config_path, inventory, directory, steps, device_name):
                 optimizer.step()
         if losses[-1] >= losses[0]:
             raise RuntimeError(f"Fixed-minibatch loss did not decrease: {losses[0]} to {losses[-1]}")
+        # All ranks have reduced every fixed-batch loss and completed DDP.
+        # A single long VAL volume should never keep three idle ranks inside
+        # an NCCL collective or depend on its watchdog timeout.
+        ctx.cleanup()
+        if not ctx.is_main:
+            return
         model.eval()
-        scores = _whole_case_validation(model, val.all_cases[:1], cfg, ctx, directory, 0, atlas)
+        scores = _whole_case_validation(model, val.all_cases[:1], cfg, DistributedContext(device), directory, 0, atlas)
         record = {"fixed_minibatch_losses": losses, "world_size": ctx.world_size,
                   "validation_case": val.all_cases[0].id, "spatial_timing": benchmark, **scores}
-        ctx.main_call(lambda: atomic_save(record, directory / "smoke.json", json_file=True))
-        if ctx.is_main:
-            print(json.dumps(record), flush=True)
+        atomic_save(record, directory / "smoke.json", json_file=True)
+        print(json.dumps(record), flush=True)
     finally:
         ctx.cleanup()
 

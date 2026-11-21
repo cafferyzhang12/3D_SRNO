@@ -134,3 +134,102 @@ def test_real_submitters_use_live_dependencies(scheduler,tmp_path):
     assert result.returncode==0,result.stderr
     last=(db/"submitted").read_text().splitlines()[-2:]
     assert "--dependency" not in last[0] and "--dependency=afterok:603 " in last[1]
+
+
+@pytest.fixture()
+def confirmation_wait(scheduler, tmp_path):
+    run, db = scheduler
+    frozen = tmp_path / "frozen"
+    frozen.mkdir()
+    (frozen / "matrix.json").write_text("{}")
+    (frozen / "tests.tsv").write_text("testA\tfrozen/A\toutputs/testA\n", newline="\n")
+    ledger = tmp_path / "reports/mri/studies/check/confirmation"
+    ledger.mkdir(parents=True)
+    (ledger / "freeze.job").write_text("100\n", newline="\n")
+    binary = tmp_path / "mockbin/sbatch"
+    # Each scheduled allocation enters the live queue for one observation.
+    # Its planned final state, exit code and artifacts are independently controlled.
+    binary.write_text("""#!/bin/bash
+set -eu
+echo "$*|${FREEZE_DIR:-}|${OUTPUT_ROOT:-}|${RUN_ID:-}" >> db/submitted
+attempt=$(wc -l < db/submitted)
+job=$((600 + attempt))
+IFS='|' read -r state status publish < "db/event-$attempt"
+echo "$job|PENDING" > "db/$job.queue"
+echo "$job|$state|$status" > "db/$job.acct"
+case "$publish" in
+    summary) mkdir -p "$OUTPUT_ROOT"; echo '{}' > "$OUTPUT_ROOT/summary.json" ;;
+    empty_summary) mkdir -p "$OUTPUT_ROOT"; : > "$OUTPUT_ROOT/summary.json" ;;
+    report|incomplete_report)
+        mkdir -p report
+        for file in report.md methods.csv paired.csv cases.csv runs.csv; do echo output > "report/$file"; done
+        if [[ "$publish" == incomplete_report ]]; then : > report/paired.csv; fi ;;
+    none) ;;
+    *) exit 4 ;;
+esac
+echo "$job;testcluster"
+""", newline="\n")
+    binary.chmod(0o755)
+    queue = tmp_path / "mockbin/squeue"
+    queue.write_text("""#!/bin/bash
+while [[ $1 != -j ]]; do shift; done
+record="db/$2.queue"
+if [[ -f "$record" ]]; then cat "$record"; rm "$record"; fi
+""", newline="\n")
+    queue.chmod(0o755)
+
+    def wait(*events, **options):
+        for i, event in enumerate(events, start=1):
+            (db / f"event-{i}").write_text(event + "\n", newline="\n")
+        return run("bash scripts/submit_mri_confirmation.sh --wait", STUDY_ID="check", FREEZE_ROOT="frozen",
+                   HISTORY_ROOT="fake", STAGE1_RESULTS="fake", LEGACY_RESULTS="fake", ARCHIVE_ROOT="fake",
+                   EXTERNAL_RESULTS_ROOT="fake", EXTERNAL_PREFIX="base", MRI_STATUS_INTERVAL="0", **options)
+    return wait, db / "submitted", ledger
+
+
+def test_confirmation_wait_recovers_timeout_and_reports_new_job(confirmation_wait, tmp_path):
+    wait, submitted, ledger = confirmation_wait
+    (tmp_path / "cohort").mkdir()
+    (tmp_path / "cohort/cohort.json").write_text("{}")
+    (tmp_path / "frozen/archive.tsv").write_text("testA\tfrozen/A\n", newline="\n")
+    result = wait("TIMEOUT|0:15|none", "COMPLETED|0:0|summary", "COMPLETED|0:0|summary",
+                  "COMPLETED|0:0|report", COHORT_DIR="cohort")
+    assert result.returncode == 0, result.stderr
+    assert "test_jobs=603:602 report=604" in result.stdout
+    assert "Completed study check" in result.stdout
+    records = submitted.read_text().splitlines()
+    assert len(records) == 4
+    assert records[0] == records[2]
+    assert "scripts/mri_test.sbatch|frozen/A|outputs/testA|check_testA" in records[2]
+    assert "scripts/mri_generalization.sbatch|frozen/A|frozen/../archive84/testA|check_testA_archive" in records[1]
+    assert "scripts/mri_study_report.sbatch" in records[3]
+    assert (ledger / "testA.retries").read_text().splitlines() == ["601\tTIMEOUT"]
+    assert (ledger / "testA.job").read_text().strip() == "603"
+
+
+@pytest.mark.parametrize("event", ["COMPLETED|1:0|summary", "COMPLETED|0:0|none", "COMPLETED|0:0|empty_summary"])
+def test_confirmation_wait_requires_exit_zero_and_nonempty_summary(confirmation_wait, event):
+    wait, submitted, ledger = confirmation_wait
+    result = wait(event)
+    assert result.returncode != 0 and "testA has no completed result" in result.stderr
+    assert len(submitted.read_text().splitlines()) == 1
+    assert not (ledger / "report.job").exists()
+
+
+def test_confirmation_wait_limits_continuations(confirmation_wait):
+    wait, submitted, ledger = confirmation_wait
+    result = wait("TIMEOUT|0:15|none", "PREEMPTED|0:15|none", MAX_CONTINUATIONS="1")
+    assert result.returncode != 0 and "testA exhausted continuations" in result.stderr
+    assert len(submitted.read_text().splitlines()) == 2
+    assert (ledger / "testA.retries").read_text().splitlines() == ["601\tTIMEOUT"]
+
+
+@pytest.mark.parametrize("event", ["FAILED|2:0|report", "COMPLETED|3:0|report", "COMPLETED|0:0|incomplete_report"])
+def test_confirmation_wait_requires_successful_complete_report(confirmation_wait, event):
+    wait, submitted, ledger = confirmation_wait
+    result = wait("COMPLETED|0:0|summary", event)
+    assert result.returncode != 0 and "Completed study" not in result.stdout
+    assert len(submitted.read_text().splitlines()) == 2
+    assert (ledger / "report.job").read_text().strip() == "602"
+    if event.endswith("|incomplete_report"):
+        assert "Missing final report file paired.csv" in result.stderr

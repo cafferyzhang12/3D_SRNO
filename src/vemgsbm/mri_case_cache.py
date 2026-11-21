@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 
@@ -31,19 +32,45 @@ def acquire_lock(path):
     return stream
 
 
-def image_digest(case):
+def image_digest(case, paired=False):
     content = hashlib.sha256()
-    for path in (*case.lq, *(case.hq or ())):
+    paths = (*case.lq, *(case.hq or ()))
+    if paired:
+        # The archive cohort manifest records alternating LR, HQ digests by slice.
+        paths = (p for pair in zip(case.lq, case.hq, strict=True) for p in pair)
+    for path in paths:
         content.update(bytes.fromhex(fingerprint(path)))
     return content.hexdigest()
 
 
+@dataclass(frozen=True)
+class ArchiveConfirmation:
+    cohort_sha256: str
+    freeze_sha256: str
+    checkpoint_sha256: str
+    cases: tuple
+
+    def metadata(self):
+        return {"split": "independent_archive", "cohort_sha256": self.cohort_sha256,
+                "freeze_sha256": self.freeze_sha256,
+                "provenance": "held-out cases from the same archive with unverified external-center provenance"}
+
+
 def evaluation_identity(config, cases, subset, exported, checkpoint_hash, root_lq, root_hq,
-                        split, seed, steps, samples, device):
+                        split, seed, steps, samples, device, archive_confirmation=None):
     inputs = []
-    for case in cases:
+    if archive_confirmation is not None and (archive_confirmation.checkpoint_sha256 != checkpoint_hash
+            or [row["case_id"] for row in archive_confirmation.cases] != [case.id for case in cases]):
+        raise ValueError("Frozen archive checkpoint or case list changed")
+    for i, case in enumerate(cases):
+        digest = image_digest(case, paired=archive_confirmation is not None)
+        if archive_confirmation is not None:
+            record = archive_confirmation.cases[i]
+            if (list(case.stems) != record["stems"] or list(case.indices) != record["original_indices"]
+                    or digest != record["png_sha256"]):
+                raise ValueError(f"Independent archive slice positions or pixel files changed: {case.id}")
         inputs.append({"case_id": case.id, "inventory_fingerprint": case.fingerprint,
-                       "image_bytes_sha256": image_digest(case), "exported": case.id in exported})
+                       "image_bytes_sha256": digest, "exported": case.id in exported})
     src = Path(__file__).parent
     modules = ["mri_infer", "mri_metrics", "mri_data", "infer", "bridge", "models", "network",
                "runtime", "haar_residual", "atlas_geometry", "metric", "spatial_atlas", "mri_external"]
@@ -55,7 +82,8 @@ def evaluation_identity(config, cases, subset, exported, checkpoint_hash, root_l
             "subset": subset, "cases": inputs, "sampling": config["sampling"],
             "inference_variant": config["inference_variant"], "predictor": config["predictor"],
             "seed": seed, "steps": steps, "samples": samples, "torch": str(torch.__version__),
-            "device": torch.cuda.get_device_name(device) if device.type=="cuda" else device.type}
+            "device": torch.cuda.get_device_name(device) if device.type=="cuda" else device.type,
+            **(archive_confirmation.metadata() if archive_confirmation is not None else {})}
 
 
 def _read(path):
@@ -107,7 +135,7 @@ def verify_case(directory, key, case, exported):
         raise ValueError(f"MRI cached case checksum or evaluation identity differs: {case.id}")
 
 
-def commit_case(cache, case, key, exported, expected_images, write):
+def commit_case(cache, case, key, exported, expected_images, write, *, paired=False):
     """Reconstruct only into a private attempt, publish one completed case with one rename."""
     # A launcher failure can kill rank zero before other workers are reaped.
     # A per-case OS lock protects the previous worker's private attempt in that interval.
@@ -122,7 +150,7 @@ def commit_case(cache, case, key, exported, expected_images, write):
             shutil.rmtree(root)
         root.mkdir()
         write(root)
-        if image_digest(case) != expected_images:
+        if image_digest(case, paired=paired) != expected_images:
             raise ValueError(f"MRI source images changed during evaluation: {case.id}")
         completed = root/case.id
         hashes = {p.name: fingerprint(p) for p in completed.iterdir()}

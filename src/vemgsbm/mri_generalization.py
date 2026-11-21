@@ -10,14 +10,16 @@ import numpy as np
 from PIL import Image
 
 from .mri_data import (_case_directories, _filename_indices, _preserved_indices, _read_raw,
-                       SIDECAR, index_cases, natural_key)
+                       SIDECAR, natural_key)
+from .mri_case_cache import ArchiveConfirmation
 from .mri_infer import infer_mri
 from .mri_inventory import load_inventory
 from .runtime import atomic_save, fingerprint, load_checkpoint, project_path
 
 
-def _read(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+def _read_with_digest(path):
+    raw = Path(path).read_bytes()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
 
 
 def _decoded(path, policy):
@@ -168,11 +170,9 @@ def prepare(checkpoint_path, inventory, archive, output, *, count=84, seed=20261
 
 def confirm(folder, cohort, output, device):
     folder, cohort, output = (Path(p).resolve() for p in (folder,cohort,output))
-    if output.exists():
-        raise FileExistsError(output)
-    frozen = _read(folder/"freeze.json")
+    frozen, freeze_digest = _read_with_digest(folder/"freeze.json")
     model, inventory = folder/"model.pt", folder/"inventory.json.gz"
-    locked = _read(cohort/"cohort.json")
+    locked, cohort_digest = _read_with_digest(cohort/"cohort.json")
     if (fingerprint(model) != frozen["selected"]["checkpoint_sha256"] or fingerprint(inventory) != frozen["inventory_sha256"]
             or fingerprint(folder/"manifest.json") != frozen["manifest_sha256"]
             or locked["inventory_sha256"] != frozen["inventory_sha256"] or locked["split"] != "independent_archive"):
@@ -183,36 +183,17 @@ def confirm(folder, cohort, output, device):
     excluded = _excluded(identity, saved)
     case_ids = [r["case_id"] for r in locked["cases"]]
     pool = _case_directories(Path(locked["archive"])/"HQ")
-    if case_ids != _cohort(pool, excluded, 84, 20261121):
+    if locked["count"] != 84 or locked["seed"] != 20261121 or case_ids != _cohort(pool, excluded, 84, 20261121):
         raise ValueError("Independent locked cases differ from the disjoint prespecified sample")
     policy = data.get("channel_policy", "identical_rgb_to_gray")
     if (policy != locked["channel_policy"] or data.get("normalization_scale") != locked["normalization_scale"]
             or data.get("normalization_offset", 0.) != locked["normalization_offset"]):
         raise ValueError("Intensity protocol changed")
-    cases = index_cases(cohort/"LQ",cohort/"HQ",scale=4,channel_policy=policy,
-                        normalization_scale=locked["normalization_scale"], normalization_offset=locked["normalization_offset"])
-    for row, case in zip(locked["cases"], cases, strict=True):
-        if case.id != row["case_id"] or list(case.stems) != row["stems"] or list(case.indices) != row["original_indices"]:
-            raise ValueError("Independent archive positions changed")
-        hashes = hashlib.sha256()
-        for pair in zip(case.lq, case.hq, strict=True):
-            for p in pair:
-                hashes.update(bytes.fromhex(fingerprint(p)))
-        if hashes.hexdigest() != row["png_sha256"]:
-            raise ValueError("Independent archive pixel files changed")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
-        result = infer_mri(model, cohort/"LQ", Path(tmp)/"independent", root_hq=cohort/"HQ",
-                           case_ids=case_ids, test_fraction=1., channel_policy=policy, save_volume_limit=0,
-                           device_name=device, **frozen["selected"]["inference"])
-        summary = _read(result/"summary.json")
-        if [r["case_id"] for r in summary["cases"]] != case_ids:
-            raise ValueError("Incomplete independent archive confirmation")
-        summary.update(split="independent_archive", cohort_sha256=fingerprint(cohort/"cohort.json"),
-                       freeze_sha256=fingerprint(folder/"freeze.json"),
-                       provenance="held-out cases from same archive; external-center provenance unverified")
-        atomic_save(summary,result/"summary.json",json_file=True)
-        os.rename(result,output)
+    provenance = ArchiveConfirmation(cohort_digest, freeze_digest, frozen["selected"]["checkpoint_sha256"],
+                                     tuple(locked["cases"]))
+    return infer_mri(model, cohort/"LQ", output, root_hq=cohort/"HQ", test_fraction=1.,
+                     channel_policy=policy, save_volume_limit=0, device_name=device, resume_cases=True,
+                     archive_confirmation=provenance, **frozen["selected"]["inference"])
 
 
 def main():

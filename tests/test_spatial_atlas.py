@@ -25,6 +25,21 @@ def module(payload, **changes):
                                   "query_chunk": 7, **changes})
 
 
+def test_atlas_descriptor_only_matches_original_frozen_encoder(payload):
+    atlas = module(payload)
+    encoder = atlas.encoder
+    lr = torch.randn(2, 1, 5, 13, 15)
+    expected = encoder(lr)[0]
+    for layer in list(encoder.layers)[1:]:
+        layer.register_forward_pre_hook(lambda *_: pytest.fail("Atlas executed unused LR scale"))
+    assert torch.equal(encoder(lr, descriptor_only=True), expected)
+    bound = atlas.bind(lr)
+    assert bound.ids.shape[0] == 2 * 5 * 13 * 15
+    assert not any(layer.training for layer in encoder.modules())
+    assert not any(parameter.requires_grad for parameter in encoder.parameters())
+    assert all(torch.equal(tensor, payload["encoder"][key]) for key, tensor in encoder.state_dict().items())
+
+
 def test_case_fold_excludes_fit_and_retrieval(payload):
     a = module(payload)
     changed = dict(payload, residuals=payload["residuals"].clone())

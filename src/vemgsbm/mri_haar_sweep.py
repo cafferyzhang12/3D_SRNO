@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from statistics import mean
 
-from .runtime import atomic_save, fingerprint, load_checkpoint
+from .runtime import atomic_save, fingerprint, load_checkpoint, sampling_noise
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,21 @@ class Arm:
 STAGES = ("backbone", "dimensions", "controls", "reference", "replicate")
 
 
+def replicate_roles(previous):
+    """Prespecified finalists plus a paired curvature isolation at E's VAL dimension."""
+    roles = {}
+    for stage, key in (("backbone", "direct"), ("backbone", "bridge"), ("dimensions", "mean"),
+                       ("dimensions", "pca"), ("controls", "physical_mls"), ("reference", "geometry"),
+                       ("reference", "shuffled")):
+        arm = Arm(**previous[stage]["winners"][key]["arm"])
+        roles[arm] = ["finalist"]
+    dim = previous["dimensions"]["winners"]["mls"]["arm"]["dim"]
+    for method in ("pca", "mls"):
+        matched = Arm(method, dim=dim, query="endpoint", path=0, reference="identity", shuffle=0)
+        roles.setdefault(matched, []).append("matched_" + method)
+    return roles
+
+
 def plan(stage, previous):
     if stage == "backbone":
         return [Arm("direct"), Arm("bridge"), Arm("bridge", readout="integral"),
@@ -46,11 +61,7 @@ def plan(stage, previous):
     if stage == "reference":
         selected = Arm(**previous["controls"]["winners"]["physical_mls"]["arm"])
         return [replace(selected, reference=ref) for ref in ("identity", "geometry", "shuffled")]
-    selected = [Arm(**previous[name]["winners"][key]["arm"]) for name, key in
-                (("backbone", "direct"), ("backbone", "bridge"), ("dimensions", "mean"),
-                 ("dimensions", "pca"), ("controls", "physical_mls"), ("reference", "geometry"),
-                 ("reference", "shuffled"))]
-    return [replace(arm, seed=seed) for arm in selected for seed in (42, 43, 44)]
+    return [replace(arm, seed=seed) for arm in replicate_roles(previous) for seed in (42, 43, 44)]
 
 
 def write_plan(stage, folder, study, previous):
@@ -72,7 +83,10 @@ def evaluate(arm, study):
     if (summary["split"] != "val" or summary["subset"]["fraction"] != 1
             or summary["checkpoint_sha256"] != fingerprint(checkpoint) or not math.isfinite(summary["all_psnr_db"])
             or cfg["train"]["seed"] != arm.seed or summary.get("readout") != arm.readout
-            or cfg["train"]["selection_metric"] != "pooled_psnr" or cfg["data"].get("debug_case_limit") is not None):
+            or cfg["train"]["selection_metric"] != "pooled_psnr" or cfg["data"].get("debug_case_limit") is not None
+            or summary["predictor"] != "model" or summary["inference_variant"] != "endpoint_safe"
+            or (summary["steps"], summary["samples"], summary["seed"], summary["sampling_sigma"]) !=
+            (cfg["sampling"]["steps"], 1, cfg["train"].get("validation_seed", 42), sampling_noise(cfg))):
         raise ValueError(f"Invalid VAL record for {rid}: {dest}")
     spatial = cfg.get("spatial_atlas", {})
     if arm.variant in {"pca", "mean", "mls"}:
@@ -86,13 +100,19 @@ def evaluate(arm, study):
         raise ValueError(f"Unsupervised endpoint loss differs: {rid}")
     ids = [row["id"] for row in saved["data_identity"] if row["split"] == "val"]
     identity = {row["id"]: row["fingerprint"] for row in saved["data_identity"] if row["split"] == "val"}
-    if (summary["subset"]["case_ids"] != ids or {row["case_id"]: row["input_fingerprint"]
+    if (len(summary["cases"]) != len(ids) or summary["subset"]["case_ids"] != ids or {row["case_id"]: row["input_fingerprint"]
                                                   for row in summary["cases"]} != identity):
         raise ValueError(f"VAL cohort differs from checkpoint: {rid}")
+    replay_delta = None
+    if saved.get("epoch_history") and cfg["sampling"].get("readout", "integral") == arm.readout:
+        selected = saved["epoch_history"][-1]
+        replay_delta = {"psnr_db": summary["all_psnr_db"] - selected["val_pooled_psnr_db"],
+                        "ssim": summary["mean_slice_ssim"] - selected["val_mean_slice_ssim"]}
     return dict(arm=asdict(arm), run_id=rid, checkpoint=str(checkpoint), result=str(dest),
                 summary_sha256=fingerprint(dest / "summary.json"), pooled_psnr=summary["all_psnr_db"],
                 slice_ssim=summary["mean_slice_ssim"], edge_mse=summary["edge_mse"], pixels=summary["pixel_count"],
-                val_identity=hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest())
+                val_identity=hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+                validation_replay_delta=replay_delta)
 
 
 def select(stage, folder, study, previous):
@@ -116,19 +136,27 @@ def select(stage, folder, study, previous):
     winners = {key: max(group, key=lambda r: r["pooled_psnr"]) for key, group in groups.items()}
     report = {"stage": stage, "selection_metric": "whole-VAL pooled PSNR, dB", "rows": rows, "winners": winners}
     if stage == "replicate":
-        # Only complete three-seed averages enter this ranking.
+        roles = replicate_roles(previous)
         by_method = {}
         for row in rows:
             key = json.dumps({k: v for k, v in row["arm"].items() if k != "seed"}, sort_keys=True)
             by_method.setdefault(key, []).append(row)
-        ranking = []
+        ranking, matched_models = [], []
         for cfg, group in by_method.items():
             if sorted(r["arm"]["seed"] for r in group) != [42, 43, 44]:
                 raise ValueError("Incomplete three-seed validation")
-            ranking.append({"config": json.loads(cfg), "mean_pooled_psnr": mean(r["pooled_psnr"] for r in group),
-                            "mean_slice_ssim": mean(r["slice_ssim"] for r in group), "runs": group})
+            config = json.loads(cfg)
+            tags = roles[Arm(**config)]
+            entry = {"config": config, "roles": tags, "mean_pooled_psnr": mean(r["pooled_psnr"] for r in group),
+                     "mean_slice_ssim": mean(r["slice_ssim"] for r in group), "runs": group}
+            if "finalist" in tags:
+                ranking.append(entry)
+            if "matched_" + config["variant"] in tags:
+                matched_models.append(entry)
         report.pop("winners")
         report["ranking"] = sorted(ranking, key=lambda r: -r["mean_pooled_psnr"])
+        report["matched_models"] = matched_models
+        report["matched_geometry"] = {r["config"]["variant"]: r["config"] for r in matched_models}
     atomic_save(report, folder / f"{stage}.json", json_file=True)
     previous[stage] = report
     i = STAGES.index(stage) + 1

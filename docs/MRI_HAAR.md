@@ -41,6 +41,12 @@ C/D/E 的训练库只接受相同 TRAIN 指纹的 A 权重，按病例和局部�
 
 `outputs/mri/${RUN_ID}_val` 提供 VAL 指标和 CSV。B 的同权重积分臂保存到 `${RUN_ID}_integral_val`。研究计划只产生 VAL 结果。选定配置后按 `vemgsbm.mri_freeze` 的 freeze / confirm 步骤使用历史固定 TEST 清单，选择记录保留实际读出、噪声和采样步数。
 
+## 终评与病例配对区间
+
+冻结矩阵将最终配置与各自的 VAL 摘要、模型和采样协议关联，三种子平均整病例 VAL PSNR 决定入选模型。为单独估计二阶曲率的作用，PCA 与 MLS 使用 E 在 VAL 上选出的同一局部维数，固定干净端点查询、单位参考协方差及相同训练路径，再在种子 42、43、44 下逐一配对。已作为入围模型运行的完全相同权重和读出可以复用测试结果。纯机制对照只进入配对表。
+
+完成正式 TEST 后，`report.md` 开头回答五个问题。主表同时显示不同种子的波动及相对作业 5281446 的病例配对区间。`paired.csv` 收录同种子对照、跨种子平均效应，以及完整模型与外部预训练基线的 PSNR、MSE 和 SSIM 差。`development.csv` 保留各阶段整病例 VAL、边缘 MSE 和入选 epoch 的训练路径与近邻诊断。`runs.csv` 分列图像输入、预训练来源、逐窗口重建和编码器前向次数、引导反向次数及含读图和评分的病例耗时。
+
 ## 分块开销
 
 在本地 CPU 的 4 个线程、单个 5×32×32 原生 LR 块、48/96/128 通道、128 张图、3 个候选和 4 维 MLS 上，测得结合 LR 检索及协方差的 bind 与一次空间特征计算耗时如下。输入和图册是合成张量，预热 1 次后取 3 次中位数。
@@ -55,3 +61,5 @@ C/D/E 的训练库只接受相同 TRAIN 指纹的 A 权重，按病例和局部�
 
 默认查询块大小取 2048。可用 `QUERY_CHUNK` 调整。GPU 门控作业会在真实 TRAIN 小批上同步计时，并把 rank 0 的 bind 和每次特征计算中位数写入 `smoke/smoke.json`。
 `all` 会检查 TIMEOUT、PREEMPTED、NODE_FAIL 后的 last.pt。已有完整 epoch 且 checkpoint 持续前进时自动续投，默认每个训练最多 12 次，可用 `MAX_CONTINUATIONS` 指定次数。每次续投的作业号和 checkpoint 元数据记入 `continuations.tsv`。A 选定后在独立 A800 作业构造一次完整 TRAIN 记录库，研究目录的 `spatial_bank.pt` 供全部 C～F 的门控、正式训练和不同种子共享。各分折在同一记录库内拟合局部模型。
+
+完整实验入口为 `bash scripts/run_mri_haar_study.sh`。它使用与冻结脚本相同的 STUDY_ID、FREEZE_ROOT、HISTORY_ROOT、ARCHIVE_ROOT、STAGE1_RESULTS、LEGACY_RESULTS、EXTERNAL_RESULTS_ROOT 和 EXTERNAL_PREFIX。可用 DEPENDENCY_JOB_ID 指向第 38 轮诊断汇总作业，可用 COHORT_DIR 指向已核验的额外病例清单。入口在各阶段的整病例 VAL 选择后释放下一阶段，冻结后并发提交固定 TEST 和独立病例确认。单卡正式训练与四卡门控是默认组合。已绑定的确认作业因超时、抢占或节点失效中断时，入口会恢复提交，最后检查报告作业退出码和五个输出文件。再次运行同一命令可接回已有作业。

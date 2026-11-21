@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 
 import yaml
+import pytest
 
 from test_training import _config
-from vemgsbm.mri_haar_sweep import Arm, plan, select
+from vemgsbm.mri_haar_sweep import Arm, plan, replicate_roles, select
 from vemgsbm.mri_infer import infer_mri
 from vemgsbm.train import run_training
 
@@ -42,6 +43,14 @@ def test_sweep_selects_complete_real_entrypoint_val(tmp_path, monkeypatch):
     bridges = [r for r in report["rows"] if r["arm"]["variant"] != "direct"]
     assert report["winners"]["bridge"]["pooled_psnr"] == max(r["pooled_psnr"] for r in bridges)
     assert len((tmp_path / "dimensions.tsv").read_text().splitlines()) == 9
+    direct = report["winners"]["direct"]
+    assert direct["validation_replay_delta"]["psnr_db"] == pytest.approx(0., abs=1.e-5)
+    summary_path = Path(direct["result"]) / "summary.json"
+    changed = json.loads(summary_path.read_text())
+    changed["seed"] += 1
+    summary_path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="Invalid VAL record"):
+        select("backbone", tmp_path, study, {})
 
 
 def test_frozen_mls_and_three_seed_controls():
@@ -56,5 +65,39 @@ def test_frozen_mls_and_three_seed_controls():
     arms = plan("reference", previous)
     assert arms == [replace(curve, reference=r) for r in ["identity", "geometry", "shuffled"]]
     repeat = plan("replicate", previous)
-    assert len(repeat) == 21
+    assert len(repeat) == 24
     assert all(set(replace(a, seed=i) for i in (42, 43, 44)).issubset(repeat) for a in repeat)
+    assert replicate_roles(previous)[Arm("pca", dim=4)] == ["finalist", "matched_pca"]
+    assert replicate_roles(previous)[Arm("mls", dim=4)] == ["matched_mls"]
+    previous["controls"]["winners"]["physical_mls"] = {"arm": asdict(Arm("mls", dim=4))}
+    assert len(plan("replicate", previous)) == 21
+    assert replicate_roles(previous)[Arm("mls", dim=4)] == ["finalist", "matched_mls"]
+
+
+def test_matched_mls_pca_three_seeds_do_not_enlarge_finalist_ranking(tmp_path, monkeypatch):
+    previous = {stage: {"winners": {}, "rows": []} for stage in ["backbone", "dimensions", "controls", "reference"]}
+    for stage, key, arm in [
+            ("backbone", "direct", Arm("direct")), ("backbone", "bridge", Arm("bridge")),
+            ("dimensions", "mean", Arm("mean")), ("dimensions", "pca", Arm("pca", dim=2)),
+            ("dimensions", "mls", Arm("mls", dim=8)), ("controls", "physical_mls", Arm("mls", dim=8, query="state", path=1)),
+            ("reference", "geometry", Arm("mls", dim=8, query="state", path=1, reference="geometry")),
+            ("reference", "shuffled", Arm("mls", dim=8, query="state", path=1, reference="shuffled"))]:
+        previous[stage]["winners"][key] = {"arm": asdict(arm)}
+
+    def evaluate(arm, study):
+        return {"arm": asdict(arm), "val_identity": "same", "pixels": 100, "run_id": arm.run_id(study),
+                "pooled_psnr": 45. if arm == replace(Arm("pca", dim=8), seed=arm.seed) else 40.,
+                "slice_ssim": .95}
+    monkeypatch.setattr("vemgsbm.mri_haar_sweep.evaluate", evaluate)
+    select("replicate", tmp_path, "test", previous)
+    report = previous["replicate"]
+    assert len(report["rows"]) == 27
+    assert len(report["ranking"]) == 7
+    assert max(r["mean_pooled_psnr"] for r in report["ranking"]) == 40.
+    assert set(report["matched_geometry"]) == {"mls", "pca"}
+    for entry in report["matched_models"]:
+        cfg = entry["config"]
+        assert entry["roles"] == ["matched_" + cfg["variant"]]
+        assert cfg["dim"] == 8 and cfg["reference"] == "identity" and cfg["query"] == "endpoint"
+        assert cfg["path"] == cfg["shuffle"] == 0
+        assert sorted(row["arm"]["seed"] for row in entry["runs"]) == [42, 43, 44]

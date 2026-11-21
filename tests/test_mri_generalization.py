@@ -1,5 +1,6 @@
 import gzip
 import json
+import csv
 
 import numpy as np
 from PIL import Image
@@ -47,7 +48,8 @@ def test_refuse_non_equivalent_archive(tmp_path):
     assert not (tmp_path/"cohort").exists()
 
 
-def test_frozen_independent_confirmation(tmp_path):
+def test_frozen_independent_confirmation(tmp_path,monkeypatch):
+    from vemgsbm import mri_infer
     archive, checkpoint, inv = archive_fixture(tmp_path,84)
     cohort = tmp_path/"cohort"
     locked = prepare(checkpoint,inv,archive,cohort)
@@ -60,6 +62,39 @@ def test_frozen_independent_confirmation(tmp_path):
                       "steps":0,"inference_variant":"endpoint_safe","predictor":"bilinear","seed":42,"samples":1}))
     (tmp_path/"freeze.json").write_text(json.dumps(record))
     output = tmp_path/"confirmed"
+    calls = []
+    original = mri_infer._write_case
+    def interrupted(case, *args, **kwargs):
+        calls.append(case.id)
+        if len(calls) == 2:
+            raise InterruptedError("archive preemption")
+        return original(case, *args, **kwargs)
+    monkeypatch.setattr(mri_infer, "_write_case", interrupted)
+    with pytest.raises(InterruptedError, match="archive preemption"):
+        confirm(tmp_path,cohort,output,"cpu")
+    assert not output.exists()
+    assert (tmp_path/".confirmed.resume"/"cases"/calls[0]/"case_commit.json").is_file()
+    for manifest_path in (cohort/"cohort.json",tmp_path/"freeze.json"):
+        original_bytes = manifest_path.read_bytes()
+        manifest_path.write_bytes(original_bytes + b"\n")
+        with pytest.raises(ValueError,match="resume identity changed"):
+            confirm(tmp_path,cohort,output,"cpu")
+        manifest_path.write_bytes(original_bytes)
+    assert len(calls)==2
     confirm(tmp_path,cohort,output,"cpu")
+    assert len(calls)==85 and calls.count(calls[0]) == 1
     summary = json.loads((output/"summary.json").read_text())
     assert summary["split"] == "independent_archive" and len(summary["cases"]) == 84
+    identity = json.loads((output/"evaluation_identity.json").read_text())
+    receipt = json.loads((output/"publication.json").read_text())
+    csvrow = next(csv.DictReader((output/"summary.csv").read_text().splitlines()))
+    for key, expected in (("cohort_sha256",fingerprint(cohort/"cohort.json")),
+                          ("freeze_sha256",fingerprint(tmp_path/"freeze.json")),("split","independent_archive")):
+        assert summary[key] == identity[key] == csvrow[key] == expected
+    assert all(receipt[name] == fingerprint(output/name) for name in receipt)
+    confirm(tmp_path,cohort,output,"cpu")
+    assert len(calls)==85
+    original_plane = cohort/"HQ"/calls[0]/"00000000.png"
+    Image.fromarray(np.full((12,12), 13, dtype=np.uint8)).save(original_plane)
+    with pytest.raises(ValueError,match="pixel files changed"):
+        confirm(tmp_path,cohort,output,"cpu")

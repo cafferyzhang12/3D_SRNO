@@ -67,7 +67,7 @@ def build_spatial_atlas(direct_ckpt, train_set, settings, device):
         quota = nsites // ds.samples_per_volume + (slot < nsites % ds.samples_per_volume)
         sites = _balanced_sites(item["lr"], quota, gen)
         lr = item["lr"][None].to(device)
-        descriptor = encoder(lr)[0]
+        descriptor = encoder(lr, descriptor_only=True)
         residual = codec.encode((item["hr"] - item["base"])[None].to(device))
         descriptors.append(_sites(descriptor)[sites].cpu())
         residuals.append(_sites(residual)[sites].cpu())
@@ -197,7 +197,7 @@ class SpatialAtlas(nn.Module):
         n = len(lr)
         if exclude_cases is not None and (len(exclude_cases) != n or any(case not in self.folds for case in exclude_cases)):
             raise ValueError("TRAIN queries must identify each member of the cross-fitted case bank")
-        features = self.encoder(lr)[0]
+        features = self.encoder(lr, descriptor_only=True)
         chunk = int(self.settings.get("query_chunk", 2048))
         selected, weights, trusts, factors = [], [], [], []
         # Folds can contain different numbers of charts on tiny training sets.
