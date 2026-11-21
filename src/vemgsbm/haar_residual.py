@@ -105,6 +105,17 @@ class HaarResidualNetwork(nn.Module):
             raise ValueError("Real native LR must align with the XY x4 base and Z grid")
         return lr.new_zeros((len(lr), 16, *lr.shape[2:]))
 
+    def _before_last_step(self, state, condition, steps, sigma, bound=None, generator=None, noise_steps=None):
+        for i in range(steps - 1):
+            time = max(.02, min(.98, i / steps))
+            _, drift = self(state, condition, time, bound=bound)
+            state = state + drift / steps
+            if sigma:
+                noise = (torch.randn(state.shape, dtype=state.dtype, device=state.device, generator=generator)
+                         if noise_steps is None else noise_steps[i])
+                state = state + noise * (sigma / math.sqrt(steps))
+        return state
+
     @torch.no_grad()
     def restore(self, lr, base, steps, sigma, generator=None, atlas=None, noise_steps=None):
         if not isinstance(steps, int) or steps < 1 or not math.isfinite(sigma) or sigma < 0:
@@ -115,15 +126,10 @@ class HaarResidualNetwork(nn.Module):
         if self.mode == "haar_direct":
             residual, _ = self(state, condition, 0.)
         else:
-            for i in range(steps):
-                time = max(.02, min(.98, i / steps))
-                endpoint, drift = self(state, condition, time, bound=bound)
-                state = state + drift / steps
-                if i + 1 < steps and sigma:
-                    noise = (torch.randn(state.shape, dtype=state.dtype, device=state.device, generator=generator)
-                             if noise_steps is None else noise_steps[i])
-                    state = state + noise * (sigma / math.sqrt(steps))
-            residual = endpoint if self.readout == "endpoint" else state
+            state = self._before_last_step(state, condition, steps, sigma, bound, generator, noise_steps)
+            time = max(.02, min(.98, (steps - 1) / steps))
+            endpoint, drift = self(state, condition, time, bound=bound)
+            residual = endpoint if self.readout == "endpoint" else state + drift / steps
         return base + self.codec.decode(bound.unwhiten(residual) if bound is not None else residual)
 
 
@@ -175,6 +181,32 @@ class HaarObjective(nn.Module):
         terms = {"loss": (fm + rm) * .5 + weight * mse, "endpoint_pixel_mse": mse,
                  "forward_matching": fm, "backward_matching": rm,
                  "path_mean_correction_rms": hr.new_tensor(diagnostics["mean_correction_rms"])}
+        if self.config["train"].get("matching_units") == "endpoint":
+            if bound is not None or path_metric is not None:
+                raise ValueError("Endpoint-equivalent matching requires the unwhitened straight Brownian bridge")
+            # x + (1-t) f = target and x + t r = source. HaarXY is orthonormal.
+            tau = t.view(-1, 1, 1, 1, 1)
+            forward_mse = ((1 - tau) * (forward - f)).square().mean()
+            reverse_mse = (tau * (reverse - r)).square().mean()
+            matching = (forward_mse + reverse_mse) * .5
+            terms.update(forward_endpoint_equivalent_mse=forward_mse,
+                         reverse_endpoint_equivalent_mse=reverse_mse)
+            # Train the supervised readout also on states available at deployment.
+            # Sample a subset to bound cost, stop gradients through the simulated trajectory.
+            n = max(1, len(lr) // 8)
+            cond = [level[:n] for level in condition]
+            sampler = self.config["sampling"]
+            steps = sampler["steps"]
+            with torch.no_grad():
+                final_state = model._before_last_step(zero[:n], cond, steps, sampler["inference_sigma"])
+            with torch.set_grad_enabled(torch.is_grad_enabled() and weight > 0):
+                last_t = max(.02, min(.98, (steps - 1) / steps))
+                last_clean, last_drift = model(final_state, cond, last_t)
+                coefficients = last_clean if model.readout == "endpoint" else final_state + last_drift / steps
+                reconstruction = base[:n] + model.codec.decode(coefficients)
+                rollout_mse = F.mse_loss(reconstruction, hr[:n])
+            terms["rollout_pixel_mse"] = rollout_mse.detach()
+            terms["loss"] = matching + weight * (mse + rollout_mse) * .5
         if bound is not None:
             terms.update({key: torch.as_tensor(value, device=hr.device) for key, value in bound.diagnostics().items()})
             rms = target.square().mean().sqrt().clamp_min(1.e-8)

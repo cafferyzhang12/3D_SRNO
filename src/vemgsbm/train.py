@@ -327,6 +327,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                               "atlas": atlas_payload["diagnostics"] if atlas_payload else None}), flush=True)
         for epoch in range(start, cfg["train"]["epochs"]):
             if (selection_metric == "pooled_psnr" and cfg["train"].get("whole_val_patience") is not None
+                    and epoch >= cfg["train"].get("minimum_epochs", 0)
                     and stale_epochs >= cfg["train"]["whole_val_patience"]):
                 break
             torch.manual_seed(cfg["train"]["seed"] + epoch + 100003 * context.rank)
@@ -392,6 +393,13 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 raise RuntimeError("DDP training sample count mismatch")
             record = {"epoch": epoch + 1, "train_items": count, "world_size": context.world_size,
                       **{k: v / count for k, v in zip(keys, values)}}
+            if haar:
+                record.update(cumulative_patches=(epoch + 1) * count,
+                              optimizer_steps=(epoch + 1) * len(loader),
+                              global_batch_size=context.world_size * cfg["train"]["batch_size"])
+                if cfg["mode"] == "haar_direct" or "rollout_pixel_mse" in record:
+                    mse = record.get("rollout_pixel_mse", record["endpoint_pixel_mse"])
+                    record["train_patch_recon_psnr_db"] = -10 * math.log10(mse) if mse > 0 else None
             raw_objective.eval()
             total, unguided_total, guidance_delta, items, error = 0.0, 0.0, 0.0, 0, None
             ssim_total, unguided_ssim_total, atlas_total, unguided_atlas_total = 0.0, 0.0, 0.0, 0.0

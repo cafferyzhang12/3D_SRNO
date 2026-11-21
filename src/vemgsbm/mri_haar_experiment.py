@@ -19,6 +19,14 @@ from .train import _prepare_spatial_bank, _whole_case_validation
 def create_variant(args):
     cfg = read_config(args.template)
     cfg["train"]["seed"] = args.seed
+    if getattr(args, "large_paired", False):
+        if args.variant not in {"direct", "bridge", "drift_only"}:
+            raise ValueError("Large paired profile is defined for the three backbone experiments")
+        cfg["model"]["widths"] = [96, 160, 256]
+        cfg["train"].update(epochs=320, bridge_epochs=320, whole_val_patience=36,
+                            minimum_epochs=80, samples_per_epoch=65536, val_samples_per_epoch=256)
+        if cfg["mode"] == "haar_bridge":
+            cfg["train"]["matching_units"] = "endpoint"
     if args.variant == "direct":
         if cfg["mode"] != "haar_direct":
             raise ValueError("Direct regression requires the direct config")
@@ -145,6 +153,7 @@ def main():
     variant.add_argument("--output", type=Path, required=True)
     variant.add_argument("--variant", choices=["direct", "bridge", "drift_only", "mean", "pca", "mls"], required=True)
     variant.add_argument("--seed", type=int, default=42)
+    variant.add_argument("--large-paired", action="store_true")
     variant.add_argument("--dim", choices=[2, 4, 6, 8], type=int, default=2)
     variant.add_argument("--query-chunk", type=int, default=2048)
     variant.add_argument("--reference", choices=["identity", "geometry", "shuffled"], default="identity")

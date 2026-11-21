@@ -23,6 +23,13 @@ flock -n 9
 config="$run/experiment.yaml"
 args=(--variant "$VARIANT" --seed "${SEED:-42}" --dim "${DIM:-2}" --query-chunk "${QUERY_CHUNK:-2048}"
       --query "${QUERY:-endpoint}" --reference "${REFERENCE:-identity}")
+if [[ "${MRI_LARGE_PAIRED:-0}" == 1 ]]; then
+    [[ "$MRI_GPUS" == 4 ]]
+    read -r BATCH_SIZE < "${MRI_BATCH_FILE:?Set the calibrated batch file}"
+    [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]
+    export BATCH_SIZE
+    args+=(--large-paired)
+fi
 if [[ -n "${DIRECT_CHECKPOINT:-}" ]]; then args+=(--direct-checkpoint "$DIRECT_CHECKPOINT"); fi
 if [[ -n "${SPATIAL_BANK:-}" ]]; then args+=(--bank "$SPATIAL_BANK"); fi
 if [[ "${PATH_GEOMETRY:-0}" == 1 ]]; then args+=(--path-geometry); fi
