@@ -340,6 +340,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 metric.eval()
             totals = {}
             count = 0
+            previous_update = {}
+            reported_count = 0
             iterator = iter(loader)
             for iteration in range(len(loader)):
                 error = None
@@ -386,6 +388,19 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     if isinstance(value, (int, float)):
                         totals["path_" + key] = totals.get("path_" + key, 0.0) + value * len(hr)
                 count += len(hr)
+                interval = cfg["train"].get("report_every_updates", 16 if haar else 0)
+                if interval and (iteration == 0 or (iteration + 1) % interval == 0):
+                    names = [k for k in ("loss", "endpoint_pixel_mse", "rollout_pixel_mse",
+                                         "forward_endpoint_equivalent_mse", "reverse_endpoint_equivalent_mse")
+                             if k in totals]
+                    values = context.sum([count - reported_count] +
+                                         [totals[k] - previous_update.get(k, 0.) for k in names])
+                    if context.is_main:
+                        print(json.dumps(dict(epoch=epoch+1, update=iteration+1, updates_per_epoch=len(loader),
+                                              patches_in_interval=int(values[0]),
+                                              **{k: v/values[0] for k, v in zip(names, values[1:])})), flush=True)
+                    previous_update = {k: totals[k] for k in names}
+                    reported_count = count
             keys = sorted(totals)
             reduced = context.sum([count] + [totals[k] for k in keys])
             count, values = int(reduced[0]), reduced[1:]
