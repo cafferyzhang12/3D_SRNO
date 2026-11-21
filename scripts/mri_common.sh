@@ -94,7 +94,8 @@ if profile == 'validate':
         cfg['atlas']['mls'].update(degree=1, neighbors=24, anchor_limit=4)
     cfg['model']['width'] = 4
     cfg['path']['iterations'] = 2
-    cfg['sampling']['steps'] = 3 if cfg['sampling'].get('geometry_guidance') else 2
+    geometry_sampling = any(cfg['sampling'].get(key) for key in ('geometry_guidance', 'momentum_geometry'))
+    cfg['sampling']['steps'] = 3 if geometry_sampling else 2
 elif profile != 'formal':
     raise ValueError('Unknown config profile')
 cfg['train'][stage + '_epochs'] = cfg['train']['epochs']

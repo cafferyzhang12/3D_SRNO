@@ -65,7 +65,9 @@ def _save_config(cfg, path):
     path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
 
-@pytest.mark.parametrize(("mode", "guided"), [("gsbm", False), ("gsbm", True), ("momentum", False)])
+@pytest.mark.parametrize(("mode", "guided"), [
+    ("gsbm", False), ("gsbm", True), ("momentum", False), ("momentum", True),
+])
 def test_mls_atlas_optimizes_paired_png_bridge(tmp_path, mode, guided):
     cfg = _config(tmp_path)
     for index in range(6):
@@ -81,14 +83,23 @@ def test_mls_atlas_optimizes_paired_png_bridge(tmp_path, mode, guided):
         cfg["atlas"]["source_routing"] = True
         cfg["path"]["geometry_ramp_power"] = 2.0
         cfg["train"]["metric_matching_weight"] = 0.05
-        cfg["sampling"].update(steps=3, geometry_guidance={"strength": 0.02, "start": 0.3, "max_update": 0.002})
+        cfg["train"]["selection_metric"] = "ssim"
+        cfg["sampling"].update(steps=3, inference_sigma=.025)
+        if mode == "gsbm":
+            cfg["path"].update(learning_rate=.0002, backtrack_steps=3)
+            cfg["sampling"]["geometry_guidance"] = {"strength": 0.02, "normal_strength": 0.01,
+                                                   "start": 0.3, "max_update": 0.002}
     if mode == "momentum":
         cfg["path"].update(quadrature=2, lr=0.02, state_weight=0.01,
                            normal_weight=0.01, max_shift=0.5)
+        if guided:
+            cfg["sampling"]["momentum_geometry"] = dict(
+                position_strength=.02, velocity_strength=.02, start=.25, max_acceleration=.2)
+            cfg["path"].update(lr=.0002, backtracking_steps=3)
     config_path = tmp_path / "config.yaml"
     _save_config(cfg, config_path)
     inventory = None
-    if mode == "gsbm":
+    if mode == "gsbm" or guided:
         inventory = tmp_path / "atlas_cases.json.gz"
         prepare_inventory(config_path, inventory)
     representation = train.run_training(config_path, "representation", "cpu", case_inventory=inventory)
@@ -111,7 +122,7 @@ def test_mls_atlas_optimizes_paired_png_bridge(tmp_path, mode, guided):
         diagnostics = ("path_state_after", "path_metric_after")
         field = "metric"
     else:
-        output = run_momentum(config_path, "cpu")
+        output = run_momentum(config_path, "cpu", case_inventory=inventory)
         diagnostics = ("path_normal_position", "path_normal_velocity")
         field = "atlas"
     report = json.loads((output / "metrics.jsonl").read_text(encoding="utf-8"))
@@ -119,8 +130,23 @@ def test_mls_atlas_optimizes_paired_png_bridge(tmp_path, mode, guided):
     checkpoint = load_checkpoint(output / "best.pt")
     assert checkpoint[field]["diagnostics"]["atlas_version"] == payload["diagnostics"]["atlas_version"]
     if guided:
-        assert report["metric_matching"] > 0
+        if mode == "gsbm":
+            assert report["metric_matching"] > 0
+            assert report["path_objective_after"] <= report["path_objective_before"]
+            assert 0 <= report["path_updated"] <= 1
+            guidance_key = "geometry_guidance"
+        else:
+            assert report["mls_acceleration_matching"] > 0
+            assert report["path_after"] <= report["path_before"]
+            assert report["validation_guidance_delta_rms"] > 0
+            assert report["validation_ssim_reference_noise"] is not None
+            guidance_key = "momentum_geometry"
         assert "validation_without_online_guidance" in report
+        assert "validation_ssim_without_online_guidance" in report
+        assert "validation_atlas_cost_without_online_guidance" in report
+        assert report["validation_inference_sigma"] == .025
+        assert report["selection_metric"] == "ssim"
+        assert checkpoint["best"] == pytest.approx(1 - report["validation_ssim"])
         roots = cfg["data"]["test"]
         out = tmp_path / "guided_test"
         infer_mri(output / "best.pt", roots["root_lq"], out, root_hq=roots["root_hq"],
@@ -128,7 +154,7 @@ def test_mls_atlas_optimizes_paired_png_bridge(tmp_path, mode, guided):
                   inference_variant="endpoint_safe")
         summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
         assert summary["subset"]["selected_cases"] == 3
-        assert summary["geometry_guidance"] == cfg["sampling"]["geometry_guidance"]
+        assert summary[guidance_key] == cfg["sampling"][guidance_key]
 
 
 @pytest.fixture

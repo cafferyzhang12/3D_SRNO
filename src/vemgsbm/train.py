@@ -19,9 +19,11 @@ from .datasets import training_data
 from .distributed import initialize_distributed, ValidationShardSampler
 from .metric import Representation, representation_loss, fit_metric, metric_payload, metric_from_payload
 from .bridge import reconstruct
+from .mri_metrics import mean_xy_ssim
 from .network import DriftNetwork, integrate
 from .paths import optimize_path, sample_path
-from .runtime import read_config, project_path, setup, atomic_save, load_checkpoint, sampling_geometry_guidance
+from .runtime import (read_config, project_path, setup, atomic_save, load_checkpoint,
+                      sampling_geometry_guidance, sampling_noise)
 
 
 class RepresentationObjective(nn.Module):
@@ -100,6 +102,14 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
         raise ValueError("Use vemgsbm.momentum.train for momentum configs")
     if stage not in {"representation", "bridge"}:
         raise ValueError("Unknown stage")
+    selection_metric = cfg["train"].get("selection_metric", "mse")
+    if selection_metric not in ("mse", "ssim"):
+        raise ValueError("train.selection_metric must be mse or ssim")
+    paired_mri = cfg["data"].get("kind") == "paired_mri_png"
+    if selection_metric == "ssim" and not paired_mri:
+        raise ValueError("SSIM checkpoint selection requires paired MRI")
+    measure_ssim = stage == "bridge" and paired_mri and (selection_metric == "ssim" or online_guidance)
+    inference_sigma = sampling_noise(cfg)
     cfg["train"]["epochs"] = cfg["train"].get(stage + "_epochs", cfg["train"]["epochs"])
     context = initialize_distributed(device_name)
     run_dir = project_path(cfg["run_dir"]) / stage
@@ -215,6 +225,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     if stage == "bridge":
                         geometry = metric.bind(base if source_routing else hr) if atlas_options else metric
                         path, path_diagnostics = optimize_path(base, hr, mask, geometry, cfg["path"])
+                        path_diagnostics["updated"] = float(path_diagnostics["accepted_steps"] > 0)
                         cutoff = cfg["train"].get("matching_time_min", 0.02)
                         times = torch.rand(len(hr), device=device) * (1 - 2 * cutoff) + cutoff
                         noise = torch.randn_like(hr)
@@ -253,6 +264,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                       **{k: v / count for k, v in zip(keys, values)}}
             raw_objective.eval()
             total, unguided_total, guidance_delta, items, error = 0.0, 0.0, 0.0, 0, None
+            ssim_total, unguided_ssim_total, atlas_total, unguided_atlas_total = 0.0, 0.0, 0.0, 0.0
             try:
                 val_seed = cfg["train"]["seed"] + 12345 + context.rank
                 torch.manual_seed(val_seed)
@@ -265,39 +277,61 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                         if stage == "representation":
                             value = representation_loss(encoder, hr)["loss"]
                         elif online_guidance:
-                            steps, sigma = cfg["sampling"]["steps"], cfg["sampling"]["sigma"]
-                            prediction = reconstruct(model, base, mask, geometry=metric, steps=steps, sigma=sigma,
+                            steps = cfg["sampling"]["steps"]
+                            prediction = reconstruct(model, base, mask, geometry=metric, steps=steps,
+                                                     sigma=inference_sigma,
                                                      generator=guided_rng, terminal_noise=False,
                                                      geometry_guidance=online_guidance)
-                            unguided = integrate(model, base, base, mask, steps, sigma,
+                            unguided = integrate(model, base, base, mask, steps, inference_sigma,
                                                  generator=unguided_rng, terminal_noise=False)
                             free = 1 - mask
                             denom = free.sum().clamp_min(1)
-                            value = ((prediction.clamp(0, 1) - hr).square() * free).sum() / denom
-                            reference = ((unguided.clamp(0, 1) - hr).square() * free).sum() / denom
-                            unguided_total += float(reference) * len(hr)
                             delta = ((prediction - unguided).square() * free).sum() / denom
                             guidance_delta += float(delta) * len(hr)
+                            prediction, unguided = prediction.clamp(0, 1), unguided.clamp(0, 1)
+                            value = ((prediction - hr).square() * free).sum() / denom
+                            reference = ((unguided - hr).square() * free).sum() / denom
+                            unguided_total += float(reference) * len(hr)
+                            if measure_ssim:
+                                unguided_ssim_total += float(mean_xy_ssim(unguided, hr)) * len(hr)
+                            chart = metric.bind(base)
+                            atlas_total += float(chart.state_cost(prediction).sum())
+                            unguided_atlas_total += float(chart.state_cost(unguided).sum())
                         else:
                             prediction = integrate(model, base, base, mask,
-                                                   cfg["sampling"]["steps"], cfg["sampling"]["sigma"],
-                                                   terminal_noise=not atlas_options)
-                            value = ((prediction.clamp(0, 1) - hr).square() * (1 - mask)).sum() / (1 - mask).sum().clamp_min(1)
+                                                   cfg["sampling"]["steps"], inference_sigma,
+                                                   terminal_noise=not atlas_options).clamp(0, 1)
+                            value = ((prediction - hr).square() * (1 - mask)).sum() / (1 - mask).sum().clamp_min(1)
+                        if measure_ssim:
+                            ssim_total += float(mean_xy_ssim(prediction, hr)) * len(hr)
                         total += float(value) * len(hr)
                         items += len(hr)
             except Exception as exc:
                 error = f"Validation: {type(exc).__name__}: {exc}"
             context.check_errors(error)
-            total, items, unguided_total, guidance_delta = context.sum([total, items, unguided_total, guidance_delta])
-            if int(items) != len(val_set) or not all(map(math.isfinite, (total, unguided_total, guidance_delta))):
+            reduced = context.sum([total, items, unguided_total, guidance_delta, ssim_total,
+                                   unguided_ssim_total, atlas_total, unguided_atlas_total])
+            (total, items, unguided_total, guidance_delta, ssim_total,
+             unguided_ssim_total, atlas_total, unguided_atlas_total) = reduced
+            if int(items) != len(val_set) or not all(map(math.isfinite, reduced)):
                 raise RuntimeError("Invalid validation accounting/score")
             validation = total / items
-            improved = validation < best
-            best = min(best, validation)
-            record.update(validation=validation, validation_items=int(items))
+            score = 1 - ssim_total / items if stage == "bridge" and selection_metric == "ssim" else validation
+            improved = score < best
+            best = min(best, score)
+            record.update(validation=validation, validation_items=int(items), selection_score=score,
+                          selection_metric=selection_metric if stage == "bridge" else "representation_loss")
+            if stage == "bridge":
+                record["validation_inference_sigma"] = inference_sigma
+            if measure_ssim:
+                record["validation_ssim"] = ssim_total / items
             if online_guidance and stage == "bridge":
                 record["validation_without_online_guidance"] = unguided_total / items
                 record["validation_guidance_delta_rms"] = math.sqrt(guidance_delta / items)
+                record["validation_atlas_cost"] = atlas_total / items
+                record["validation_atlas_cost_without_online_guidance"] = unguided_atlas_total / items
+                if measure_ssim:
+                    record["validation_ssim_without_online_guidance"] = unguided_ssim_total / items
             # Fit only on distributed TRAIN HR features; validation selects the
             # encoder checkpoint, never contributes centers or metric statistics.
             payload = atlas_payload

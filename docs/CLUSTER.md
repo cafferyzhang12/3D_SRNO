@@ -32,6 +32,26 @@ CONFIG=configs/mri_x4.local.yaml RUN_ID=mri_x4_gsbm_example bash scripts/submit_
 提交成功只表示作业已进入调度队列，不表示四卡验证或正式训练已经通过。
 请以 Slurm 状态与作业退出码、日志和最终产物为准。
 
+## GSBM 与动量桥的 MLS 对照
+
+在源码目录设置 `MRI_DATA_ROOT` 为原配对 MRI 数据根目录，设置
+`SUBSET_MANIFEST` 为已有 15% 测试病例清单的绝对路径。通过
+`NEURAL_ATLAS_SRC` 指定集群上与实验相同版本的 `neural_atlas_lab/src`，
+也可使用 `fundiff` 中已安装的对应版本。为每次训练设置独立的 `RUN_ID`。
+
+```bash
+mkdir -p reports/slurm
+CONFIG=configs/mri_gsbm_mls_guided_x4.yaml RUN_ID=mri_x4_gsbm_mls_trial \
+  sbatch --parsable --qos=high scripts/mri_atlas.sbatch
+CONFIG=configs/mri_momentum_mls_x4.yaml RUN_ID=mri_x4_momentum_mls_trial \
+  sbatch --parsable --qos=high scripts/mri_atlas.sbatch
+```
+
+每条作业在同一四卡 A800 allocation 内执行验证集小规模重建、正式表征和桥训练、
+固定 15% 测试。每次审计生成的紧凑病例索引供四个 rank 共享，并由该作业的表征训练、
+桥训练和正式测试使用。测试结果分别写入
+`outputs/mri/<RUN_ID>_test15/summary.json`。
+
 ## 正式配置
 
 `configs/mri_x4.yaml` 保存可审查的默认值：表征预训练 10 个 epoch，bridge

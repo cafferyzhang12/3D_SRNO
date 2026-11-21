@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from vemgsbm.momentum.geometry import assign_chart, fit_atlas
+from vemgsbm.momentum.guidance import atlas_anchor_update
 from vemgsbm.momentum.model import AccelerationNetwork, HaarXY
 from vemgsbm.momentum.phase import PhasePath, _shape_functions, _transition_coefficients, optimize_path, transition
 
@@ -91,3 +92,25 @@ def test_motion_preserves_observed_slices_and_single_step_anchor():
     assert torch.equal(first, second)
     assert torch.equal(first[:,:,::2], base[:,:,::2])
     assert not torch.equal(first[:,:,1], base[:,:,1])
+
+
+def test_atlas_force_damps_normal_velocity_and_preserves_observations():
+    class FlatChart:
+        @staticmethod
+        def phase_costs(image, speed):
+            # Each plane has tangents along its first half and normals along its second half.
+            return image.square().flatten(1).mean(1), speed[..., 4:].square().flatten(1).mean(1)
+
+    codec = HaarXY()
+    base = torch.zeros(1, 1, 2, 8, 8)
+    mask = torch.zeros_like(base)
+    mask[:, :, 0] = 1
+    speed = torch.full_like(base, .7)
+    time = .6
+    options = dict(position_strength=0., velocity_strength=10., start=.25, max_acceleration=.2)
+    update = atlas_anchor_update(codec, FlatChart(), base, mask, codec.encode(base),
+                                 codec.encode(speed), time, options)
+    acceleration = codec.decode(update) * (3 / (1 - time)**2)
+    torch.testing.assert_close(acceleration[:, :, 0], torch.zeros_like(acceleration[:, :, 0]))
+    torch.testing.assert_close(acceleration[..., :4], torch.zeros_like(acceleration[..., :4]))
+    torch.testing.assert_close(acceleration[:, :, 1, :, 4:], torch.full((1, 1, 8, 4), -.2))

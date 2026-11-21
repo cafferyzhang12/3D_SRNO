@@ -1,5 +1,5 @@
 mode: gsbm
-run_dir: runs/mri/mri_x4_gsbm_mls_guided
+run_dir: runs/mri/mri_x4_gsbm_mls_guided_v2
 data:
   kind: paired_mri_png
   degradation: paired_xy
@@ -37,7 +37,8 @@ representation:
 path:
   knots: 5
   iterations: 5
-  lr: 0.02
+  lr: 0.0002
+  backtrack_steps: 3
   quadrature: 5
   optimize_std: true
   std_bound: 0.75
@@ -62,12 +63,15 @@ train:
   threads: 4
   seed: 42
   validate_every: 1
+  selection_metric: ssim
   metric_matching_weight: 0.05
 sampling:
   steps: 20
   sigma: 0.1
+  inference_sigma: 0.05
   geometry_guidance:
     strength: 0.02
+    normal_strength: 0.01
     start: 0.3
     max_update: 0.002
 test:

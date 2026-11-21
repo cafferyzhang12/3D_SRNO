@@ -35,10 +35,12 @@ def read_config(path):
     sigma = cfg["path"]["sigma"]
     if not math.isfinite(sigma) or sigma < 0 or sigma != cfg["sampling"]["sigma"]:
         raise ValueError("Path and SDE reference diffusion sigma must agree and be finite")
+    sampling_noise(cfg)
     data = cfg["data"]
     if cfg.get("atlas") and (data.get("kind") != "paired_mri_png" or any(p % 4 for p in patch[1:])):
         raise ValueError("The MRI MLS atlas requires paired MRI and XY patches divisible by four")
     sampling_geometry_guidance(cfg)
+    sampling_momentum_guidance(cfg)
     if cfg.get("chart_momentum") is not None:
         from .momentum.trivialized import chart_momentum_options
 
@@ -55,6 +57,15 @@ def read_config(path):
     return cfg
 
 
+def sampling_noise(config):
+    """Return the inference noise, with older checkpoints using reference noise."""
+    sampling = config["sampling"]
+    sigma = sampling.get("inference_sigma", sampling["sigma"])
+    if isinstance(sigma, bool) or not isinstance(sigma, (int, float)) or not math.isfinite(sigma) or sigma < 0:
+        raise ValueError("Inference diffusion sigma must be a nonnegative finite number")
+    return float(sigma)
+
+
 def sampling_geometry_guidance(config):
     from .bridge import geometry_guidance_options
 
@@ -63,6 +74,14 @@ def sampling_geometry_guidance(config):
                                 or config["data"].get("kind") != "paired_mri_png"):
         raise ValueError("Online MLS guidance requires an LR-routed MLS GSBM MRI configuration")
     return options
+
+
+def sampling_momentum_guidance(config):
+    if config.get("sampling", {}).get("momentum_geometry") is None:
+        return None
+    from .momentum.guidance import momentum_geometry_options
+
+    return momentum_geometry_options(config)
 
 
 def setup(seed, device_name="auto", threads=4):
@@ -114,6 +133,13 @@ def build_models(checkpoint, device):
         model = AccelerationNetwork(**cfg["model"], chart_features=chart_options is not None).to(device)
         if chart_options is not None:
             geometry = ChartMomentumAtlas(checkpoint["atlas"], chart_options).to(device)
+        elif sampling_momentum_guidance(cfg) is not None:
+            from .atlas_geometry import MRIAtlasGeometry
+
+            payload = checkpoint.get("atlas")
+            if not isinstance(payload, dict) or payload.get("kind") != "mls" or "routing" not in payload:
+                raise ValueError("Guided momentum checkpoint requires an LR-routed MRI atlas")
+            geometry = MRIAtlasGeometry(payload).to(device)
     else:
         from .network import DriftNetwork
         model = DriftNetwork(cfg["model"]["width"]).to(device)

@@ -111,6 +111,28 @@ def test_changing_geometry_changes_the_optimized_path():
     assert second.mean(.5).mean() < -.1
 
 
+def test_backtracking_recovers_atlas_descent_after_an_oversized_adam_step():
+    source = torch.zeros(1, 1, 2, 2, 2)
+    mask = torch.zeros_like(source)
+    mask[..., 0] = 1
+    config = dict(iterations=1, sigma=0., state_weight=.03, metric_weight=.01,
+                  quadrature_points=5, learning_rate=.2, max_correction=.15)
+    atlas = TargetCost()
+    original, stalled = optimize_path(source, source, mask, atlas, config)
+    path, recovered = optimize_path(source, source, mask, atlas, dict(config, backtrack_steps=8))
+    assert stalled["accepted_steps"] == 0
+    assert torch.equal(original.mean_knots, torch.zeros_like(original.mean_knots))
+    assert recovered["trial_evaluations"] > recovered["accepted_steps"] == 1
+    assert recovered["objective_after"] < recovered["objective_before"]
+    assert recovered["mean_correction_rms"] > 0
+    assert torch.equal(path.mean(0), source)
+    assert torch.equal(path.mean(1), source)
+    middle = path.mean(.5)
+    assert torch.count_nonzero(middle * mask) == 0
+    assert (middle * (1 - mask)).mean() > 0
+    assert atlas.offset.grad is None
+
+
 def test_metric_kinetic_energy_is_actually_used_in_path_objective():
     source, target, mask = images()
     metric = TargetCost()

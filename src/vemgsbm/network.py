@@ -19,10 +19,11 @@ class DriftNetwork(nn.Module):
 
 @torch.no_grad()
 def integrate(model, initial, base, mask, steps=20, sigma=0.1, direction="forward", generator=None,
-              terminal_noise=True, state_guidance=None):
+              terminal_noise=True, state_guidance=None, transition_guidance=None):
     """Euler-Maruyama in forward or reversed time; no HR available at inference.
 
-    Optional state guidance acts on each provisional interior state.
+    Optional guidance acts on provisional interior states. Transition guidance
+    also receives the previous state, before the drift and noise updates.
     Both directions use a positive simulation step. The backward network is
     trained against the reversed-time drift, so no second sign flip is applied.
     Times are supplied in original (LR=0, HR=1) coordinates.
@@ -44,6 +45,7 @@ def integrate(model, initial, base, mask, steps=20, sigma=0.1, direction="forwar
         # Endpoint Gaussian conditional drifts have singular representations;
         # endpoint time embeddings are evaluated at the training cutoff.
         time = min(0.98, max(0.02, time))
+        previous = state
         drift = model(state, base, mask, time, direction)
         noise = torch.randn(state.shape, dtype=state.dtype, device=state.device, generator=generator)
         state = state + dt * drift
@@ -51,11 +53,14 @@ def integrate(model, initial, base, mask, steps=20, sigma=0.1, direction="forwar
         if terminal_noise or index + 1 < steps:
             state = state + sigma * dt**0.5 * noise * (1 - mask)
         state = torch.where(mask.bool(), base, state)
-        if state_guidance is not None and index + 1 < steps:
+        if (state_guidance is not None or transition_guidance is not None) and index + 1 < steps:
             next_time = (index + 1) / steps
             if direction == "backward":
                 next_time = 1 - next_time
-            state = state_guidance(state, next_time, dt, mask)
+            if transition_guidance is not None:
+                state = transition_guidance(state, next_time, dt, mask, previous)
+            else:
+                state = state_guidance(state, next_time, dt, mask)
             state = torch.where(mask.bool(), base, state)
         if not torch.isfinite(state).all():
             raise FloatingPointError("Nonfinite GSBM SDE trajectory")

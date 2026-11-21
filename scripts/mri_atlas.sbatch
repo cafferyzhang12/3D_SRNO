@@ -33,12 +33,27 @@ for profile in validate formal; do
     representation_config=$(gsbm_config "$CONFIG" representation "$profile")
     run="$PWD/runs/mri/$RUN_ID"
     if [[ "$profile" == validate ]]; then run="$run/smoke"; fi
-    inventory_option=()
-    if [[ "$mode" == gsbm ]]; then
-        inventory="$run/mri_case_inventory.json.gz"
-        echo "Preparing MRI inventory before torchrun ($profile)"
-        "$GSBM_PYTHON" -m vemgsbm.mri_inventory --config "$representation_config" --output "$inventory"
-        inventory_option=(--case-inventory "$inventory")
+    inventory="$run/mri_case_inventory.json.gz"
+    echo "Preparing MRI inventory before torchrun ($profile)"
+    "$GSBM_PYTHON" -m vemgsbm.mri_inventory --config "$representation_config" --output "$inventory"
+    inventory_option=(--case-inventory "$inventory")
+    if [[ "$profile" == formal ]]; then
+        "$GSBM_PYTHON" - "$representation_config" "$inventory" "$SUBSET_MANIFEST" <<'PY'
+import json
+import sys
+from vemgsbm.mri_infer import checked_test_subset
+from vemgsbm.mri_inventory import load_inventory
+from vemgsbm.runtime import read_config
+
+config_path, inventory, locked_manifest = sys.argv[1:]
+cfg = read_config(config_path)
+indexed, _ = load_inventory(inventory, cfg["data"], ("test",))
+test = cfg.get("test", {})
+selected, subset = checked_test_subset(indexed["test"], float(test.get("fraction", .15)),
+                                       int(test.get("subset_seed", 20261110)), locked_manifest)
+print(json.dumps({"locked_test_cases": subset["selected_cases"],
+                  "locked_test_slices": sum(len(case.stems) for case in selected)}), flush=True)
+PY
     fi
     gsbm_torchrun -m vemgsbm.train --config "$representation_config" --stage representation --device cuda "${inventory_option[@]}"
     export REPRESENTATION_CHECKPOINT="$run/representation/best.pt"
@@ -47,7 +62,7 @@ for profile in validate formal; do
         gsbm_torchrun -m vemgsbm.train --config "$bridge_config" --stage bridge --device cuda "${inventory_option[@]}"
         export CHECKPOINT="$run/bridge/best.pt"
     else
-        gsbm_torchrun -m vemgsbm.momentum.train --config "$bridge_config" --device cuda
+        gsbm_torchrun -m vemgsbm.momentum.train --config "$bridge_config" --device cuda "${inventory_option[@]}"
         export CHECKPOINT="$run/momentum/best.pt"
     fi
     if [[ "$profile" == validate ]]; then
@@ -70,8 +85,6 @@ PY
     fi
     unset REPRESENTATION_CHECKPOINT
 done
-if [[ "$mode" == gsbm ]]; then
-    export MRI_CASE_INVENTORY="$inventory"
-fi
+export MRI_CASE_INVENTORY="$inventory"
 export INFERENCE_VARIANT=endpoint_safe
 exec bash scripts/mri_test.sbatch

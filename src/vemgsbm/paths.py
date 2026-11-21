@@ -273,21 +273,29 @@ def optimize_path(source: Tensor, target: Tensor, mask: Tensor, metric: Any,
     """Optimize Gaussian means for the supplied *paired* conditional endpoints.
 
     Common-random-number midpoint quadrature is used during local optimization.
-    Only mean knots receive gradients; metric parameters are never optimized or
-    given .grad tensors. Keeping the best iterate makes reported objective
-    decrease on this quadrature, but does not imply population convergence.
+    Mean and optional variance knots receive gradients; the metric is frozen.
+    When backtracking is enabled, each step must decrease the same frozen-noise
+    objective. An exhausted search returns the last accepted iterate.
     Returned tensors are detached before neural bridge matching.
     """
     cfg = {} if config is None else dict(config)
     iterations = cfg.get("iterations", 5)
     points = cfg.get("quadrature_points", cfg.get("quadrature", 5))
     learning_rate = float(cfg.get("learning_rate", cfg.get("lr", 0.03)))
+    backtrack_steps = cfg.get("backtrack_steps", 0)
+    maximum = cfg.get("max_correction")
     if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 0:
         raise ValueError("iterations must be a nonnegative integer")
     if isinstance(points, bool) or not isinstance(points, int) or points < 1:
         raise ValueError("quadrature_points must be a positive integer")
     if not math.isfinite(learning_rate) or learning_rate <= 0:
         raise ValueError("learning rate must be finite and positive")
+    if isinstance(backtrack_steps, bool) or not isinstance(backtrack_steps, int) or backtrack_steps < 0:
+        raise ValueError("backtrack_steps must be a nonnegative integer")
+    if maximum is not None:
+        maximum = float(maximum)
+        if not math.isfinite(maximum) or maximum <= 0:
+            raise ValueError("max_correction must be finite and positive")
     for key in ("control_weight", "state_weight", "metric_weight"):
         value = float(cfg.get(key, {"control_weight": 1., "state_weight": .1, "metric_weight": .05}[key]))
         if not math.isfinite(value) or value < 0:
@@ -311,11 +319,12 @@ def optimize_path(source: Tensor, target: Tensor, mask: Tensor, metric: Any,
     if not bool(torch.isfinite(baseline)):
         raise FloatingPointError("Nonfinite initial conditional-control objective")
     best_value = float(baseline.detach())
-    best_knots = variable.detach().clone()
-    best_std = None if std_variable is None else std_variable.detach().clone()
+    best_variables = [parameter.detach().clone() for parameter in variables]
     best_terms = {key: float(value.detach()) for key, value in base_terms.items()}
     initial_value, initial_terms = best_value, dict(best_terms)
+    accepted_steps, attempted_steps, trial_evaluations = 0, 0, 0
     for _ in range(iterations):
+        attempted_steps += 1
         optimizer.zero_grad(set_to_none=True)
         value, _ = _objective(path, metric, times, noise, cfg)
         gradients = torch.autograd.grad(value, variables)
@@ -325,27 +334,40 @@ def optimize_path(source: Tensor, target: Tensor, mask: Tensor, metric: Any,
             parameter.grad = gradient
         torch.nn.utils.clip_grad_norm_(variables, float(cfg.get("gradient_clip", 10.0)), error_if_nonfinite=True)
         optimizer.step()
-        maximum = cfg.get("max_correction")
-        if maximum is not None:
-            maximum = float(maximum)
-            if not math.isfinite(maximum) or maximum <= 0:
-                raise ValueError("max_correction must be finite and positive")
-            with torch.no_grad():
-                variable.copy_(initial.mean_knots + (variable - initial.mean_knots).clamp(-maximum, maximum))
         with torch.no_grad():
-            candidate, terms = _objective(path, metric, times, noise, cfg)
-            if not bool(torch.isfinite(candidate)):
-                raise FloatingPointError("Nonfinite optimized conditional-control objective")
-            if float(candidate) < best_value:
-                best_value = float(candidate)
-                best_knots = variable.detach().clone()
-                best_std = None if std_variable is None else std_variable.detach().clone()
-                best_terms = {key: float(item) for key, item in terms.items()}
-    result = PathBatch(initial.source, initial.target, initial.mask, best_knots, initial.sigma,
-                       best_std, path.std_bound).detached()
+            if maximum is not None:
+                variable.copy_(initial.mean_knots + (variable - initial.mean_knots).clamp(-maximum, maximum))
+            displacement = ([parameter - anchor for parameter, anchor in zip(variables, best_variables)]
+                            if backtrack_steps else ())
+            for retry in range(backtrack_steps + 1):
+                scale = 0.5**retry
+                if retry:
+                    for parameter, anchor, delta in zip(variables, best_variables, displacement):
+                        parameter.copy_(anchor + scale * delta)
+                candidate, terms = _objective(path, metric, times, noise, cfg)
+                trial_evaluations += 1
+                score = float(candidate)
+                if not math.isfinite(score):
+                    if backtrack_steps:
+                        continue
+                    raise FloatingPointError("Nonfinite optimized conditional-control objective")
+                if score < best_value:
+                    best_value = score
+                    best_variables = [parameter.detach().clone() for parameter in variables]
+                    best_terms = {key: float(item) for key, item in terms.items()}
+                    accepted_steps += 1
+                    optimizer.param_groups[0]["lr"] *= scale
+                    break
+            else:
+                if backtrack_steps:
+                    break
+    result = PathBatch(initial.source, initial.target, initial.mask, best_variables[0], initial.sigma,
+                       best_variables[1] if std_variable is not None else None, path.std_bound).detached()
     diagnostics = {"objective_before": initial_value, "objective_after": best_value,
                    "objective_improvement": initial_value - best_value,
-                   "iterations": float(iterations)}
+                   "iterations": float(iterations), "attempted_steps": float(attempted_steps),
+                   "accepted_steps": float(accepted_steps), "trial_evaluations": float(trial_evaluations),
+                   "mean_correction_rms": float((result.mean_knots - initial.mean_knots).square().mean().sqrt())}
     diagnostics["optimized_std"] = float(std_variable is not None)
     diagnostics.update({f"{key}_before": value for key, value in initial_terms.items()})
     diagnostics.update({f"{key}_after": value for key, value in best_terms.items()})

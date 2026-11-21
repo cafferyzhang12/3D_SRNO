@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..models import _TimeResidualBlock, batch_time, volume_inputs
+from .guidance import atlas_anchor_update
 from .phase import transition
 
 
@@ -79,7 +80,7 @@ class AccelerationNetwork(nn.Module):
         return self.output(self.decoder(torch.cat((hidden, skip), dim=1), embedding))
 
     @torch.no_grad()
-    def restore(self, base, mask, steps=20, sigma=0.15, generator=None, geometry=None):
+    def restore(self, base, mask, steps=20, sigma=0.15, generator=None, geometry=None, geometry_guidance=None):
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
             raise ValueError("Expected positive integer steps")
         if not math.isfinite(sigma) or sigma < 0:
@@ -90,11 +91,21 @@ class AccelerationNetwork(nn.Module):
         if self.chart_features and geometry is None:
             raise ValueError("Chart momentum sampling requires its fitted MLS atlas")
         frame = geometry.bind(condition, free) if self.chart_features else None
+        bound = None
+        if geometry_guidance is not None:
+            if self.chart_features or not getattr(geometry, "source_routing", False):
+                raise ValueError("Momentum force requires its fitted LR-routed MRI atlas")
+            bound = geometry.bind(base)
         position = torch.zeros_like(condition)
         velocity = torch.zeros_like(condition)
         for step in range(steps):
+            time = step / steps
             physical = frame.features(position, velocity) if frame is not None else None
-            anchor = self(position, velocity, condition, step / steps, physical) * free
+            anchor = self(position, velocity, condition, time, physical) * free
+            if bound is not None:
+                anchor = anchor + atlas_anchor_update(codec=self.codec, bound=bound, base=base, mask=mask,
+                                                       position=position, velocity=velocity, time=time,
+                                                       options=geometry_guidance)
             # Integrate the stiff reference acceleration exactly while holding
             # this learned effective endpoint fixed over the current step.
             # In chart mode, the next query pushes both updated coordinates

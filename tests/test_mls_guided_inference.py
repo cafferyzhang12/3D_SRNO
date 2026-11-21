@@ -5,7 +5,7 @@ import pytest
 
 from vemgsbm.bridge import reconstruct
 from vemgsbm.network import DriftNetwork
-from vemgsbm.runtime import build_models
+from vemgsbm.runtime import build_models, sampling_noise
 
 
 class RecordingGeometry:
@@ -71,3 +71,38 @@ def test_checkpoint_requires_mls_payload_only_when_guidance_is_enabled():
     cfg["sampling"]["geometry_guidance"]["strength"] = 0.02
     with pytest.raises(ValueError, match="missing its MRI MLS geometry"):
         build_models(checkpoint, "cpu")
+
+
+def test_transition_guidance_receives_previous_state_and_preserves_tangent_motion():
+    class Chart(RecordingGeometry):
+        def transition_costs(self, previous, state):
+            self.queried.append((previous.clone(), state.detach().clone()))
+            normal = (state[..., 1] - previous[..., 1]).square().flatten(1).mean(1)
+            return torch.zeros_like(normal), normal
+
+    def drift(state, *_):
+        return torch.ones_like(state)
+
+    base = torch.zeros((1, 1, 3, 4, 4))
+    chart = Chart()
+    mask = torch.zeros_like(base)
+    mask[..., 0] = 1
+    result = reconstruct(drift, base, mask, geometry=chart, sigma=0., steps=4,
+                         geometry_guidance={"normal_strength": 0.1, "max_update": 0.1})
+    assert len(chart.queried) == 2
+    before, after = chart.queried[0]
+    torch.testing.assert_close(after[..., 1] - before[..., 1], torch.full_like(after[..., 1], .25))
+    torch.testing.assert_close(result[..., 0], base[..., 0])
+    torch.testing.assert_close(result[..., 2:], torch.ones_like(result[..., 2:]))
+    assert (result[..., 1] < 1.).all()
+
+
+def test_inference_sigma_is_separate_and_validated():
+    cfg = {"sampling": {"sigma": .10}}
+    assert sampling_noise(cfg) == .10
+    cfg["sampling"]["inference_sigma"] = .05
+    assert sampling_noise(cfg) == .05
+    assert cfg["sampling"]["sigma"] == .10
+    cfg["sampling"]["inference_sigma"] = float("nan")
+    with pytest.raises(ValueError, match="Inference diffusion sigma"):
+        sampling_noise(cfg)

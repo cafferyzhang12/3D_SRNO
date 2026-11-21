@@ -107,6 +107,9 @@ def optimize_path(endpoint, free, chart, config, *, control_scale=1.0):
     noise_z = torch.randn((points, *endpoint.shape), device=endpoint.device, dtype=endpoint.dtype)
     noise_v = torch.randn_like(noise_z)
     geometry_cost = chart if callable(chart) else chart.cost
+    geometry_ramp = float(config.get("geometry_ramp_power", 0.))
+    if not math.isfinite(geometry_ramp) or geometry_ramp < 0:
+        raise ValueError("Momentum path geometry ramp must be finite and nonnegative")
 
     def cost():
         totals = []
@@ -114,7 +117,8 @@ def optimize_path(endpoint, free, chart, config, *, control_scale=1.0):
             z, v, _, correction = path.sample(t, noise_z[i], noise_v[i])
             normal_position, normal_velocity = geometry_cost(z, v, free)
             control = 0.5 * control_scale * correction.square().mean()
-            totals.append(torch.stack((control, normal_position, normal_velocity)))
+            weight = t.pow(geometry_ramp)
+            totals.append(torch.stack((control, weight * normal_position, weight * normal_velocity)))
         terms = torch.stack(totals).mean(0)
         total = terms[0] + config["state_weight"] * terms[1] + config["normal_weight"] * terms[2]
         return total, terms
@@ -126,6 +130,9 @@ def optimize_path(endpoint, free, chart, config, *, control_scale=1.0):
         best = float(initial)
         best_shifts = shifts.detach().clone()
     backtracks = config.get("backtracking_steps", 0)
+    if isinstance(backtracks, bool) or not isinstance(backtracks, int) or backtracks < 0:
+        raise ValueError("Momentum path backtracking steps must be a nonnegative integer")
+    accepted, shrinks = 0, 0
     for _ in range(config["iterations"]):
         optimizer.zero_grad(set_to_none=True)
         loss, _ = cost()
@@ -143,6 +150,7 @@ def optimize_path(endpoint, free, chart, config, *, control_scale=1.0):
                     break
                 shifts.copy_(previous + update * (.5 ** (attempt + 1)))
                 candidate, terms = cost()
+                shrinks += 1
             if backtracks and (not torch.isfinite(candidate) or candidate > loss):
                 shifts.copy_(previous)
                 continue
@@ -151,8 +159,11 @@ def optimize_path(endpoint, free, chart, config, *, control_scale=1.0):
             if float(candidate) < best:
                 best, best_terms = float(candidate), terms
                 best_shifts = shifts.detach().clone()
+                accepted += 1
     return PhasePath(endpoint, best_shifts, path.sigma, free), {
         "path_before": float(initial), "path_after": best,
         "path_control": float(best_terms[0]), "path_normal_position": float(best_terms[1]),
         "path_normal_velocity": float(best_terms[2]), "path_shift_rms": float(best_shifts.square().mean().sqrt()),
+        "path_objective_improvement": float(initial) - best, "path_improving_steps": accepted,
+        "path_backtracks": shrinks,
     }

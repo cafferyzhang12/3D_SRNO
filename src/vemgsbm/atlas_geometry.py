@@ -356,7 +356,7 @@ class BoundSourceMRIAtlas:
         # Low confidence reduces strength without creating a detached zero cost.
         return (local["weight"] * robust).sum(-1) * (.05 + .95 * self.source_confidence)
 
-    def _direction_energy(self, local, velocity):
+    def _direction_components(self, local, velocity):
         jacobian = local["jacobian"]
         gram = jacobian.transpose(-2, -1) @ jacobian
         # Recover tangent coefficients in the chart's induced metric. A tiny
@@ -369,6 +369,10 @@ class BoundSourceMRIAtlas:
         tangent = torch.einsum("bki,bkij,bkj->bk", coordinate_velocity, gram, coordinate_velocity)
         lifted = torch.einsum("bkdi,bki->bkd", jacobian, coordinate_velocity)
         normal = (velocity[:, None] - lifted).square().sum(-1)
+        return tangent, normal
+
+    def _direction_energy(self, local, velocity):
+        tangent, normal = self._direction_components(local, velocity)
         chart_energy = (tangent + self.settings["normal_weight"] * normal) / velocity.shape[-1]
         ambient = velocity.square().mean(-1)
         # Unsupported charts revert smoothly to the ambient feature metric.
@@ -378,6 +382,30 @@ class BoundSourceMRIAtlas:
 
     def state_cost(self, images):
         return self._state_energy(self._local_geometry(self.geometry.encode(images), derivative=False))
+
+    def transition_costs(self, previous, images):
+        """Measure chart attraction and off-tangent feature displacement per patch."""
+        with torch.no_grad():
+            origin = self.geometry.encode(previous)
+            local = self._local_geometry(origin)
+        current = self.geometry.encode(images)
+        state_cost = self._state_energy(self._local_geometry(current, derivative=False))
+        displacement = current - origin
+        _, normal = self._direction_components(local, displacement)
+        normal_cost = (local["weight"] * local["trust"] * normal).sum(-1) / displacement.shape[-1]
+        return state_cost, normal_cost
+
+    def phase_costs(self, images, image_velocity):
+        """Return position and trusted chart-normal velocity costs per patch."""
+        step = self.settings["jvp_step"]
+        features, left, right = self.geometry.encode(torch.cat(
+            (images, images - step * image_velocity, images + step * image_velocity))).chunk(3)
+        velocity = (right - left) / (2 * step)
+        with torch.no_grad():
+            local = self._local_geometry(features.detach())
+        _, normal = self._direction_components(local, velocity)
+        normal_cost = (local["weight"] * local["trust"] * normal).sum(-1) / velocity.shape[-1]
+        return self._state_energy(self._local_geometry(features, derivative=False)), normal_cost
 
     def kinetic(self, first, second, dt):
         a, b = self.geometry.encode(torch.cat((first, second))).chunk(2)

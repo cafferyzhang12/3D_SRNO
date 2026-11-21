@@ -28,7 +28,7 @@ from .distributed import initialize_distributed
 from .infer import tile_starts
 from .mri_data import index_cases, read_plane
 from .runtime import (atomic_save, build_models, fingerprint, load_checkpoint, project_path,
-                      sampling_geometry_guidance, setup)
+                      sampling_geometry_guidance, sampling_momentum_guidance, sampling_noise, setup)
 
 
 def _read_lq(case, index):
@@ -144,6 +144,8 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
     scale = config["data"]["scale"]
     patch = tuple(config["data"]["patch_size"])
     guidance = sampling_geometry_guidance(config)
+    momentum_guidance = sampling_momentum_guidance(config)
+    sigma = sampling_noise(config)
     improved = guidance is not None or config.get("inference_variant") == "endpoint_safe" or config["mode"] == "momentum"
     shape = (len(case.lq), case.lr_shape[0] * scale, case.lr_shape[1] * scale)
     folder.mkdir()
@@ -175,8 +177,9 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
                         base, mask = make_mri_tile(case, run, start, patch, scale, reader=reader)
                         prediction = reconstruct(
                             model, base.to(device), mask.to(device), config["mode"], geometry=geometry,
-                            steps=steps, sigma=config["sampling"]["sigma"], generator=generator,
+                            steps=steps, sigma=sigma, generator=generator,
                             terminal_noise=not improved, geometry_guidance=guidance,
+                            **({"momentum_guidance": momentum_guidance} if momentum_guidance is not None else {}),
                         )
                         tile = prediction[0, 0] if improved else prediction[0, 0].clamp(0, 1)
                         array = tile.cpu().numpy()
@@ -240,6 +243,7 @@ def _write_case(case, staged, model, geometry, config, device, seed, steps, samp
         "normalization_scale": case.normalization_scale,
         "normalization_offset": case.normalization_offset, "channel_policy": case.channel_policy,
         "mode": config["mode"], "seed": seed, "steps": steps, "samples": samples,
+        "sampling_sigma": sampling_noise(config), "reference_sigma": config["sampling"]["sigma"],
         "base": "real LR, per-slice bilinear XY, align_corners=False", "observed_mask": "all_zero",
         "volume_exported": save_volume,
         "mean_file": "mean.npy" if save_volume else None,
@@ -254,6 +258,10 @@ def _write_case(case, staged, model, geometry, config, device, seed, steps, samp
     }
     if guidance is not None:
         metadata["geometry_guidance"] = guidance
+    momentum_guidance = sampling_momentum_guidance(config)
+    if momentum_guidance is not None:
+        metadata["momentum_geometry"] = momentum_guidance
+        metadata["inference_variant"] = "mls_guided_momentum_bridge"
     if config.get("chart_momentum") is not None:
         metadata["chart_momentum"] = config["chart_momentum"]
     if metrics is not None:
@@ -334,6 +342,20 @@ def select_case_subset(cases, fraction=0.15, seed=20261110):
     selected = sorted(cases, key=lambda c: hashlib.sha256(f"{seed}:{c.id}".encode()).hexdigest())[:count]
     identifiers = {c.id for c in selected}
     return [c for c in cases if c.id in identifiers]
+
+
+def checked_test_subset(cases, fraction=0.15, seed=20261110, manifest_path=None):
+    """Describe the selected whole cases and verify an optional locked cohort."""
+    available_ids = [case.id for case in cases]
+    selected = select_case_subset(cases, fraction, seed)
+    subset = {"fraction": fraction, "seed": seed, "available_cases": len(available_ids),
+              "selected_cases": len(selected), "case_ids": [case.id for case in selected],
+              "available_ids_sha256": hashlib.sha256("\n".join(available_ids).encode()).hexdigest()}
+    if manifest_path is not None:
+        frozen = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        if subset != frozen:
+            raise ValueError("Indexed test cohort differs from the locked comparison manifest")
+    return selected, subset
 
 
 def _checked_rank_call(context, function):
@@ -441,16 +463,7 @@ def infer_mri(
             for case in cases:
                 if case.id in (".", "..") or Path(case.id).name != case.id or "/" in case.id or "\\" in case.id:
                     raise ValueError("Case identifiers must be simple directory names")
-            available_ids = [case.id for case in cases]
-            cases = select_case_subset(cases, test_fraction, subset_seed)
-            subset = {"fraction": test_fraction, "seed": subset_seed,
-                      "available_cases": len(available_ids), "selected_cases": len(cases),
-                      "case_ids": [case.id for case in cases],
-                      "available_ids_sha256": hashlib.sha256("\n".join(available_ids).encode()).hexdigest()}
-            if subset_manifest is not None:
-                frozen = json.loads(Path(subset_manifest).read_text(encoding="utf-8"))
-                if subset != frozen:
-                    raise ValueError("Indexed test cohort differs from the locked comparison manifest")
+            cases, subset = checked_test_subset(cases, test_fraction, subset_seed, subset_manifest)
             atomic_save(subset, output_root.parent / (output_root.name + "_subset.json"), json_file=True)
             return cases, fingerprint(checkpoint_path), subset
 
@@ -470,12 +483,18 @@ def infer_mri(
             summary = _collect_summary(staged, cases, checkpoint_hash, exported_case_ids)
             summary["subset"] = subset
             summary["inference_variant"] = "momentum_bridge" if config["mode"] == "momentum" else inference_variant
+            summary["sampling_sigma"] = sampling_noise(config)
+            summary["reference_sigma"] = config["sampling"]["sigma"]
             if config.get("chart_momentum") is not None:
                 summary["inference_variant"] = "chart_trivialized_momentum_bridge"
                 summary["chart_momentum"] = config["chart_momentum"]
             guidance = sampling_geometry_guidance(config)
             if guidance is not None:
                 summary["geometry_guidance"] = guidance
+            momentum_guidance = sampling_momentum_guidance(config)
+            if momentum_guidance is not None:
+                summary["inference_variant"] = "mls_guided_momentum_bridge"
+                summary["momentum_geometry"] = momentum_guidance
             atomic_save(subset, staged / "subset_manifest.json", json_file=True)
             atomic_save(summary, staged / "summary.json", json_file=True)
             if output_root.exists():

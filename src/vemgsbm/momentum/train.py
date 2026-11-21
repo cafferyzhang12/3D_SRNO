@@ -2,6 +2,7 @@
 import argparse
 import copy
 import json
+import math
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
@@ -9,8 +10,10 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from ..datasets import training_data
 from ..distributed import initialize_distributed, ValidationShardSampler
-from ..runtime import atomic_save, load_checkpoint, project_path, read_config, setup
+from ..mri_metrics import mean_xy_ssim
+from ..runtime import atomic_save, load_checkpoint, project_path, read_config, sampling_noise, setup
 from .geometry import assign_chart, fit_atlas
+from .guidance import momentum_geometry_options
 from .model import AccelerationNetwork
 from .phase import optimize_path
 from .trivialized import ChartMomentumAtlas, chart_momentum_options, fit_chart_momentum_atlas
@@ -50,6 +53,23 @@ def run_training(config_path, device_name="auto", resume=None, case_inventory=No
         raise ValueError("Expected a momentum config")
     use_mls = bool(cfg.get("atlas"))
     chart_options = chart_momentum_options(cfg)
+    guidance = momentum_geometry_options(cfg)
+    train_cfg = cfg["train"]
+    metric_weight = train_cfg.get("metric_matching_weight", 0.)
+    if (isinstance(metric_weight, bool) or not isinstance(metric_weight, (int, float))
+            or not math.isfinite(metric_weight) or metric_weight < 0 or (metric_weight and guidance is None)):
+        raise ValueError("Momentum metric matching needs finite nonnegative weight and the LR-routed atlas")
+    selection = train_cfg.get("selection_metric", "mse")
+    if selection not in ("mse", "ssim"):
+        raise ValueError("Momentum selection_metric must be mse or ssim")
+    sample_sigma = sampling_noise(cfg)
+    reference_sigma = cfg["sampling"]["sigma"]
+    validation_settings = {"inference": (sample_sigma, guidance)}
+    if guidance is not None:
+        validation_settings["without_online_guidance"] = (sample_sigma, None)
+        if sample_sigma != reference_sigma:
+            validation_settings["reference_noise"] = (reference_sigma, guidance)
+    report_ssim = guidance is not None or selection == "ssim"
     context = initialize_distributed(device_name)
     run_dir = project_path(cfg["run_dir"]) / "momentum"
     lock = None
@@ -65,7 +85,6 @@ def run_training(config_path, device_name="auto", resume=None, case_inventory=No
     try:
         context.assert_same((cfg, resume), "momentum configuration")
         context.main_call(prepare)
-        train_cfg = cfg["train"]
         seed = train_cfg["seed"]
         device = setup(seed, str(context.device), train_cfg.get("threads", 4))
         if case_inventory is None:
@@ -117,7 +136,12 @@ def run_training(config_path, device_name="auto", resume=None, case_inventory=No
                 geometry = MRIAtlasGeometry(atlas).to(device)
             else:
                 atlas, geometry = load_mri_atlas(cfg, digest, identity, device)
-            geometry_report = {"geometry": "mls", "atlas": atlas["diagnostics"]}
+            if guidance is not None and not geometry.source_routing:
+                raise ValueError("Momentum geometry requires the fitted LR source routing")
+            geometry_report = {"geometry": "source_conditioned_mls" if guidance is not None else "mls",
+                               "atlas": atlas["diagnostics"], "sampling_sigma": sample_sigma,
+                               "reference_sigma": reference_sigma, "selection_metric": selection,
+                               "validation_conditions": list(validation_settings)}
         else:
             device_atlas = {k: v.to(device) for k, v in atlas.items() if isinstance(v, torch.Tensor)}
             geometry_report = {"geometry": "pca", "training_tokens": atlas["training_tokens"],
@@ -141,6 +165,7 @@ def run_training(config_path, device_name="auto", resume=None, case_inventory=No
                 try:
                     batch = next(iterator)
                     hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
+                    bound = None
                     with torch.no_grad():
                         free = model.codec.free(mask)
                         endpoint = model.codec.encode(hr - base) * free
@@ -150,11 +175,20 @@ def run_training(config_path, device_name="auto", resume=None, case_inventory=No
                             endpoint = frame.to_body(endpoint)
                         else:
                             frame = None
-                            cost = (geometry.bind(hr).momentum_cost(base, model.codec) if use_mls
-                                    else assign_chart(device_atlas, endpoint * (5/16)).cost)
-                    if frame is not None:
+                    if guidance is not None:
+                        bound = geometry.bind(base)
+
+                        def phase_cost(position, velocity, free):
+                            terms = bound.phase_costs(base + model.codec.decode(position * free),
+                                                      model.codec.decode(velocity * free))
+                            return tuple(term.mean() for term in terms)
+
+                        path, details = optimize_path(endpoint, free, phase_cost, cfg["path"])
+                    elif frame is not None:
                         path, details = frame.optimize(endpoint, cfg["path"])
                     else:
+                        cost = (geometry.bind(hr).momentum_cost(base, model.codec) if use_mls
+                                else assign_chart(device_atlas, endpoint * (5/16)).cost)
                         path, details = optimize_path(endpoint, free, cost, cfg["path"])
                     time = torch.rand(len(hr), device=device)
                     time = torch.where(torch.rand_like(time) < 0.1, 0.0, time)
@@ -165,12 +199,23 @@ def run_training(config_path, device_name="auto", resume=None, case_inventory=No
                 context.check_errors(error)
                 optimizer.zero_grad(set_to_none=True)
                 predicted = network(position, velocity, condition, time, physical)
-                loss = ((predicted - target).square() * free).sum() / (free.sum() * predicted.shape[1]).clamp_min(1)
+                anchor_error = (predicted - target) * free
+                euclidean = anchor_error.square().sum() / (free.sum() * predicted.shape[1]).clamp_min(1)
+                terms = {"scaled_acceleration_mse": euclidean}
+                loss = euclidean
+                if metric_weight:
+                    image = base + model.codec.decode(position)
+                    metric_error = bound.drift_cost(image, model.codec.decode(anchor_error))
+                    ramp = time.pow(cfg["path"].get("geometry_ramp_power", 0.))
+                    weighted_metric = (metric_error * ramp).mean()
+                    terms["mls_acceleration_matching"] = weighted_metric
+                    loss = euclidean + metric_weight * weighted_metric
                 context.check_errors(None if torch.isfinite(loss) else "Nonfinite acceleration matching loss")
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
                 optimizer.step()
-                for key, value in {"scaled_acceleration_mse": float(loss.detach()), **details}.items():
+                for key, value in {**{name: float(term.detach()) for name, term in terms.items()},
+                                   "loss": float(loss.detach()), **details}.items():
                     totals[key] = totals.get(key, 0.0) + value * len(hr)
                 count += len(hr)
             keys = sorted(totals)
@@ -178,34 +223,68 @@ def run_training(config_path, device_name="auto", resume=None, case_inventory=No
             if int(global_count) != len(train_set):
                 raise RuntimeError("Unexpected momentum DDP patch count")
             model.eval()
-            total, items, error = 0.0, 0, None
+            scores = {name: [0., 0., 0.] for name in validation_settings}
+            guidance_delta, items, error = 0., 0, None
             try:
-                generator = torch.Generator(device=device).manual_seed(seed + 12345 + context.rank)
+                generators = {name: torch.Generator(device=device).manual_seed(seed + 12345 + context.rank)
+                              for name in validation_settings}
                 with torch.no_grad():
                     for batch in val_loader:
                         hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
-                        geometry_input = {"geometry": geometry} if chart_options is not None else {}
-                        pred = model.restore(base, mask, generator=generator, **cfg["sampling"],
-                                             **geometry_input).clamp(0, 1)
-                        mse = ((pred - hr).square() * (1 - mask)).sum() / (1 - mask).sum().clamp_min(1)
-                        total += float(mse) * len(hr)
+                        validation_chart = geometry.bind(base) if guidance is not None else None
+                        guided_pred = None
+                        for name, (sigma, options) in validation_settings.items():
+                            use_geometry = chart_options is not None or options is not None
+                            pred = model.restore(base, mask, generator=generators[name],
+                                                 steps=cfg["sampling"]["steps"], sigma=sigma,
+                                                 geometry=geometry if use_geometry else None,
+                                                 geometry_guidance=options).clamp(0, 1)
+                            mse = ((pred - hr).square() * (1 - mask)).sum() / (1 - mask).sum().clamp_min(1)
+                            scores[name][0] += float(mse) * len(hr)
+                            if report_ssim:
+                                scores[name][1] += float(mean_xy_ssim(pred, hr)) * len(hr)
+                            if validation_chart is not None:
+                                scores[name][2] += float(validation_chart.state_cost(pred).sum())
+                                if name == "inference":
+                                    guided_pred = pred
+                                elif name == "without_online_guidance":
+                                    difference = (guided_pred - pred).square().flatten(1).mean(1).sqrt()
+                                    guidance_delta += float(difference.sum())
                         items += len(hr)
             except Exception as exc:
                 error = f"Momentum validation: {exc}"
             context.check_errors(error)
-            total, items = context.sum([total, items])
-            if int(items) != len(val_set) or not torch.isfinite(torch.tensor(total)):
+            items, guidance_delta, *values = context.sum(
+                [items, guidance_delta, *[value for entry in scores.values() for value in entry]]
+            )
+            if int(items) != len(val_set) or not math.isfinite(guidance_delta) or not all(map(math.isfinite, values)):
                 raise RuntimeError("Unexpected momentum validation accounting")
-            validation = total / items
-            improved = validation < best
-            best = min(best, validation)
+            validation = {name: tuple(value / items for value in values[3*i:3*i + 3])
+                          for i, name in enumerate(scores)}
+            primary_mse, primary_ssim, atlas_cost = validation["inference"]
+            score = primary_mse if selection == "mse" else 1 - primary_ssim
+            improved = score < best
+            best = min(best, score)
             record = {"epoch": epoch + 1, "train_items": int(global_count), "validation_items": int(items),
-                      "world_size": context.world_size, "validation": validation,
+                      "world_size": context.world_size, "validation": primary_mse,
                       **{k: v / global_count for k, v in zip(keys, sums)}}
+            if report_ssim:
+                record["validation_ssim"] = primary_ssim
+                record["selection_metric"] = selection
+                record["validation_inference_sigma"] = sample_sigma
+                for name, (mse, ssim, energy) in validation.items():
+                    if name != "inference":
+                        record[f"validation_{name}"] = mse
+                        record[f"validation_ssim_{name}"] = ssim
+                        record[f"validation_atlas_cost_{name}"] = energy
+                if guidance is not None:
+                    record["validation_atlas_cost"] = atlas_cost
+                    record["validation_guidance_delta_rms"] = guidance_delta / items
 
             def save():
                 state = {"format_version": 1, "stage": "reconstruction", "training_stage": "momentum",
                          "algorithm": ("chart_trivialized_momentum_bridge" if chart_options is not None
+                                       else "lr_routed_mls_momentum_bridge" if guidance is not None
                                        else "paired_geometry_conditioned_momentum_bridge"),
                          "epoch": epoch + 1,
                          "model": model.state_dict(), "optimizer": optimizer.state_dict(), "atlas": atlas,
