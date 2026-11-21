@@ -45,7 +45,8 @@ for arm in "${arms[@]}"; do
     job=$(train_job "$arm"); echo "$job" > "$ledger/$arm.job"
     echo "$arm training $job"
 done
-for arm in "${arms[@]}"; do
+watch_training() {
+    local arm=$1 job checkpoint stamp file
     read -r job < "$ledger/$arm.job"
     while ! wait_success "$job"; do
         case "$(mri_slurm_state "$job")" in TIMEOUT|PREEMPTED|NODE_FAIL) ;; *) exit 1;; esac
@@ -58,7 +59,17 @@ for arm in "${arms[@]}"; do
         printf '%s\t%s\n' "$job" "$stamp" >> "$file"
         job=$(train_job "$arm"); echo "$job" > "$ledger/$arm.job"
     done
+}
+watchers=()
+for arm in "${arms[@]}"; do
+    watch_training "$arm" &
+    watchers+=("$!")
 done
+failed=0
+for watcher in "${watchers[@]}"; do
+    wait "$watcher" || failed=1
+done
+[[ "$failed" == 0 ]]
 # Complete all validation-based selections before the first TEST job is released.
 freezes=()
 for arm in "${arms[@]}"; do
