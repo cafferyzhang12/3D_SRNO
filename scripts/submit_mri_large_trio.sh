@@ -6,6 +6,7 @@ source scripts/mri_slurm_dependencies.sh
 : "${STUDY_ID:?}" "${MRI_DATA_ROOT:?}" "${MRI_CASE_INVENTORY:?}" "${FIXED_TEST_MANIFEST:?}"
 [[ "$STUDY_ID" =~ ^[a-zA-Z0-9_.-]{1,40}$ ]]
 export MRI_GPUS=4 MRI_LARGE_PAIRED=1
+export OVERFIT_STEPS="${OVERFIT_STEPS:-128}"
 ledger="reports/mri/$STUDY_ID"
 export MRI_BATCH_FILE="$PWD/$ledger/batch.txt"
 mkdir -p "$ledger" reports/slurm
