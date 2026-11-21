@@ -5,6 +5,7 @@ set -euo pipefail
 [[ "$STUDY_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$ ]]
 [[ $# == 1 ]]
 cd "${GSBM_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+source scripts/mri_slurm_dependencies.sh
 folder="reports/mri/studies/$STUDY_ID"
 mkdir -p "$folder" reports/slurm
 exec 8>"$folder/admin.lock"
@@ -17,27 +18,20 @@ select_job() {
     local action="$1" stage="$2" dependency="$3" file="$folder/${1}_${2}.job" opts=() job state
     if [[ -s "$file" ]]; then
         read -r job < "$file"
-        state=$(sacct -nXj "$job" -o State -P | head -1)
-        case "$state" in COMPLETED|RUNNING|PENDING|CONFIGURING|COMPLETING) echo "$job"; return;; esac
+        state=$(mri_slurm_state "$job") || return 1
+        if [[ "$state" == COMPLETED ]] || mri_slurm_live "$state"; then echo "$job"; return; fi
     fi
-    if [[ -n "$dependency" ]]; then opts+=(--dependency="afterok:$dependency" --kill-on-invalid-dep=yes); fi
     if [[ "$action" == bank ]]; then opts+=(--time=2-00:00:00); fi
-    job=$(MRI_GPUS=1 STUDY_ACTION="$action" STUDY_STAGE="$stage" sbatch --parsable --export=ALL "${opts[@]}" scripts/mri_haar_select.sbatch)
-    job=${job%%;*}
-    [[ "$job" =~ ^[0-9]+$ ]]
+    job=$(MRI_GPUS=1 STUDY_ACTION="$action" STUDY_STAGE="$stage" mri_slurm_submit "$dependency" "${opts[@]}" scripts/mri_haar_select.sbatch) || return 1
     echo "$job" > "$file"
     echo "$job"
 }
 wait_for_job() {
-    local job="$1" state unknown=0
+    local job="$1" state
     while true; do
-        state=$(sacct -nXj "$job" -o State -P | head -1)
-        case "$state" in
-            COMPLETED) return;;
-            RUNNING|PENDING|CONFIGURING|COMPLETING|REQUEUED|RESIZING) unknown=0;;
-            "") unknown=$((unknown+1)); [[ $unknown -lt 20 ]] || return 1;;
-            *) echo "Slurm job $job ended with $state" >&2; return 1;;
-        esac
+        state=$(mri_slurm_state "$job") || return 1
+        if [[ "$state" == COMPLETED ]]; then return 0; fi
+        if ! mri_slurm_live "$state"; then echo "Slurm job $job ended with $state" >&2; return 1; fi
         sleep 30
     done
 }
@@ -50,14 +44,14 @@ submit_stage() {
     while IFS=$'\t' read -r rid variant dim query path reference shuffle seed readout; do
         response=$(RUN_ID="$rid" VARIANT="$variant" DIM="$dim" QUERY="$query" PATH_GEOMETRY="$path" \
             REFERENCE="$reference" SHUFFLE_ROUTING="$shuffle" SEED="$seed" DIRECT_CHECKPOINT="$descriptor" SPATIAL_BANK="$bank" \
-            bash scripts/submit_mri_haar.sh)
+            bash scripts/submit_mri_haar.sh) || return 1
         job="${response##*experiment_job=}"
-        [[ "$job" =~ ^[0-9]+$ ]]
+        [[ "$job" =~ ^[0-9]+$ ]] || return 1
         if [[ " ${jobs[*]} " != *" $job "* ]]; then jobs+=("$job"); fi
     done < "$folder/$stage.tsv"
-    [[ "${#jobs[@]}" -gt 0 ]]
+    [[ "${#jobs[@]}" -gt 0 ]] || return 1
     depends=$(IFS=:; echo "${jobs[*]}")
-    select_id=$(select_job select "$stage" "$depends")
+    select_id=$(select_job select "$stage" "$depends") || return 1
     printf 'stage=%s train_jobs=%s select_job=%s\n' "$stage" "$depends" "$select_id" >&2
     echo "$select_id"
 }
@@ -69,9 +63,10 @@ recoverable_interruption() {
     while IFS=$'\t' read -r rid rest; do
         ledger="reports/mri/submissions/$rid"
         read -r job < "$ledger/train.job"
-        state=$(sacct -nXj "$job" -o State -P | head -1)
+        state=$(mri_slurm_state "$job") || return 1
+        if mri_slurm_live "$state"; then continue; fi
         case "$state" in
-            COMPLETED|RUNNING|PENDING|CONFIGURING|COMPLETING) continue;;
+            COMPLETED) continue;;
             TIMEOUT|PREEMPTED|NODE_FAIL) ;;
             *) echo "Training job $job requires investigation ($state)" >&2; return 1;;
         esac

@@ -47,9 +47,7 @@ gsbm_torchrun -m vemgsbm.train --config "$config" --case-inventory "$inventory" 
     --stage bridge --device cuda "${resume[@]}"
 export CHECKPOINT="$PWD/$run/bridge/best.pt" MRI_CASE_INVENTORY="$inventory"
 export OUTPUT_ROOT="outputs/mri/${RUN_ID}_val"
-if [[ ! -f "$OUTPUT_ROOT/summary.json" ]]; then
-    source scripts/mri_whole_val.sh
-fi
+source scripts/mri_whole_val.sh
 "$GSBM_PYTHON" - "$OUTPUT_ROOT/summary.json" "$CHECKPOINT" <<'PY'
 import json,sys
 from pathlib import Path
@@ -62,7 +60,5 @@ PY
 if [[ "$VARIANT" == bridge ]]; then
     # Re-evaluate the very same supervised B weights at the integral readout.
     export OUTPUT_ROOT="outputs/mri/${RUN_ID}_integral_val" MRI_HAAR_READOUT=integral
-    if [[ ! -f "$OUTPUT_ROOT/summary.json" ]]; then
-        source scripts/mri_whole_val.sh
-    fi
+    source scripts/mri_whole_val.sh
 fi

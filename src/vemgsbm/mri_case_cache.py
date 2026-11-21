@@ -3,7 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import tempfile
+import shutil
 
 import torch
 
@@ -31,15 +31,19 @@ def acquire_lock(path):
     return stream
 
 
+def image_digest(case):
+    content = hashlib.sha256()
+    for path in (*case.lq, *(case.hq or ())):
+        content.update(bytes.fromhex(fingerprint(path)))
+    return content.hexdigest()
+
+
 def evaluation_identity(config, cases, subset, exported, checkpoint_hash, root_lq, root_hq,
                         split, seed, steps, samples, device):
     inputs = []
     for case in cases:
-        content = hashlib.sha256()
-        for path in (*case.lq, *(case.hq or ())):
-            content.update(bytes.fromhex(fingerprint(path)))
         inputs.append({"case_id": case.id, "inventory_fingerprint": case.fingerprint,
-                       "image_bytes_sha256": content.hexdigest(), "exported": case.id in exported})
+                       "image_bytes_sha256": image_digest(case), "exported": case.id in exported})
     src = Path(__file__).parent
     modules = ["mri_infer", "mri_metrics", "mri_data", "infer", "bridge", "models", "network",
                "runtime", "haar_residual", "atlas_geometry", "metric", "spatial_atlas", "mri_external"]
@@ -58,7 +62,7 @@ def _read(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _key(identity):
+def identity_key(identity):
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",",":")).encode()).hexdigest()
 
 
@@ -85,6 +89,8 @@ def bind_cache(cache, identity, output):
             raise ValueError("Unidentified MRI case cache")
         atomic_save(identity,manifest,json_file=True)
     (cache/"cases").mkdir(exist_ok=True)
+    (cache/"case_locks").mkdir(exist_ok=True)
+    (cache/"attempts").mkdir(exist_ok=True)
     return False
 
 
@@ -101,21 +107,30 @@ def verify_case(directory, key, case, exported):
         raise ValueError(f"MRI cached case checksum or evaluation identity differs: {case.id}")
 
 
-def commit_case(cache, case, identity_key, exported, write):
+def commit_case(cache, case, key, exported, expected_images, write):
     """Reconstruct only into a private attempt, publish one completed case with one rename."""
-    destination = cache/"cases"/case.id
-    if destination.exists():
-        verify_case(destination, identity_key, case, exported)
-        return
-    with tempfile.TemporaryDirectory(prefix="case-attempt-", dir=cache) as tmp:
-        root = Path(tmp)
+    # A launcher failure can kill rank zero before other workers are reaped.
+    # A per-case OS lock protects the previous worker's private attempt in that interval.
+    token = hashlib.sha256(case.id.encode()).hexdigest()
+    with acquire_lock(cache/"case_locks"/token):
+        destination = cache/"cases"/case.id
+        if destination.exists():
+            verify_case(destination, key, case, exported)
+            return
+        root = cache/"attempts"/token
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir()
         write(root)
+        if image_digest(case) != expected_images:
+            raise ValueError(f"MRI source images changed during evaluation: {case.id}")
         completed = root/case.id
         hashes = {p.name: fingerprint(p) for p in completed.iterdir()}
-        atomic_save({"evaluation_sha256": identity_key, "case_id": case.id, "files":hashes},
+        atomic_save({"evaluation_sha256": key, "case_id": case.id, "files":hashes},
                     completed/"case_commit.json", json_file=True)
-        verify_case(completed, identity_key, case, exported)
+        verify_case(completed, key, case, exported)
         os.rename(completed,destination)
+        root.rmdir()
 
 
 def seal(staged, identity):

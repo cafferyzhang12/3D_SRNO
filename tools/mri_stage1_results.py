@@ -7,7 +7,7 @@ from pathlib import Path
 
 from vemgsbm.mri_compare import paired_comparison
 from vemgsbm.mri_stage1 import ARMS
-from vemgsbm.runtime import atomic_save
+from vemgsbm.runtime import atomic_save, fingerprint
 
 
 def summarize(folder):
@@ -58,8 +58,14 @@ def summarize(folder):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path)
+    parser.add_argument("--replay", type=Path, help="Actual per-update routing audit")
     args = parser.parse_args()
     report = summarize(args.folder)
+    if args.replay:
+        trace = json.loads((args.replay / "summary.json").read_text(encoding="utf-8"))
+        if trace["guided_summary_sha256"] != fingerprint(args.folder / "guided/summary.json"):
+            raise ValueError("Routing replay does not match the completed guided experiment")
+        report["actual_routing_by_cost"] = trace["pooled_all_steps"]
     atomic_save(report, args.folder / "stage1_decision.json", json_file=True)
     with (args.folder / "stage1_ranking.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(report["ranking"][0]))

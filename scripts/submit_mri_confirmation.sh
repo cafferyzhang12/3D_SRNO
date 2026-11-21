@@ -1,6 +1,7 @@
 #!/bin/bash
 # Administrative scheduler. A successful immutable study-wide freeze releases all TEST jobs.
 set -euo pipefail
+source scripts/mri_slurm_dependencies.sh
 : "${STUDY_ID:?Set STUDY_ID}" "${FREEZE_ROOT:?Set FREEZE_ROOT}" "${HISTORY_ROOT:?Set HISTORY_ROOT}"
 : "${STAGE1_RESULTS:?Set STAGE1_RESULTS}" "${LEGACY_RESULTS:?Set LEGACY_RESULTS}" "${ARCHIVE_ROOT:?Set ARCHIVE_ROOT}"
 : "${EXTERNAL_RESULTS_ROOT:?Set EXTERNAL_RESULTS_ROOT}" "${EXTERNAL_PREFIX:?Set EXTERNAL_PREFIX}"
@@ -13,22 +14,20 @@ submit() {
     local name="$1" script="$2" deps="${3:-}" job state options=()
     if [[ -s "$ledger/$name.job" ]]; then
         read -r job < "$ledger/$name.job"
-        state=$(sacct -nXj "$job" -o State -P | head -1)
-        case "$state" in COMPLETED|RUNNING|PENDING|CONFIGURING|COMPLETING) echo "$job"; return;; esac
+        state=$(mri_slurm_state "$job") || return 1
+        if [[ "$state" == COMPLETED ]] || mri_slurm_live "$state"; then echo "$job"; return; fi
     fi
-    if [[ -n "$deps" ]]; then options+=(--dependency="afterok:$deps" --kill-on-invalid-dep=yes); fi
-    job=$(sbatch --parsable --export=ALL "${options[@]}" "$script")
-    job=${job%%;*}
-    [[ "$job" =~ ^[0-9]+$ ]]
+    job=$(mri_slurm_submit "$deps" "$script") || return 1
     echo "$job" > "$ledger/$name.job"
     echo "$job"
 }
 freeze=$(submit freeze scripts/mri_freeze_study.sbatch "${BASELINE_VAL_JOBS:-}")
 until [[ -s "$FREEZE_ROOT/matrix.json" ]]; do
-    state=$(sacct -nXj "$freeze" -o State -P | head -1)
-    case "$state" in RUNNING|PENDING|CONFIGURING|COMPLETING|"") sleep 30;; *)
-        [[ -s "$FREEZE_ROOT/matrix.json" ]] || { echo "Study freeze $freeze ended with $state" >&2; exit 1; };;
-    esac
+    state=$(mri_slurm_state "$freeze")
+    if mri_slurm_live "$state"; then sleep 30; else
+        [[ "$state" == COMPLETED && -s "$FREEZE_ROOT/matrix.json" ]] || {
+            echo "Study freeze $freeze ended with $state before matrix publication" >&2; exit 1; }
+    fi
 done
 jobs=()
 while IFS=$'\t' read -r name frozen output; do

@@ -88,7 +88,7 @@ def confirm(folder, output, device):
     result = infer_mri(checkpoint, project_path(roots["root_lq"]), output,
                        root_hq=project_path(roots["root_hq"]), split="test", case_inventory=inventory,
                        subset_manifest=manifest, subset_seed=20261110, test_fraction=.15,
-                       save_volume_limit=0, device_name=device, **record["selected"]["inference"])
+                       save_volume_limit=0, device_name=device, resume_cases=True, **record["selected"]["inference"])
     summary = json.loads(read(result / "summary.json"))
     if (len(summary["cases"]), summary["total_slices"],
             sum(row["metrics"]["pixel_count"] for row in summary["cases"])) != (84, 14991, 3929800704):

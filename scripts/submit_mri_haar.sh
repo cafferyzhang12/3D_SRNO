@@ -1,6 +1,7 @@
 #!/bin/bash
 # One independent experiment; repeat with the same RUN_ID to resume from last.pt.
 set -euo pipefail
+source scripts/mri_slurm_dependencies.sh
 : "${RUN_ID:?Set an independent RUN_ID}" "${VARIANT:?direct|bridge|drift_only|mean|pca|mls}"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,75}$ ]]
 case "$VARIANT" in
@@ -19,21 +20,13 @@ submit() {
     local options=(--gres="gpu:$gpus" --cpus-per-task="$((6 * gpus))" --job-name="haar-$phase-$VARIANT")
     if [[ -s "$ledger/$phase.job" ]]; then
         read -r job < "$ledger/$phase.job"
-        state=$(sacct -nXj "$job" -o State -P | head -1)
-        case "$state" in
-            COMPLETED|RUNNING|PENDING|CONFIGURING|COMPLETING) echo "$job"; return;;
-        esac
+        state=$(mri_slurm_state "$job") || return 1
+        if [[ "$state" == COMPLETED ]] || mri_slurm_live "$state"; then echo "$job"; return; fi
     fi
-    if [[ -n "$dependency" ]]; then
-        [[ "$dependency" =~ ^[0-9]+(:[0-9]+)*$ ]]
-        options+=(--dependency="afterok:$dependency" --kill-on-invalid-dep=yes)
-    fi
-    job=$(MRI_GPUS="$gpus" PHASE="$phase" sbatch --parsable --export=ALL "${options[@]}" scripts/mri_haar.sbatch)
-    job=${job%%;*}
-    [[ "$job" =~ ^[0-9]+$ ]]
+    job=$(MRI_GPUS="$gpus" PHASE="$phase" mri_slurm_submit "$dependency" "${options[@]}" scripts/mri_haar.sbatch) || return 1
     printf '%s\n' "$job" > "$ledger/$phase.job"
     printf '%s\n' "$job"
 }
 gate=$(submit gate 4 "${DEPENDENCY_JOB_ID:-}")
-experiment=$(submit train "$training_gpus" "$gate")
+experiment=$(submit train "$training_gpus" "$gate${TRAIN_AFTER_JOB_ID:+:$TRAIN_AFTER_JOB_ID}")
 printf 'ddp_gate_job=%s experiment_job=%s\n' "$gate" "$experiment"

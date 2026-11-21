@@ -14,9 +14,12 @@ def _paired_case_totals(reference, candidate):
         raise ValueError("Case manifests differ")
     if "split" in reference and "split" in candidate and reference["split"] != candidate["split"]:
         raise ValueError("Evaluation splits differ")
-    if ("metric_protocol" in reference and "metric_protocol" in candidate
-            and reference["metric_protocol"] != candidate["metric_protocol"]):
-        raise ValueError("Metric protocols differ")
+    if "metric_protocol" in reference and "metric_protocol" in candidate:
+        # Later summaries add secondary metrics. This bootstrap only consumes the
+        # all-voxel squared error and slice SSIM, whose definitions must agree.
+        for key in ("all_psnr_db", "mean_slice_ssim"):
+            if reference["metric_protocol"].get(key) != candidate["metric_protocol"].get(key):
+                raise ValueError(f"Metric protocols differ for {key}")
     keys = ("pixel_count", "ssim_slice_count", "evaluated_slices")
     metrics = []
     fingerprints_checked = True

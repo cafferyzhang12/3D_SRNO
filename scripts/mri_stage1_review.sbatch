@@ -14,4 +14,6 @@ cd "${GSBM_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 source scripts/mri_common.sh
 gsbm_environment
 : "${STAGE1_RESULTS:?Set the completed stage-1 validation directory}"
-"$GSBM_PYTHON" tools/mri_stage1_results.py "$STAGE1_RESULTS"
+args=()
+if [[ -n "${REPLAY_OUTPUT:-}" ]]; then args+=(--replay "$REPLAY_OUTPUT"); fi
+"$GSBM_PYTHON" tools/mri_stage1_results.py "$STAGE1_RESULTS" "${args[@]}"

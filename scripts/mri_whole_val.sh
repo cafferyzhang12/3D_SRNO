@@ -15,4 +15,4 @@ if [[ -n "${MRI_HAAR_READOUT:-}" ]]; then args+=(--readout "$MRI_HAAR_READOUT");
 if [[ -n "${MRI_CASE_INVENTORY:-}" ]]; then args+=(--case-inventory "$MRI_CASE_INVENTORY"); fi
 gsbm_torchrun -m vemgsbm.mri_infer --split val --test-fraction 1 --checkpoint "$CHECKPOINT" \
     --root-lq "${val[0]}" --root-hq "${val[1]}" --output-root "${OUTPUT_ROOT:-outputs/mri/${RUN_ID}_val}" \
-    --device cuda --inference-variant endpoint_safe --save-volume-limit 0 "${args[@]}"
+    --device cuda --inference-variant endpoint_safe --save-volume-limit 0 --resume-cases "${args[@]}"

@@ -380,11 +380,15 @@ def _write_case(case, staged, model, geometry, config, device, seed, steps, samp
     atomic_save(metadata, folder / "metadata.json", json_file=True)
 
 
-def _collect_summary(staged, cases, checkpoint_hash, exported_case_ids=None):
+def _collect_summary(staged, cases, checkpoint_hash, exported_case_ids=None, *, resume=False):
     """Check complete outputs and aggregate in canonical order, regardless of rank."""
     expected = {case.id for case in cases}
     exported_case_ids = expected if exported_case_ids is None else exported_case_ids
-    if {path.name for path in staged.iterdir()} != expected:
+    names = {path.name for path in staged.iterdir()}
+    if resume:
+        from .mri_case_cache import PUBLICATION_FILES
+        names -= PUBLICATION_FILES  # A crash may occur between writing reports and the final rename.
+    if names != expected:
         raise RuntimeError("MRI result directories do not match the requested cases")
     case_summaries = []
     for case in cases:
@@ -509,13 +513,13 @@ def infer_mri(
     steps=None, samples=1, case_ids=None, max_cases=None, scan_cache=None,
     channel_policy="identical_rgb_to_gray", save_volume_limit=None, test_fraction=None, subset_seed=20261110,
     inference_variant="legacy", subset_manifest=None, case_inventory=None, split=None, predictor="model",
-    drift_sampler=None, inference_sigma=None, disable_guidance=False, readout=None,
+    drift_sampler=None, inference_sigma=None, disable_guidance=False, readout=None, resume_cases=False,
 ):
     """Publish all cases atomically; torchrun assigns each case to exactly one rank.
 
     Ordinary rank failures are reported to every rank before staging is removed.
-    A killed process can leave an unpublished staging directory and output lock;
-    this implementation deliberately does not resume or reuse partial outputs.
+    With resume_cases, complete case commits survive interrupted jobs. An
+    evaluation identity and file digests govern all reuse and final publication.
     save_volume_limit retains arrays for only the first N selected, naturally
     sorted cases. All remaining cases still require complete HQ evaluation.
     """
@@ -543,13 +547,20 @@ def infer_mri(
     output_root = Path(output_root).expanduser().resolve()
     context = initialize_distributed(device_name)
     lock_path = output_root.parent / (output_root.name + ".inference.lock")
-    lock, temporary = None, None
+    lock, guard, temporary = None, None, None
+    cache = output_root.with_name("." + output_root.name + ".resume")
 
     def prepare_output():
-        nonlocal lock, temporary
-        if output_root.exists():
+        from .mri_case_cache import acquire_lock
+        nonlocal lock, guard, temporary
+        if output_root.exists() and not resume_cases:
             raise FileExistsError(f"Choose a new MRI output directory: {output_root}")
         output_root.parent.mkdir(parents=True, exist_ok=True)
+        guard = acquire_lock(output_root.with_name("." + output_root.name + ".inference.guard"))
+        if resume_cases:
+            if lock_path.exists():
+                raise FileExistsError(f"Legacy inference lock exists: {lock_path}")
+            return str(cache / "cases")
         lock = lock_path.open("x")
         if output_root.exists():
             raise FileExistsError(f"MRI output appeared during initialization: {output_root}")
@@ -559,6 +570,7 @@ def infer_mri(
         return str(staged)
 
     def load_models():
+        loaded_hash = fingerprint(checkpoint_path) if resume_cases else None
         checkpoint = load_checkpoint(checkpoint_path)
         config = _validate_mri_checkpoint(checkpoint)
         sampling = dict(config["sampling"])
@@ -588,15 +600,15 @@ def infer_mri(
         if predictor == "bilinear":
             sampling.update(inference_sigma=0., geometry_guidance=None, momentum_geometry=None)
             config.update(inference_variant="endpoint_safe", chart_momentum=None)
-            return config, device, None, None, checkpoint.get("data_identity")
+            return config, device, None, None, checkpoint.get("data_identity"), loaded_hash
         model, geometry = build_models({**checkpoint, "config": config}, device)
         if sampler == "diffusion_corrected":
             model = diffusion_adjusted_model(model, sampling["sigma"], sampling_noise(config))
-        return config, device, model, geometry, checkpoint.get("data_identity")
+        return config, device, model, geometry, checkpoint.get("data_identity"), loaded_hash
 
     try:
         staged = Path(context.main_call(prepare_output, broadcast_result=True))
-        config, device, model, geometry, fitted_identity = _checked_rank_call(context, load_models)
+        config, device, model, geometry, fitted_identity, loaded_hash = _checked_rank_call(context, load_models)
         data = config["data"]
         steps = config["sampling"]["steps"] if steps is None else steps
         if predictor == "bilinear":
@@ -644,23 +656,49 @@ def infer_mri(
                 if case.id in (".", "..") or Path(case.id).name != case.id or "/" in case.id or "\\" in case.id:
                     raise ValueError("Case identifiers must be simple directory names")
             cases, subset = checked_test_subset(cases, test_fraction, subset_seed, subset_manifest)
-            atomic_save(subset, output_root.parent / (output_root.name + "_subset.json"), json_file=True)
             return cases, fingerprint(checkpoint_path), subset
 
         cases, checkpoint_hash, subset = context.main_call(prepare_cases, broadcast_result=True)
         exported_case_ids = {case.id for case in cases[:save_volume_limit]}
+        identity = None
+        if resume_cases:
+            from .mri_case_cache import (PUBLICATION_FILES, bind_cache, commit_case, evaluation_identity,
+                                         identity_key, seal, verify_case)
+            if any(c.id.casefold() in PUBLICATION_FILES for c in cases):
+                raise ValueError("MRI case ID conflicts with a report filename")
+            context.check_errors("Checkpoint changed while loading the evaluated model"
+                                 if loaded_hash != checkpoint_hash else None)
+            def prepare_resume():
+                frozen = evaluation_identity(config, cases, subset, exported_case_ids, checkpoint_hash,
+                                             root_lq, root_hq, split, seed, steps, samples, device)
+                return frozen, bind_cache(cache, frozen, output_root)
+            identity, published = context.main_call(prepare_resume, broadcast_result=True)
+            key = identity_key(identity)
+            image_hashes = {row["case_id"]: row["image_bytes_sha256"] for row in identity["cases"]}
+            if published:
+                def validate_published():
+                    for case in cases[context.rank::context.world_size]:
+                        verify_case(output_root/case.id, key, case, case.id in exported_case_ids)
+                _checked_rank_call(context, validate_published)
+                return output_root
+        context.main_call(lambda: atomic_save(subset, output_root.parent / (output_root.name + "_subset.json"), json_file=True))
 
         def reconstruct_cases():
             for case in cases[context.rank::context.world_size]:
-                _write_case(case, staged, model, geometry, config, device, seed, steps, samples,
-                            checkpoint_hash, root_lq, root_hq, save_volume=case.id in exported_case_ids)
+                def write(directory):
+                    _write_case(case, directory, model, geometry, config, device, seed, steps, samples,
+                                checkpoint_hash, root_lq, root_hq, save_volume=case.id in exported_case_ids)
+                if resume_cases:
+                    commit_case(cache, case, key, case.id in exported_case_ids, image_hashes[case.id], write)
+                else:
+                    write(staged)
 
         # No collectives occur inside a case; a failed worker still meets every
         # other worker here instead of skipping a barrier and stranding them.
         _checked_rank_call(context, reconstruct_cases)
 
         def publish():
-            summary = _collect_summary(staged, cases, checkpoint_hash, exported_case_ids)
+            summary = _collect_summary(staged, cases, checkpoint_hash, exported_case_ids, resume=resume_cases)
             summary["subset"] = subset
             summary.update(split=split or "custom", checkpoint_sha256=checkpoint_hash,
                            predictor=predictor, steps=steps, samples=samples, seed=seed)
@@ -699,6 +737,8 @@ def infer_mri(
             atomic_save(subset, staged / "subset_manifest.json", json_file=True)
             atomic_save(summary, staged / "summary.json", json_file=True)
             write_metrics_csv(staged, summary)
+            if resume_cases:
+                seal(staged, identity)
             if output_root.exists():
                 raise FileExistsError(f"MRI output appeared before publication: {output_root}")
             os.rename(staged, output_root)
@@ -714,6 +754,8 @@ def infer_mri(
                     if lock is not None:
                         lock.close()
                         lock_path.unlink(missing_ok=True)
+                    if guard is not None:
+                        guard.close()
         finally:
             context.cleanup()
     return output_root
@@ -747,6 +789,7 @@ def main():
     parser.add_argument("--inference-sigma", type=float)
     parser.add_argument("--disable-guidance", action="store_true")
     parser.add_argument("--readout", choices=["integral", "endpoint"])
+    parser.add_argument("--resume-cases", action="store_true", help="Resume checked atomic whole-case commits")
     parser.add_argument("--scan-cache")
     parser.add_argument("--case-inventory")
     parser.add_argument("--channel-policy", default="identical_rgb_to_gray")
@@ -759,6 +802,7 @@ def main():
         inference_variant=args.inference_variant, subset_manifest=args.subset_manifest,
         drift_sampler=args.drift_sampler, inference_sigma=args.inference_sigma, disable_guidance=args.disable_guidance,
         case_inventory=args.case_inventory, split=args.split, predictor=args.predictor, readout=args.readout,
+        resume_cases=args.resume_cases,
     )
     if int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps({"output_root": str(output)}, ensure_ascii=False), flush=True)
