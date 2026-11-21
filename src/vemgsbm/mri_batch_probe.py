@@ -42,7 +42,7 @@ def probe(config, destination):
             return dict(batch=size, peak_reserved=torch.cuda.max_memory_reserved(),
                         total=total, seconds_per_step=(time.perf_counter()-begin)/2)
         measurements = []
-        for size in (4, 8, 16, 24, 32, 48, 64, 96, 128):
+        for size in (4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384):
             if measurements:
                 last = measurements[-1]
                 if last["peak_reserved"] * size / last["batch"] > .74 * last["total"]:
@@ -60,7 +60,16 @@ def probe(config, destination):
         ctx.check_errors(None if measurements else "No safe batch for this GPU")
         results = [None] * ctx.world_size
         torch.distributed.all_gather_object(results, measurements)
-        chosen = min(rows[-1]["batch"] for rows in results)
+        # Prefer a useful occupancy with headroom, without sacrificing >5% throughput.
+        common = {r["batch"] for r in results[0]}
+        for rows in results[1:]:
+            common.intersection_update(r["batch"] for r in rows)
+        rates = {b: min(b / next(r["seconds_per_step"] for r in rows if r["batch"] == b)
+                        for rows in results) for b in common}
+        efficient = sorted(b for b in rates if rates[b] >= .95 * max(rates.values()))
+        roomy = [b for b in efficient if all(next(r["peak_reserved"]/r["total"] for r in rows
+                                                  if r["batch"] == b) >= .5 for rows in results)]
+        chosen = min(roomy or efficient)
         ddp = DistributedDataParallel(objective, device_ids=[ctx.local_rank], broadcast_buffers=False)
         # Validate synchronization, bucket storage, clipping and optimizer state together.
         tested = measure(ddp, chosen)

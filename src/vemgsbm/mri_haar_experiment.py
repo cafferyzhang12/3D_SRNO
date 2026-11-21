@@ -23,8 +23,9 @@ def create_variant(args):
         if args.variant not in {"direct", "bridge", "drift_only"}:
             raise ValueError("Large paired profile is defined for the three backbone experiments")
         cfg["model"]["widths"] = [96, 160, 256]
+        patches = max(65536, 4 * cfg["train"]["batch_size"] * 256)
         cfg["train"].update(epochs=320, bridge_epochs=320, whole_val_patience=36,
-                            minimum_epochs=80, samples_per_epoch=65536, val_samples_per_epoch=256)
+                            minimum_epochs=80, samples_per_epoch=patches, val_samples_per_epoch=256)
         if cfg["mode"] == "haar_bridge":
             cfg["train"]["matching_units"] = "endpoint"
     if args.variant == "direct":
