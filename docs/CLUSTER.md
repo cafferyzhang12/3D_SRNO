@@ -1,110 +1,55 @@
-# 独立 GSBM 项目的集群运行
+# 配对 MRI 的集群实验
 
-从仓库根目录提交。脚本默认使用 `$HOME/.conda/envs/fundiff/bin/python`。
-`GSBM_PROJECT_ROOT` 和 `GSBM_PYTHON` 可分别指定仓库和解释器。
-将 [MRI 模板](../configs/mri_x4.yaml) 复制到 `configs/mri_x4.local.yaml`，填好
-三个数据划分的 LR/HQ 路径，再通过 `CONFIG` 传入。
+在项目目录提交。计算使用 `$HOME/.conda/envs/fundiff/bin/python`，由 `sbatch` 分配 A800 节点。每个正式实验用一张 A800，四卡 DDP 验证使用一个 Slurm task 和四个 torchrun 进程。两者都用 high QoS。登录节点负责源文件同步、依赖安装、提交和查询作业。
 
-## 作业与资源
+## 历史验证和采样消融
 
-所有图像读取、预训练、度量拟合、数值检查、神经漂移匹配和推理均在
-`sbatch` 分配的 A800 计算节点执行。登录节点只进行源文件同步、依赖安装、
-路径检查、作业提交和日志检查。每个计算入口要求四张 Slurm 分配的 A800，
-使用单节点、单 Slurm task，由 `torch.distributed.run` 启动四个 rank。
-QOS 在脚本和提交命令中均显式设置为 `high`。
-
-在项目目录提交：
+从一个独立的源码部署目录提交。以下路径与作业 5281446 的快照对应。
 
 ```bash
-CONFIG=configs/mri_x4.local.yaml RUN_ID=mri_x4_gsbm_example bash scripts/submit_mri_pipeline.sh
-```
-
-流水线通过 `afterok` 依次连接四个作业：
-
-1. `validate`：在四卡 allocation 内执行项目测试；真实 MRI 的小规模
-   表征训练、bridge matching 训练和单个验证病例重建。
-2. `representation`：正式三维自监督表征训练和训练 HR 特征库的度量拟合。
-3. `bridge`：固定表征和度量，执行条件路径优化与双向神经漂移匹配。
-4. `test`：最佳 bridge checkpoint 的固定 15% 独立测试。
-
-只有前一作业成功退出，后一作业才可开始。设置
-`--kill-on-invalid-dep=yes`，失败的上游不会导致依赖作业误运行。
-提交成功只表示作业已进入调度队列，不表示四卡验证或正式训练已经通过。
-请以 Slurm 状态与作业退出码、日志和最终产物为准。
-
-## GSBM 与动量桥的 MLS 对照
-
-在源码目录设置 `MRI_DATA_ROOT` 为原配对 MRI 数据根目录，设置
-`SUBSET_MANIFEST` 为已有 15% 测试病例清单的绝对路径。通过
-`NEURAL_ATLAS_SRC` 指定集群上与实验相同版本的 `neural_atlas_lab/src`，
-也可使用 `fundiff` 中已安装的对应版本。为每次训练设置独立的 `RUN_ID`。
-
-```bash
+export ARCHIVE_ROOT="$HOME/3D_SRNO_4"
+export HISTORY_ROOT="$ARCHIVE_ROOT/vem_gsbm_mls_v2_20261120_f08f30129d6a"
+export NEURAL_ATLAS_SRC="$HOME/Learning_Geometric_State_Spaces_for_Probabilistic_Trajectory_Inference/neural_atlas_lab/src"
+export MRI_DATA_ROOT="$HOME/data/MRI_SR"
+export MRI_CASE_INVENTORY="$HISTORY_ROOT/runs/mri/mri_x4_gsbm_mls_v2_20261120/mri_case_inventory.json.gz"
+export RUN_ID="x4_stage1_$(date +%Y%m%d_%H%M%S)"
 mkdir -p reports/slurm
-CONFIG=configs/mri_gsbm_mls_guided_x4.yaml RUN_ID=mri_x4_gsbm_mls_trial \
-  sbatch --parsable --qos=high scripts/mri_atlas.sbatch
-CONFIG=configs/mri_momentum_mls_x4.yaml RUN_ID=mri_x4_momentum_mls_trial \
-  sbatch --parsable --qos=high scripts/mri_atlas.sbatch
+HISTORY_GATE_JOB=$(MRI_GPUS=4 sbatch --parsable scripts/mri_history_gate.sbatch)
+export HISTORY_GATE_JOB
+bash scripts/submit_mri_stage1.sh
+DEPENDENCY_JOB_ID="$HISTORY_GATE_JOB" bash scripts/submit_mri_historical_val.sh
 ```
 
-每条作业在同一四卡 A800 allocation 内执行验证集小规模重建、正式表征和桥训练、
-固定 15% 测试。每次审计生成的紧凑病例索引供四个 rank 共享，并由该作业的表征训练、
-桥训练和正式测试使用。测试结果分别写入
-`outputs/mri/<RUN_ID>_test15/summary.json`。
+`scripts/mri_history_gate.sbatch` 检查历史文件、固定清单、四进程训练和真实训练小批上的损失下降。`submit_mri_stage1.sh` 先做 pytest 和一个完整 VAL 病例的重建，再运行相同种子、相同末步策略的模型对照。保留相同 RUN_ID 重新调用，可恢复失败作业。每个作业的记录在 `reports/mri/submissions/`。作业号、退出码、相应输出目录的 `summary.json` 共同作为完成依据。
 
-## 正式配置
+| 整病例 VAL 臂 | 步数 | 每窗漂移网络调用 | 推理噪声 |
+|---|---:|---:|---:|
+| plain，无在线引导 | 20 | 20 | 0.05 |
+| guided，开启在线引导 | 20 | 20 | 0.05 |
+| corrected，变扩散系数的漂移 | 20 | 40 | 0.05 |
+| equal_calls，同网络调用预算 | 10 | 20 | 0.05 |
+| reference，训练参考扩散系数 | 20 | 20 | 0.10 |
 
-`configs/mri_x4.yaml` 保存可审查的默认值：表征预训练 10 个 epoch，bridge
-训练 40 个 epoch，每卡 batch 4、四卡全局 batch 16，每个 epoch 全局抽取
-4096 个三维窗口、固定验证 64 个窗口。HR 窗口为 `[5,128,128]`，输入真实
-LR 为 `[5,32,32]`。这些 epoch 是窗口预算，不是完整读取全部体素一次。
+五臂由同一个第 38 轮权重生成。在 `paths.py` 的反向时间约定下，当前速度为 ((f-r)/2)，扩散项的调整给出 (0.625f-0.375r)。`diagnostics` 在成对的 Hann 融合、裁剪输出上计算引导误差分解和选图统计。`mri_stage1_replay.sbatch` 重放 guided 的实际逐步权重。两项诊断只读取 VAL。完成以后，将 `STAGE1_RESULTS` 设为 `outputs/mri/$RUN_ID` 的绝对路径，提交 `scripts/mri_stage1_review.sbatch`，生成 `stage1_decision.json` 和 `stage1_ranking.csv`。
 
-表征宽度 8、特征维度 32、训练特征库最多 1024 个样本、32 个局部中心。
-漂移网络宽度 16。条件路径有 5 个节点，每个 batch 执行 5 次内部优化，
-5 个积分采样点，同时优化均值和有界方差样条（std_bound=0.75）；参考噪声 sigma 0.1，state 与 metric 项权重均为 0.01，
-均值修正限制为 0.25。最终采样默认 20 步。
+## 开发、冻结和正式确认
 
-参数是可运行的起始研究配置，不能预先声称达到最佳精度或吞吐量。
-验证门同时检查数学模块和工程接口；它不证明正式实验的质量或跨模态性能。
-`BATCH_SIZE`、`REPRESENTATION_BATCH_SIZE`、`REPRESENTATION_EPOCHS`、
-`BRIDGE_EPOCHS`、`SAMPLES_PER_EPOCH`、`VAL_SAMPLES_PER_EPOCH`
-可在提交前覆盖；运行时生成的有效 YAML 保存在 `reports/mri/run_configs/`。
-改变算力预算进行比较时，应同时记录优化步数、路径内部优化次数和采样步数。
+1. 从 TRAIN 的真实配对窗口训练。旧模型复评已有权重。新模型按全部 VAL 病例的 pooled PSNR 选择 epoch 和配置，同时保留 SSIM、前景、边缘和 Z 向指标。主干、维数、负对照、参考协方差和多种子入口见 [MRI_HAAR.md](MRI_HAAR.md)。
+2. 主研究入口为 `STUDY_ID=<新标识> bash scripts/submit_mri_haar_study.sh all`。默认每个实验一张卡，可设置 `MRI_GPUS=4` 复现四卡模式。控制脚本在提交端只查询 Slurm 和作业清单，在计算节点上检查、选择和训练。外部权重与输入适配见 [MRI_外部基线.md](MRI_外部基线.md)。
+3. 单独冻结一种方法时，将已完成的同协议候选传给 `scripts/mri_freeze.sbatch`。冻结会核查每个 VAL 病例的指纹和 checkpoint 哈希，再把选定权重、清单、整病例 inventory、推理参数和选模依据复制到新的冻结目录。整项研究使用 `submit_mri_confirmation.sh`，先冻结整个候选矩阵，再放行 TEST 作业。
 
-## 验证门的隔离
+```bash
+locked="$HISTORY_ROOT/outputs/mri/mri_x4_gsbm_mls_v2_20261120_test15/subset_manifest.json"
+freeze_job=$(sbatch --parsable scripts/mri_freeze.sbatch \
+    --candidate "$CHECKPOINT" "$VALIDATION_OUTPUT" --inventory "$MRI_CASE_INVENTORY" \
+    --manifest "$locked" --folder "$FREEZE_DIR")
+export FREEZE_DIR RUN_ID
+sbatch --dependency="afterok:$freeze_job" --kill-on-invalid-dep=yes scripts/mri_test.sbatch
+```
 
-验证使用单独的 `${RUN_ID}_gate_${SLURM_JOB_ID}` 目录，不写入正式权重。
-它使用两个病例的索引上限、每阶段 1 epoch、全局 8 个训练窗口和 4 个
-验证窗口、每卡 batch 1。缩小后的表征/漂移宽度均为 4，特征维度 8，
-路径内部优化两次。最后仅对一个**验证**病例做两步重建，不接触测试成绩。
-正式训练的模型和窗口预算来自正式有效配置。
-
-## 15% 测试与输出约定
-
-测试入口固定传入 `--test-fraction 0.15 --subset-seed 20261110`。在对完整
-候选病例排序和校验后，只选择一次全局病例子集，再将病例分给四个 rank。
-当前 560 个病例对应 84 个完整病例，不是各 rank 独立抽样，也不是仅取
-前 84 个自然排序病例。病例清单与种子保存为 `subset_manifest.json`，
-并在输出目录旁保留清单，以便重跑和对照实验核对。
-
-原 MRI 的 `case/slice.png` 配对方式、逐层 XY 插值、原始 Z 位置、强度
-归一化、完整切片评估与重叠三维窗口融合方式保持对应接口。每个病例
-输出 `metadata.json` 和 `metrics.json`，根目录成功发布 `summary.json`。
-默认前 8 个被选病例保留 `mean.npy`、`variance.npy`，其他被选病例仍完成
-全部切片评价。`EXPORT_CASE_LIMIT` 只影响数组导出数量，不影响 15% 评价范围。
-单次采样的 variance 为零，不能解释为已校准的不确定性。
-
-训练权重分别位于 `runs/mri/<RUN_ID>/representation/` 和
-`runs/mri/<RUN_ID>/bridge/`。bridge checkpoint 为兼容推理接口记录
-`stage=reconstruction`，同时保留 `training_stage=bridge` 和独立算法标识。
-
-Slurm 日志在 `reports/slurm/`，提交记录在 `reports/mri/submissions/`，
-流水线记录在 `reports/mri/pipelines/<RUN_ID>.txt`。
+正式确认一律读取历史固定 15% 清单。TDM 的原配置保留训练时记录的 10% 默认值，确认入口显式传入 15%、种子 20261110 和固定清单，核验 84 例、14,991 张和 3,929,800,704 个体素。`mri_test.sbatch` 需要冻结目录；旧表征/桥流水线和 MLS 训练脚本结束于整病例 VAL。每次评价输出逐病例目录、`per_case.csv`、`summary.csv` 和 `summary.json`。配对差通过在两臂同时重抽病例计算，同一次抽样内重新汇总体素 MSE、PSNR 和切片 SSIM。
 
 ```bash
 squeue -u "$USER"
-sacct -j <job_id> --format=JobID,State,ExitCode,Elapsed,NodeList
+sacct -X -j "$job" --format=JobID,State,ExitCode,Elapsed,NodeList
 ```
-
-数据和模态迁移不自动等于零样本泛化。适配电镜时需要在其训练体上学习或
-重新拟合表征/几何，并验证其观测算子；无需指定脑组织分割、骨架或树拓扑。

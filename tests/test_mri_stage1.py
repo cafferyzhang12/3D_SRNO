@@ -48,3 +48,30 @@ def test_correction_identity_and_haar_parseval():
     dc_change = (guided - plain).reshape(2, 4, 3, 4).sum((1, 3)) / 4
     assert stats["haar_high"]["dot"] + (dc_error * dc_change).sum() == pytest.approx(stats["whole"]["dot"])
     assert correction_report(correction_regions(hr, plain, plain, codec)["whole"])["optimal_change_multiplier"] is None
+
+
+def test_replay_runtime_weights_exact_trajectory_rng_and_hr_oracle():
+    from collections import Counter, defaultdict
+    from test_atlas_geometry import fixture_geometry, image
+    from vemgsbm.mri_guidance_replay import _collect_chart, trace_tile
+    from vemgsbm.mri_stage1 import oracle_fit_scores
+
+    geometry = fixture_geometry(curvature=.5)
+    base = image([[.15, -.25]])
+    def model(state, condition, mask, time, direction):
+        return state.sin() + .12
+    generator = torch.Generator().manual_seed(42)
+    result, chart, calls = trace_tile(
+        model, base, torch.zeros_like(base), "gsbm", geometry=geometry, generator=generator,
+        sigma=.05, steps=20, terminal_noise=False,
+        geometry_guidance={"strength":.02,"normal_strength":.01,"start":.3,"max_update":.002})
+    assert torch.isfinite(result).all() and calls == 20
+    assert len(chart.observations) == 26  # .35 through .95, both cost branches
+    assert {s for s, _, _, _ in chart.observations} == set(range(7,20))
+    assert all(not w.requires_grad for _, _, w, _ in chart.observations)
+    counts = defaultdict(Counter)
+    _collect_chart(chart, oracle_fit_scores(geometry, image([[0,1]])),counts)
+    assert len(counts) == 26
+    assert all(v["updates"] == 1 for v in counts.values())
+    assert all(v["trust_weight_mass"] <= 1 for v in counts.values())
+    assert any(abs(v["lr_prior_gap"] - v["actual_weights_gap"]) > 1.e-6 for v in counts.values())

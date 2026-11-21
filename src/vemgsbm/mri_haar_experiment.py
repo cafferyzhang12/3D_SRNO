@@ -66,8 +66,9 @@ def overfit(config_path, inventory, directory, steps, device_name):
         atlas = None
         if cfg.get("spatial_atlas"):
             from .spatial_atlas import load_spatial_atlas
-            ctx.main_call(lambda: _prepare_spatial_bank(cfg, train, ids, device, directory))
-            payload = load_checkpoint(directory / "spatial_bank.pt")["payload"]
+            bank_path = ctx.main_call(lambda: _prepare_spatial_bank(cfg, train, ids, device, directory),
+                                      broadcast_result=True)
+            payload = load_checkpoint(bank_path)["payload"]
             atlas = load_spatial_atlas(payload, cfg["spatial_atlas"]).requires_grad_(False).to(device).eval()
         raw = HaarObjective(model, cfg, atlas)
         objective = (DistributedDataParallel(raw, device_ids=[ctx.local_rank] if device.type == "cuda" else None,

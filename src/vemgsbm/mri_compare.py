@@ -9,10 +9,7 @@ import numpy as np
 from .runtime import atomic_save
 
 
-def paired_comparison(reference, candidate, seed=42, resamples=10000):
-    """Resample the same patients in both arms and recompute the pooled estimands."""
-    if resamples < 2:
-        raise ValueError("At least two bootstrap draws required")
+def _paired_case_totals(reference, candidate):
     if reference["subset"] != candidate["subset"]:
         raise ValueError("Case manifests differ")
     if "split" in reference and "split" in candidate and reference["split"] != candidate["split"]:
@@ -48,25 +45,46 @@ def paired_comparison(reference, candidate, seed=42, resamples=10000):
         totals.append(np.asarray(rows, dtype=np.float64))
     if not len(totals[0]) or not all(np.isfinite(a).all() for a in totals):
         raise ValueError("Nonempty, finite paired case totals required")
+    return np.stack(totals), fingerprints_checked
+
+
+def paired_seed_comparison(pairs, seed=42, resamples=10000):
+    """Pair patients across methods and seeds, then average the per-seed estimands."""
+    if resamples < 2 or not pairs:
+        raise ValueError("At least one compared pair and two bootstrap draws required")
+    totals, checked = [], []
+    for reference, candidate in pairs:
+        if reference["subset"] != pairs[0][0]["subset"]:
+            raise ValueError("Different case manifests across paired seeds")
+        data, validated = _paired_case_totals(reference, candidate)
+        totals.append(data)
+        checked.append(validated)
 
     def differences(index):
-        # Equal voxel and slice counts were checked case by case above.
-        ref, cand = (arm[index].sum(axis=1).T for arm in totals)
+        values = []
         with np.errstate(divide="ignore", invalid="ignore"):
-            return np.stack((10 * np.log10(ref[0] / cand[0]), (cand[0] - ref[0]) / ref[1],
-                             (cand[2] - ref[2]) / ref[3]), axis=-1)
+            for pair in totals:
+                ref, cand = (arm[index].sum(axis=1).T for arm in pair)
+                values.append(np.stack((10 * np.log10(ref[0] / cand[0]), (cand[0] - ref[0]) / ref[1],
+                                        (cand[2] - ref[2]) / ref[3]), axis=-1))
+        return np.mean(values, axis=0)
 
-    count = len(metrics[0])
+    count = totals[0].shape[1]
     observed = differences(np.arange(count)[None])[0]
     rng = np.random.default_rng(seed)
     draws = np.concatenate([differences(rng.integers(count, size=(min(128, resamples - i), count)))
                             for i in range(0, resamples, 128)])
     result = {"number_of_cases": count, "seed": seed, "resamples": resamples, "level": .95,
-              "difference": "candidate minus reference", "input_fingerprints_checked": fingerprints_checked}
+              "difference": "candidate minus reference", "input_fingerprints_checked": all(checked),
+              "paired_runs": len(pairs)}
     for i, name in enumerate(("pooled_psnr_db", "pooled_mse", "mean_slice_ssim")):
         ci = np.percentile(draws[:, i], [2.5, 97.5]).tolist() if np.isfinite(draws[:, i]).all() else None
         result[name] = {"difference": float(observed[i]) if np.isfinite(observed[i]) else None, "ci95": ci}
     return result
+
+
+def paired_comparison(reference, candidate, seed=42, resamples=10000):
+    return paired_seed_comparison([(reference, candidate)], seed=seed, resamples=resamples)
 
 
 def main():

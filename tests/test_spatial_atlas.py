@@ -92,6 +92,17 @@ def test_moving_surface_subtracts_expansion_velocity(payload):
     assert torch.isfinite(path.mean_knots).all()
 
 
+def test_mean_path_cannot_cancel_opposite_chart_errors(payload):
+    atlas = module(payload, centers=2, candidates=2, method="mean")
+    atlas.mean.zero_()
+    atlas.mean[::2, 3] = 1.
+    atlas.mean[1::2, 3] = -1.
+    bound = atlas.bind(torch.zeros(1,1,1,2,2))
+    bound.weights.fill_(.5)
+    mean = torch.zeros(1,16,1,2,2)
+    assert bound.mean_state_cost(mean, .5).item() == pytest.approx(.25 / 16)
+
+
 def test_unsupported_quadratic_reduces_to_pca(payload):
     mls = module(payload, neighbors=2)
     pca = module(payload, neighbors=2, method="pca")

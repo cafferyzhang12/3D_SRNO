@@ -59,26 +59,28 @@ def correction_report(total):
 
 
 @torch.no_grad()
-def chart_fit(geometry, base, hr, output):
-    """Score every chart on HR using the deployed trust-limited decoder.
+def oracle_fit_scores(geometry, hr):
+    """Fit each HR tile to every deployed bounded decoder; lower MSE is better."""
+    features = geometry.encode(hr)
+    fits = []
+    for chunk in torch.arange(geometry.atlas.chart_count, device=hr.device).split(8):
+        all_ids = chunk[None].expand(len(hr), -1)
+        oracle = BoundSourceMRIAtlas(geometry, all_ids, torch.ones_like(all_ids, dtype=hr.dtype),
+                                     torch.ones(len(hr), dtype=hr.dtype, device=hr.device))
+        fits.append(oracle._local_geometry(features, derivative=False)["residual"])
+    return torch.cat(fits, dim=1)
 
-    Only this post-inference diagnostic sees HQ. The candidate IDs and their
-    prior come from LR alone. Use a reconstructed endpoint to evaluate the
-    state-dependent weights in the routed candidate set.
-    """
+
+@torch.no_grad()
+def chart_fit(geometry, base, hr, output):
+    """Compare LR-only selection and reconstructed endpoint scores against an HR oracle."""
     source = (geometry.encoder(base) - geometry.source_mean) / geometry.source_scale
     distribution, confidence = source_chart_distribution(
         source, geometry.source_bank, geometry.chart_probabilities, geometry.routing_settings)
     top_mass, ids = distribution.topk(min(3, distribution.shape[1]), dim=1)
     prior = top_mass / top_mass.sum(1, keepdim=True)
     bound = BoundSourceMRIAtlas(geometry, ids, prior, confidence)
-    features = geometry.encode(hr)
-    fits = []
-    for chunk in torch.arange(distribution.shape[1], device=base.device).split(8):
-        all_ids = chunk[None].expand(len(base), -1)
-        oracle = BoundSourceMRIAtlas(geometry, all_ids, torch.ones_like(all_ids, dtype=base.dtype), confidence)
-        fits.append(oracle._local_geometry(features, derivative=False)["residual"])
-    fits = torch.cat(fits, dim=1)
+    fits = oracle_fit_scores(geometry, hr)
     best = fits.amin(1)
     selected = fits.gather(1, ids)
     endpoint_weights = bound._local_geometry(geometry.encode(output), derivative=False)["weight"]

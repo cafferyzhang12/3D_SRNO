@@ -115,8 +115,9 @@ def _fit_charts(source, residuals, settings, dim, generator):
     ridge = float(settings.get("ridge", 1.e-4))
     if ridge <= 0:
         raise ValueError("Quadratic fit requires positive ridge")
+    pca_supported = (effective > dim) & (eigenvalues[:, -dim] > 1.e-8)
     enough = ((effective >= matrix.shape[-1]) & (condition <= settings.get("condition_limit", 1.e6))
-              & (eigenvalues[:, -dim] > 1.e-8))
+              & pca_supported)
     shrink = s / (s.square() + ridge * s[:, :1].square())
     coeff = (vt.mT * shrink[:, None, :]) @ (u.mT @ (normal * w.sqrt()[..., None]))
     coeff *= enough[:, None, None]
@@ -134,7 +135,7 @@ def _fit_charts(source, residuals, settings, dim, generator):
     fitted = dict(centers=centers, radius=radius, mean=mean, basis=basis, bandwidth=bandwidth,
                   offset=coeff[:, 0], linear=coeff[:, 1:1+dim], form=form, covariance=covariance,
                   desc_mean=desc_mean, lr_to_q=lr_to_q, effective=effective, condition=condition,
-                  quadratic_supported=enough)
+                  quadratic_supported=enough, pca_supported=pca_supported)
     return avg, scale, {k: v.float() for k, v in fitted.items()}
 
 
@@ -230,7 +231,7 @@ class SpatialAtlas(nn.Module):
         values = self.mean[ids]
         if self.method == "mean":
             return values, basis
-        values = values + (basis @ qn[..., None]).squeeze(-1)
+        values = values + self.pca_supported[ids][..., None] * (basis @ qn[..., None]).squeeze(-1)
         if self.method == "pca":
             return values, basis
         form = self.form[ids]
@@ -265,6 +266,8 @@ class SpatialAtlas(nn.Module):
 
     def _confidence(self, ids, prior, trust):
         support = (self.effective[ids] / max(2*self.dim, 16)).clamp(max=1)
+        if self.method != "mean":
+            support = support * self.pca_supported[ids]
         if self.method == "mls":
             support = support * (.25 + .75 * self.quadratic_supported[ids])
         return (prior * trust * support).sum(1)
@@ -280,7 +283,8 @@ class BoundSpatialAtlas:
             return (buffer[self.ids] * self.weights).sum(1).mean()
         return {"effective_neighbors": average(self.atlas.effective),
                 "quadratic_design_condition": average(self.atlas.condition),
-                "quadratic_fallback_fraction": average(1 - self.atlas.quadratic_supported)}
+                "quadratic_fallback_fraction": average(1 - self.atlas.quadratic_supported),
+                "pca_to_mean_fallback_fraction": average(1 - self.atlas.pca_supported)}
 
     def whiten(self, r):
         if self.factor is None:
@@ -316,7 +320,7 @@ class BoundSpatialAtlas:
                 # Basis has full column rank. QR here has continuous, finite
                 # derivatives for chart coordinates in the supported domain.
                 q = torch.linalg.qr(jac, mode="reduced").Q
-                tangent = (q @ (q.mT @ vector[...,None])).squeeze(-1)
+                tangent = (q @ (q.mT @ vector[...,None])).squeeze(-1) * a.pca_supported[ids][..., None]
             if velocity is None:
                 confidence = a._confidence(ids, w, self.trust[region])
                 mix = lambda values: (w[...,None] * values).sum(1)

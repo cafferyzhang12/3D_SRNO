@@ -150,13 +150,27 @@ def _prepare_spatial_bank(cfg, dataset, identity, device, run_dir):
         cached = load_checkpoint(cached_path)
         if cached.get("provenance") != provenance:
             raise ValueError("Spatial bank identity, settings or descriptor checkpoint differs")
-        payload = cached["payload"]
-    else:
-        bank_set = copy.copy(dataset)
-        bank_set.seed = options.get("seed", 42)
-        bank_set.set_epoch(0)
-        payload = build_spatial_atlas(checkpoint, bank_set, options, device)
-    atomic_save({"provenance": provenance, "payload": payload}, run_dir / "spatial_bank.pt")
+        return str(cached_path.resolve())
+    bank_set = copy.copy(dataset)
+    bank_set.seed = options.get("seed", 42)
+    bank_set.set_epoch(0)
+    payload = build_spatial_atlas(checkpoint, bank_set, options, device)
+    destination = run_dir / "spatial_bank.pt"
+    atomic_save({"provenance": provenance, "payload": payload}, destination)
+    return str(destination.resolve())
+
+
+def _publish_epoch_history(run_dir, records):
+    # last.pt is the commit point. On resume, replay its complete history if
+    # preemption fell between the checkpoint and this small JSONL replacement.
+    with tempfile.NamedTemporaryFile("w", dir=run_dir, encoding="utf-8", delete=False) as stream:
+        temp = Path(stream.name)
+        for row in records:
+            stream.write(json.dumps(row, allow_nan=False) + "\n")
+    try:
+        os.replace(temp, run_dir / "metrics.jsonl")
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def run_training(config_path, stage="bridge", device_name="auto", resume=None, case_inventory=None):
@@ -244,8 +258,10 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 if old is not None:
                     spatial_payload = old["spatial_atlas"]
                 else:
-                    context.main_call(lambda: _prepare_spatial_bank(cfg, train_set, identity, device, run_dir))
-                    spatial_payload = load_checkpoint(run_dir / "spatial_bank.pt")["payload"]
+                    bank_path = context.main_call(
+                        lambda: _prepare_spatial_bank(cfg, train_set, identity, device, run_dir),
+                        broadcast_result=True)
+                    spatial_payload = load_checkpoint(bank_path)["payload"]
                 metric = load_spatial_atlas(spatial_payload, cfg["spatial_atlas"]).to(device).requires_grad_(False)
                 metric.eval()
             objective = HaarObjective(model, cfg, metric)
@@ -270,6 +286,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
         parameters = [p for p in objective.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(parameters, lr=cfg["train"]["learning_rate"], weight_decay=1e-5)
         start, best, stale_epochs = 0, float("inf"), 0
+        history = []
         if resume:
             if old["training_stage"] != stage or old["manifest_sha256"] != digest or old["data_identity"] != identity:
                 raise ValueError("Resume identity differs")
@@ -290,6 +307,13 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             optimizer.load_state_dict(old["optimizer"])
             start, best = old["epoch"], old["best"]
             stale_epochs = old.get("stale_epochs", 0)
+            if haar:
+                if "epoch_history" in old:
+                    history = old["epoch_history"]
+                    context.main_call(lambda: _publish_epoch_history(run_dir, history))
+                elif (run_dir / "metrics.jsonl").is_file():
+                    history = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
+                    history = [row for row in history if row["epoch"] <= start]
         raw_objective = objective
         if context.is_distributed:
             objective = DistributedDataParallel(objective, device_ids=[context.local_rank] if device.type == "cuda" else None,
@@ -482,11 +506,17 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                               "metric": payload, "stale_epochs": stale_epochs}
                 if spatial_payload is not None:
                     checkpoint["spatial_atlas"] = spatial_payload
+                if haar:
+                    history.append(record)
+                    checkpoint["epoch_history"] = history
                 if improved:
                     atomic_save(checkpoint, run_dir / "best.pt")
                 atomic_save(checkpoint, run_dir / "last.pt")
-                with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(record) + "\n")
+                if haar:
+                    _publish_epoch_history(run_dir, history)
+                else:
+                    with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(record) + "\n")
                 print(json.dumps(record), flush=True)
             context.main_call(save)
         return run_dir

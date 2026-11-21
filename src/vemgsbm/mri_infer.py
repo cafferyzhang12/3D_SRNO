@@ -18,7 +18,6 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from time import perf_counter
 import time
 
 import numpy as np
@@ -201,7 +200,7 @@ def _validate_mri_checkpoint(checkpoint):
 
 
 @torch.no_grad()
-def _infer_case(case, folder, model, geometry, config, device, seed, steps, samples):
+def _infer_case(case, folder, model, geometry, config, device, seed, steps, samples, *, replay_tile=None):
     scale = config["data"]["scale"]
     patch = tuple(config.get("external", {}).get("eval_patch_zyx", config["data"]["patch_size"]))
     guidance = sampling_geometry_guidance(config)
@@ -253,9 +252,13 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
                     by_tile = [[torch.randn(noise_shape, dtype=bases.dtype, device=device, generator=generator)
                                 for _ in range(steps - 1)] for _ in group]
                     options["noise_steps"] = [torch.cat(step) for step in zip(*by_tile, strict=True)]
-                predictions = reconstruct(model, bases, masks, config["mode"], geometry=geometry,
-                                          steps=steps, sigma=sigma, generator=generator, terminal_noise=not improved,
-                                          geometry_guidance=guidance, **options)
+                sampler = reconstruct
+                if replay_tile is not None:
+                    sampler = replay_tile
+                    options["tile_location"] = (run, group)
+                predictions = sampler(model, bases, masks, config["mode"], geometry=geometry,
+                                      steps=steps, sigma=sigma, generator=generator, terminal_noise=not improved,
+                                      geometry_guidance=guidance, **options)
             if not improved:
                 predictions = predictions.clamp(0, 1)
             yield from zip(group, predictions[:, 0].cpu().numpy(), strict=True)
@@ -311,7 +314,6 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
 def _write_case(case, staged, model, geometry, config, device, seed, steps, samples,
                 checkpoint_hash, root_lq, root_hq, save_volume=True):
     folder = staged / case.id
-    started = perf_counter()
     # Each case resets its generators to seed + sample. Keeping this original
     # convention makes stochastic predictions independent of rank assignment.
     started = time.perf_counter()
@@ -337,7 +339,7 @@ def _write_case(case, staged, model, geometry, config, device, seed, steps, samp
         "normalization_offset": case.normalization_offset, "channel_policy": case.channel_policy,
         "mode": config["mode"], "seed": seed, "steps": steps, "samples": samples,
         "sampling_sigma": sampling_noise(config), "reference_sigma": config["sampling"]["sigma"],
-        "inference_and_metrics_seconds": perf_counter() - started,
+        "inference_and_metrics_seconds": elapsed,
         "base": "real LR, per-slice bilinear XY, align_corners=False", "observed_mask": "all_zero",
         "volume_exported": save_volume,
         "mean_file": "mean.npy" if save_volume else None,
@@ -575,8 +577,10 @@ def infer_mri(
         sampler = sampling.get("drift_sampler", "forward")
         if sampler not in {"forward", "diffusion_corrected"}:
             raise ValueError("Unknown drift sampler")
-        if (disable_guidance or drift_sampler is not None or sampler != "forward") and config["mode"] != "gsbm":
-            raise ValueError("Drift sampler and online guidance overrides require GSBM")
+        if (drift_sampler is not None or sampler != "forward") and config["mode"] != "gsbm":
+            raise ValueError("Drift sampler overrides require GSBM")
+        if disable_guidance and config["mode"] not in {"gsbm", "haar_bridge", "haar_direct"}:
+            raise ValueError("Online GSBM guidance override requires a supported MRI bridge")
         config = {**config, "sampling": sampling, "inference_variant": inference_variant, "predictor": predictor}
         if config["mode"] in {"haar_direct", "haar_bridge"}:
             config["inference_variant"] = "endpoint_safe"
@@ -660,6 +664,17 @@ def infer_mri(
             summary["subset"] = subset
             summary.update(split=split or "custom", checkpoint_sha256=checkpoint_hash,
                            predictor=predictor, steps=steps, samples=samples, seed=seed)
+            if predictor == "model":
+                summary["training_seed"] = config["train"].get("seed")
+            if predictor == "bilinear":
+                summary.update(input_dimensionality="2D", pretraining="none")
+            elif config.get("external"):
+                summary.update(input_dimensionality="2D", pretraining=config["external"]["pretraining"])
+            else:
+                pretraining = "project MRI TRAIN geometry"
+                if config["mode"] in {"haar_direct", "haar_bridge"}:
+                    pretraining = "direct encoder on MRI TRAIN" if config.get("spatial_atlas") else "none"
+                summary.update(input_dimensionality=f"{data['patch_size'][0]}-slice", pretraining=pretraining)
             summary["inference_variant"] = "momentum_bridge" if config["mode"] == "momentum" else config["inference_variant"]
             if config["mode"] in {"haar_direct", "haar_bridge"} and predictor == "model":
                 summary["readout"] = config["sampling"].get("readout", "integral")

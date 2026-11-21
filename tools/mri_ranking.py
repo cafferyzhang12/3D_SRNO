@@ -23,18 +23,19 @@ def main():
     result = []
     for key, summary in data.items():
         comparison = paired_comparison(data[args.reference], summary)
-        external = summary.get("external", {})
         nfe = summary.get("network_calls_per_tile_sample", summary.get("drift_network_calls_per_tile_sample"))
         if nfe is None and "momentum" in summary.get("inference_variant", ""):
             nfe = summary["steps"]
         seconds = [r.get("evaluation_seconds") for r in summary["cases"]]
         row = dict(method=key, split=summary.get("split", "archived"), cases=len(summary["cases"]),
                    **{name: summary.get(name) for name in metrics}, reference=args.reference,
+                   input_dimensionality=summary.get("input_dimensionality"),
+                   pretraining=summary.get("pretraining", summary.get("external", {}).get("pretraining")),
                    nfe_per_tile=nfe, seed=summary.get("seed"),
                    case_evaluation_seconds=sum(seconds) if all(s is not None for s in seconds) else None,
                    checkpoint_sha256=summary.get("checkpoint_sha256"), summary_sha256=fingerprint(sources[key]),
                    source=sources[key])
-        for name in ("pooled_psnr_db", "mean_slice_ssim"):
+        for name in ("pooled_psnr_db", "pooled_mse", "mean_slice_ssim"):
             stats = comparison[name]
             row["delta_" + name] = stats["difference"]
             lo, hi = stats["ci95"] or (None, None)

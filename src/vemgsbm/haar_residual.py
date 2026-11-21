@@ -8,7 +8,7 @@ from torch.nn import functional as F
 
 from .models import _TimeResidualBlock, batch_time
 from .momentum.model import HaarXY
-from .paths import optimize_path, sample_path
+from .paths import linear_path, optimize_path, sample_path
 
 
 HAAR_MODES = {"haar_direct", "haar_bridge"}
@@ -149,7 +149,17 @@ class HaarObjective(nn.Module):
             target = bound.whiten(target)
             if model.spatial.get("path_geometry", False):
                 path_metric = bound.path_metric()
-        path, diagnostics = optimize_path(zero, target, torch.zeros_like(zero), path_metric, self.config["path"])
+        path_cfg = self.config["path"]
+        if path_metric is None:
+            # Exact minimum of the mean and variance control action.
+            path = linear_path(zero, target, torch.zeros_like(zero), path_cfg["knots"], path_cfg["sigma"])
+            diagnostics = {"mean_correction_rms": 0., "accepted_steps": 0}
+        else:
+            # CondSOC may draw quadrature noise. Preserve the matching-time and
+            # noise RNG stream shared with the network-only path ablation.
+            devices = [target.device] if target.is_cuda else []
+            with torch.random.fork_rng(devices=devices):
+                path, diagnostics = optimize_path(zero, target, torch.zeros_like(zero), path_metric, path_cfg)
         cutoff = self.config["train"].get("matching_time_min", .02)
         t = torch.rand(len(hr), device=hr.device) * (1 - 2 * cutoff) + cutoff
         noise = torch.randn_like(target)
