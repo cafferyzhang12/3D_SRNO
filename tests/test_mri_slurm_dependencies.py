@@ -61,7 +61,13 @@ echo "$job;cluster"
     }.items():
         (db/file).write_text(text,newline="\n")
     def run(command, **settings):
-        env = dict(os.environ, SLURM_LOOKUP_ATTEMPTS="2",SLURM_LOOKUP_DELAY="0",**settings)
+        # On a real allocation, paths and dependencies in the parent environment
+        # refer to live Slurm work. The simulator owns its checkout and ledgers.
+        env = {k: v for k, v in os.environ.items() if k.upper() in {
+            "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC",
+            "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
+        }}
+        env.update(SLURM_LOOKUP_ATTEMPTS="2", SLURM_LOOKUP_DELAY="0", **settings)
         # Let Bash put POSIX mock executables before the real scheduler.
         return subprocess.run([bash,"-c","export PATH=\"$PWD/mockbin:$PATH\"; "+command],
                               env=env,cwd=tmp_path, text=True,encoding="utf-8",capture_output=True,timeout=20)
