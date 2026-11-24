@@ -54,6 +54,8 @@ def freeze(candidates, inventory, manifest, destination):
                           disable_guidance=not bool(report.get("geometry_guidance")))
         if cfg["mode"] == "haar_bridge":
             kwargs["readout"] = report["readout"]
+            if report.get("sampler_type") in {"ode","sde"}:
+                kwargs.update(sampler_type=report["sampler_type"],solver=report.get("solver","euler"))
         rows.append(dict(checkpoint=str(checkpoint), checkpoint_sha256=report["checkpoint_sha256"],
                          validation=str(result), summary_sha256=fingerprint(result / "summary.json"),
                          pooled_psnr=report["all_psnr_db"], ssim=report["mean_slice_ssim"], inference=kwargs))

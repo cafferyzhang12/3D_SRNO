@@ -153,7 +153,10 @@ def test_legacy_cache_is_read_only_and_new_cache_is_invalidated(tmp_path, monkey
     monkeypatch.setattr(mri_data, "_png_header", original_header)
     path = lq / "case1" / "slice0.png"
     stat = path.stat()
-    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000))
+    # GPFS may round subsecond timestamp updates. Change a whole two seconds
+    # so this tests cache invalidation rather than filesystem clock precision.
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+    assert path.stat().st_mtime_ns != stat.st_mtime_ns
     assert data_fingerprint(index_cases(lq, hq, scale=2, cache_path=cache)) != data_fingerprint(first)
 
 

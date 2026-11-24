@@ -11,6 +11,9 @@ PY
 )
 [[ "${#val[@]}" == 2 ]]
 args=()
+if [[ -n "${MRI_SAMPLER_TYPE:-}" ]]; then args+=(--sampler-type "$MRI_SAMPLER_TYPE"); fi
+if [[ -n "${MRI_INFER_STEPS:-}" ]]; then args+=(--steps "$MRI_INFER_STEPS"); fi
+if [[ -n "${MRI_NUM_SAMPLES:-}" ]]; then args+=(--samples "$MRI_NUM_SAMPLES"); fi
 if [[ -n "${MRI_HAAR_READOUT:-}" ]]; then args+=(--readout "$MRI_HAAR_READOUT"); fi
 if [[ -n "${MRI_CASE_INVENTORY:-}" ]]; then args+=(--case-inventory "$MRI_CASE_INVENTORY"); fi
 gsbm_torchrun -m vemgsbm.mri_infer --split val --test-fraction 1 --checkpoint "$CHECKPOINT" \

@@ -1,0 +1,106 @@
+mode: haar_bridge
+run_dir: runs/mri/haar_sr_mls_x4
+predict_target: x1
+use_band_whitening: true
+band_stats_cache: reports/mri/sr_mls/train_haar_statistics.pt
+sigma_0: 0.0
+sigma_bridge: 0.0
+infer_sampler: ode
+infer_steps: 4
+mls_reg_weight: 0.05
+mls_regularizer:
+  bank: reports/mri/sr_mls/train_mls_residuals.pt
+  geometry_mode: paired_curved
+  paired_base_weight: 1.0
+  coordinate_limit: 3.0
+  dim: 4
+  folds: 5
+  centers: 128
+  neighbors: 64
+  max_fit_sites_per_fold: 65536
+  sites_per_case: 256
+  patches_per_case: 4
+  loss_sites_per_patch: 256
+  query_chunk: 2048
+  ridge: 0.0001
+  condition_limit: 1000000
+  seed: 42
+data:
+  kind: paired_mri_png
+  degradation: paired_xy
+  scale: 4
+  patch_size: [5, 128, 128]
+  channel_policy: identical_rgb_to_gray
+  scan_workers: 4
+  train:
+    root_lq: data/MRI_SR/train/LQ/X4_png
+    root_hq: data/MRI_SR/train/HQ_png
+  val:
+    root_lq: data/MRI_SR/val_small/LQ/X4_png
+    root_hq: data/MRI_SR/val_small/HQ_png
+  test:
+    root_lq: data/MRI_SR/test/LQ/X4_png
+    root_hq: data/MRI_SR/test/HQ_png
+  scan_cache:
+    train: reports/mri/gsbm_mls_x4/index_train.json
+    val: reports/mri/gsbm_mls_x4/index_val.json
+    test: reports/mri/gsbm_mls_x4/index_test.json
+  legacy_scan_cache:
+    train: data/private/scan_train.json
+    val: data/private/scan_val.json
+    test: data/private/scan_test.json
+model:
+  widths: [96, 160, 256]
+  multiscale_xy: true
+path:
+  knots: 5
+  iterations: 0
+  quadrature: 5
+  optimize_std: false
+  sigma: 0.0
+  state_weight: 0
+  metric_weight: 0
+  control_weight: 1
+train:
+  objective: sr_reconstruction
+  epochs: 40
+  batch_size: 64
+  train_samples: 1
+  val_samples: 1
+  samples_per_epoch: 262144
+  val_samples_per_epoch: 256
+  learning_rate: 0.0001
+  matching_time_min: 0.0001
+  workers: 2
+  threads: 4
+  seed: 42
+  validation_seed: 42
+  selection_metric: pooled_psnr
+  minimum_epochs: 40
+  whole_val_patience: 40
+  endpoint_weight: 1.0
+  start_weight: 1.0
+  rollout_weight: 1.0
+  rollout_steps: 4
+  hf_weight: 0.1
+  edge_weight: 0.05
+  bridge_aux_weight: 0.0
+  clip_grad_norm: 1.0
+  warmup_epochs: 2
+  schedule_epochs: 40
+  min_lr_ratio: 0.05
+  ema_decay: 0.999
+  checkpoint_epochs: [15, 24, 40]
+  report_every_updates: 32
+sampling:
+  tile_batch: 8
+  steps: 4
+  sampler_type: ode
+  solver: euler
+  sigma: 0.0
+  inference_sigma: 0.0
+  readout: endpoint
+test:
+  fraction: 0.15
+  subset_seed: 20261110
+  save_volume_limit: 0

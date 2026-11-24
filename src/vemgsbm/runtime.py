@@ -25,6 +25,22 @@ def read_config(path):
         cfg = yaml.safe_load(stream)
     if cfg.get("mode") not in MODES:
         raise ValueError(f"Unsupported mode, expected one of {sorted(MODES)}")
+    if cfg.get("predict_target") not in {None,"drift","x1"}:
+        raise ValueError("predict_target must be drift or x1")
+    if cfg.get("predict_target") == "x1":
+        sampling = cfg["sampling"]
+        sampling.setdefault("sampler_type",cfg.get("infer_sampler","ode"))
+        if cfg.get("infer_sampler",sampling["sampler_type"]) != sampling["sampler_type"]:
+            raise ValueError("infer_sampler and sampling.sampler_type must agree")
+        if sampling.get("solver","euler") not in {"euler","heun"} or (
+                sampling["sampler_type"] == "sde" and sampling.get("solver","euler") != "euler"):
+            raise ValueError("SDE uses Euler; ODE supports Euler or Heun")
+        if type(sampling["steps"]) is not int or sampling["steps"] < 1:
+            raise ValueError("Positive integer inference steps required")
+        clip = cfg["train"].get("clip_grad_norm",1.)
+        decay = cfg["train"].get("ema_decay",.999)
+        if not math.isfinite(clip) or clip <= 0 or not 0 <= decay < 1:
+            raise ValueError("Invalid gradient clip or EMA decay")
     patch = cfg["data"]["patch_size"]
     if len(patch) != 3 or any(not isinstance(v, int) or isinstance(v, bool) or v < 3 for v in patch):
         raise ValueError("patch_size must be ZYX")
@@ -56,7 +72,56 @@ def read_config(path):
         weight = cfg["train"].get("endpoint_weight", 1.)
         if not math.isfinite(weight) or weight < 0:
             raise ValueError("Invalid endpoint_weight")
-        if cfg["train"].get("matching_time_min", .02) != .02:
+        if cfg.get("predict_target") == "x1":
+            if cfg["mode"] != "haar_bridge" or cfg.get("spatial_atlas") or cfg.get("atlas"):
+                raise ValueError("x1 uses training-only MLS; online atlas branches are unsupported")
+            if not 1.e-4 <= cfg["train"].get("matching_time_min",1.e-4) < .5:
+                raise ValueError("x1 training times must stay in [1e-4, 1-1e-4]")
+            for key in ("sigma_0", "sigma_bridge", "mls_reg_weight"):
+                value = cfg.get(key, {"sigma_0":.03,"sigma_bridge":.08,"mls_reg_weight":0.}[key])
+                if type(value) not in (int,float) or not math.isfinite(value) or value < 0:
+                    raise ValueError(f"Invalid {key}")
+            sr_reconstruction = cfg["train"].get("objective") == "sr_reconstruction"
+            if (not sr_reconstruction and cfg.get("sigma_0",.03) <= 0) or cfg.get("sigma_bridge",.08) != sigma:
+                raise ValueError("Bridge x1 needs positive sigma_0 and matching sigma_bridge/path.sigma")
+            if cfg.get("use_band_whitening",True) and not cfg.get("band_stats_cache"):
+                raise ValueError("x1 whitening requires band_stats_cache")
+            if cfg["sampling"].get("readout","endpoint") != "endpoint":
+                raise ValueError("x1 has only an endpoint readout")
+            if not sr_reconstruction and not 2 <= cfg["train"].get("rollout_steps",3) <= 4:
+                raise ValueError("x1 rollout_steps must be 2..4")
+            if sr_reconstruction:
+                if (cfg.get("sigma_0",.03) != 0 or cfg.get("sigma_bridge",.08) != 0
+                        or sampling["sampler_type"] != "ode" or sampling.get("solver","euler") != "euler"):
+                    raise ValueError("SR reconstruction requires a zero prior, zero bridge noise and Euler ODE")
+                if cfg["train"].get("rollout_steps") != sampling["steps"]:
+                    raise ValueError("SR rollout and deployment must use the same time grid")
+                if cfg.get("straightening"):
+                    raise ValueError("SR reconstruction is supervised by paired HR, not a teacher endpoint")
+                for key, default in (("start_weight",1.),("rollout_weight",1.),("hf_weight",.1),("edge_weight",.05)):
+                    value = cfg["train"].get(key,default)
+                    if not isinstance(value,(int,float)) or not math.isfinite(value) or value < 0:
+                        raise ValueError(f"Invalid SR {key}")
+                    if key in {"start_weight","rollout_weight"} and value == 0:
+                        raise ValueError("SR reconstruction requires both start and rollout supervision")
+            if cfg["train"].get("coefficient_loss","charbonnier") not in {"l1","charbonnier"}:
+                raise ValueError("Unknown coefficient loss")
+            for key in ("coefficient_weight","pixel_weight","rollout_weight","charbonnier_eps"):
+                value = cfg["train"].get(key,1.e-3 if key == "charbonnier_eps" else 1.)
+                if not math.isfinite(value) or value < 0 or (key == "charbonnier_eps" and value == 0):
+                    raise ValueError(f"Invalid {key}")
+            if cfg.get("mls_reg_weight",0.) and not cfg.get("mls_regularizer"):
+                raise ValueError("Positive mls_reg_weight requires mls_regularizer settings")
+            if cfg.get("mls_reg_weight",0.):
+                geometry_mode = cfg["mls_regularizer"].get("geometry_mode","normal")
+                expected_mode = "paired_curved" if sr_reconstruction else "normal"
+                if geometry_mode != expected_mode:
+                    raise ValueError(f"This objective requires MLS geometry_mode={expected_mode}")
+            if cfg.get("straightening") and cfg.get("sigma_bridge",.08) != 0:
+                raise ValueError("Straightening trains straight paths: set sigma_bridge/path.sigma/sampling.sigma to zero")
+            if cfg.get("infer_steps",cfg["sampling"]["steps"]) != cfg["sampling"]["steps"]:
+                raise ValueError("infer_steps and sampling.steps must agree")
+        elif cfg["train"].get("matching_time_min", .02) != .02:
             raise ValueError("Haar MRI sampler uses matching_time_min=.02")
         if cfg["mode"] == "haar_bridge" and weight == 0 and cfg["sampling"].get("readout") == "endpoint":
             raise ValueError("Endpoint readout requires endpoint supervision")
@@ -83,6 +148,17 @@ def read_config(path):
 def sampling_noise(config):
     """Return the inference noise, with older checkpoints using reference noise."""
     sampling = config["sampling"]
+    sampler = sampling.get("sampler_type", config.get("infer_sampler"))
+    if sampler is not None:
+        if sampler not in {"ode", "sde"}:
+            raise ValueError("sampler_type must be ode or sde")
+        if sampler == "ode":
+            return 0.0
+        reference = config.get("sigma_bridge", config["path"]["sigma"])
+        supplied = sampling.get("inference_sigma", reference)
+        if not math.isfinite(reference) or reference < 0 or supplied != reference:
+            raise ValueError("SDE inference_sigma must equal sigma_bridge")
+        return float(reference)
     sigma = sampling.get("inference_sigma", sampling["sigma"])
     if isinstance(sigma, bool) or not isinstance(sigma, (int, float)) or not math.isfinite(sigma) or sigma < 0:
         raise ValueError("Inference diffusion sigma must be a nonnegative finite number")
@@ -159,7 +235,8 @@ def build_models(checkpoint, device):
     elif cfg["mode"] in {"haar_direct", "haar_bridge"}:
         from .haar_residual import make_haar_model
 
-        if checkpoint.get("format_version") != (4 if cfg.get("spatial_atlas") else 3):
+        if checkpoint.get("format_version") != (5 if cfg.get("predict_target") == "x1" else
+                                                 (4 if cfg.get("spatial_atlas") else 3)):
             raise ValueError("Unsupported native-LR Haar MRI checkpoint version")
         model = make_haar_model(cfg).to(device)
         if cfg.get("spatial_atlas"):
@@ -184,7 +261,8 @@ def build_models(checkpoint, device):
     else:
         from .network import DriftNetwork
         model = DriftNetwork(cfg["model"]["width"]).to(device)
-    model.load_state_dict(checkpoint["model"])
+    weights = "ema_model" if checkpoint.get("evaluation_weights") == "ema" else "model"
+    model.load_state_dict(checkpoint[weights])
     model.eval()
     if guidance is not None:
         from .atlas_geometry import MRIAtlasGeometry

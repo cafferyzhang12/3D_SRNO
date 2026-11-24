@@ -78,10 +78,12 @@ def build_spatial_atlas(direct_ckpt, train_set, settings, device):
             "sampling": {"seed": ds.seed, "sites_per_case": nsites, "patches_per_case": npatches}}
 
 
-def _fit_charts(source, residuals, settings, dim, generator):
-    from neural_atlas.mls_atlas import polynomial_powers
-
+def _fit_charts(source, residuals, settings, dim, generator, source_weights=None):
     avg, scale = source.mean(0), source.std(0, unbiased=False).clamp_min(1e-5)
+    if source_weights is not None:
+        # Apply descriptor weights after standardization so normalization does
+        # not silently cancel the relative weight of the paired LR features.
+        scale = scale / source_weights
     source = (source - avg) / scale
     ncenters = min(len(source), int(settings.get("centers", 128)))
     k = min(int(settings.get("neighbors", 64)), len(source))
@@ -104,9 +106,7 @@ def _fit_charts(source, residuals, settings, dim, generator):
     qn = q / bandwidth[:, None]
     # Same monomial ordering as neural_atlas. Store the quadratic coefficients
     # as a symmetric form for cheap analytic values and Jacobians at all sites.
-    powers = polynomial_powers(dim, 2)
-    pairs = np.array([np.repeat(np.arange(dim), p) for p in powers if p.sum() == 2])
-    i, j = pairs.T
+    i, j = torch.triu_indices(dim, dim)
     matrix = torch.cat((torch.ones_like(qn[..., :1]), qn, qn[..., i] * qn[..., j]), dim=-1)
     design = matrix * w.sqrt()[..., None]
     normal = centered - q @ basis.mT
@@ -135,7 +135,8 @@ def _fit_charts(source, residuals, settings, dim, generator):
     fitted = dict(centers=centers, radius=radius, mean=mean, basis=basis, bandwidth=bandwidth,
                   offset=coeff[:, 0], linear=coeff[:, 1:1+dim], form=form, covariance=covariance,
                   desc_mean=desc_mean, lr_to_q=lr_to_q, effective=effective, condition=condition,
-                  quadratic_supported=enough, pca_supported=pca_supported)
+                  quadratic_supported=enough, pca_supported=pca_supported,
+                  domain_lo=qn.amin(1), domain_hi=qn.amax(1))
     return avg, scale, {k: v.float() for k, v in fitted.items()}
 
 
@@ -351,6 +352,238 @@ class BoundSpatialAtlas:
 
 def load_spatial_atlas(payload, settings):
     return SpatialAtlas(payload, settings)
+
+
+@torch.no_grad()
+def prepare_training_mls(dataset, model, settings):
+    """Bank of paired TRAIN residual sites; no descriptor model and no VAL/TEST fitting."""
+    from .runtime import project_path
+    from .mri_case_cache import acquire_lock
+
+    if dataset.split != "train":
+        raise ValueError("MLS regularizer banks must be built from TRAIN")
+    nsites, npatches = int(settings.get("sites_per_case",256)), int(settings.get("patches_per_case",4))
+    if min(nsites,npatches) < 1:
+        raise ValueError("Positive MLS sampling budgets required")
+    seed = int(settings.get("seed",42))
+    paired = settings.get("geometry_mode", "normal") == "paired_curved"
+    identity = {"version":2 if paired else 1,"train":[[c.id,c.fingerprint] for c in dataset.cases],
+                "mean":model.band_mean.cpu().tolist(),"std":model.band_std.cpu().tolist(),
+                "whitened":model.use_band_whitening,"sites_per_case":nsites,"patches_per_case":npatches,"seed":seed}
+    path = project_path(settings["bank"])
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with acquire_lock(path.with_suffix(".lock")):
+        if path.is_file():
+            saved = load_checkpoint(path)
+            if saved.get("identity") != identity:
+                raise ValueError("TRAIN MLS bank identity differs; choose a new bank path")
+            return saved
+        ds = copy.copy(dataset)
+        ds.samples_per_epoch, ds.samples_per_volume = None, min(npatches,nsites)
+        ds.seed = seed
+        ds.set_epoch(0)
+        generator = torch.Generator().manual_seed(seed)
+        records, bases, cases = [], [], []
+        device = model.band_mean.device
+        if paired:
+            print(f"TRAIN MLS paired bank: sampling {len(ds)} patches from {len(ds.cases)} cases", flush=True)
+        for idx in range(len(ds)):
+            item = ds[idx]
+            slot = idx % ds.samples_per_volume
+            quota = nsites//ds.samples_per_volume + (slot < nsites%ds.samples_per_volume)
+            sites = _balanced_sites(item["lr"],quota,generator)
+            device_sites = sites.to(device)
+            coefficients = model.codec.encode((item["hr"]-item["base"])[None].to(device))
+            values = _sites(model.normalize_haar(coefficients))[device_sites].cpu()
+            records.append(values)
+            if paired:
+                bases.append(_sites(model.codec.encode(item["base"][None].to(device)))[device_sites].cpu())
+            cases.append(torch.full((len(values),),idx//ds.samples_per_volume,dtype=torch.long))
+            if paired and ((idx+1) % 256 == 0 or idx+1 == len(ds)):
+                print(f"TRAIN MLS paired bank: {idx+1}/{len(ds)} patches", flush=True)
+        payload = dict(identity=identity,residuals=torch.cat(records),case_indices=torch.cat(cases),
+                       train_case_ids=[c.id for c in ds.cases])
+        if paired:
+            payload.update(base_coefficients=torch.cat(bases),
+                           band_scale=(model.band_std.detach().cpu()+1.e-6 if model.use_band_whitening
+                                       else torch.ones(16)),
+                           provenance={"split":"train", "paired_source":"base_haar",
+                                       "train_fingerprints":[c.fingerprint for c in ds.cases]})
+        atomic_save(payload,path)
+        return payload
+
+
+class TrainingMLSAtlas(nn.Module):
+    """Cross-fitted residual charts, queried only by detached paired TRAIN truth.
+
+    Legacy ``normal`` charts use whitened residuals. ``paired_curved`` charts
+    use physical residual coefficients for all PCA, coordinates and decoded
+    errors, with whitened residual/base descriptors used only for retrieval.
+    The paired base supplies the observed LR context; no degradation operator
+    or synthetic downsampling relationship is assumed.
+    """
+    _decode = SpatialAtlas._decode
+
+    def __init__(self,payload,settings):
+        super().__init__()
+        self.settings, self.method = dict(settings), "mls"
+        self.geometry_mode = settings.get("geometry_mode", "normal")
+        if self.geometry_mode not in {"normal", "paired_curved"}:
+            raise ValueError("Unknown training MLS geometry_mode")
+        self.paired_base_weight = float(settings.get("paired_base_weight", 1.))
+        if not np.isfinite(self.paired_base_weight) or self.paired_base_weight < 0:
+            raise ValueError("paired_base_weight must be finite and nonnegative")
+        self.use_paired_base = self.geometry_mode == "paired_curved" and self.paired_base_weight > 0
+        self.dim = int(settings.get("dim",4))
+        ids = payload["train_case_ids"]
+        nf = min(len(ids),int(settings.get("folds",5)))
+        if nf < 2 or not 1 <= self.dim < 16 or len(set(ids)) != len(ids):
+            raise ValueError("TRAIN MLS needs distinct cases, >=2 folds and 1..15 tangent dimensions")
+        seed = int(settings.get("seed",42))
+        ordered = sorted(ids,key=lambda case: hashlib.sha256(f"{seed}:{case}".encode()).digest())
+        self.folds = {case:i%nf for i,case in enumerate(ordered)}
+        residuals = payload["residuals"].detach().cpu().float()
+        cases = payload["case_indices"].detach().cpu()
+        if (residuals.ndim != 2 or residuals.shape[1] != 16 or not len(residuals)
+                or not residuals.isfinite().all() or cases.shape != (len(residuals),)
+                or cases.is_floating_point() or cases.dtype == torch.bool
+                or cases.min() < 0 or cases.max() >= len(ids)):
+            raise ValueError("Invalid aligned TRAIN residual records and case indices")
+        if payload.get("provenance", {}).get("split", "train") != "train":
+            raise ValueError("Training MLS charts require TRAIN provenance")
+        if len(cases.unique()) != len(ids):
+            raise ValueError("Every TRAIN case needs at least one sampled residual")
+        row_fold = torch.tensor([self.folds[case] for case in ids])[cases.long()]
+        source, source_weights = residuals, None
+        if self.use_paired_base:
+            base = payload.get("base_coefficients")
+            if base is None or base.shape != residuals.shape or not base.isfinite().all():
+                raise ValueError("Paired MLS requires aligned finite TRAIN base_coefficients")
+            source = torch.cat((residuals, base.detach().cpu().float()), -1)
+            source_weights = torch.cat((torch.ones(16), torch.full((16,), self.paired_base_weight)))
+        physical_scale = torch.as_tensor(payload.get("band_scale", torch.ones(16))).detach().cpu().float().flatten()
+        if physical_scale.shape != (16,) or not physical_scale.isfinite().all() or (physical_scale <= 0).any():
+            raise ValueError("MLS bank band_scale must contain 16 positive finite physical scales")
+        self.register_buffer("physical_scale", physical_scale)
+        fit_target = residuals * physical_scale if self.geometry_mode == "paired_curved" else residuals
+        limit = int(settings.get("max_fit_sites_per_fold", 65536))
+        if limit < 1:
+            raise ValueError("max_fit_sites_per_fold must be positive")
+        chunks, avgs, scales, self.offsets = {}, [], [], [0]
+        self.fit_sites_per_fold = []
+        for fold in range(nf):
+            gen = torch.Generator().manual_seed(seed+fold)
+            rows = (row_fold != fold).nonzero()[:, 0]
+            if len(rows) > limit:
+                rows = rows[torch.randperm(len(rows), generator=gen)[:limit]]
+            self.fit_sites_per_fold.append(len(rows))
+            avg,scale,fit = _fit_charts(source[rows],fit_target[rows],settings,self.dim,gen,source_weights)
+            self.offsets.append(self.offsets[-1]+len(fit["centers"]))
+            for key,value in fit.items():
+                chunks.setdefault(key,[]).append(value)
+            avgs.append(avg)
+            scales.append(scale)
+        for key,parts in chunks.items():
+            self.register_buffer(key,torch.cat(parts))
+        self.register_buffer("query_mean",torch.stack(avgs))
+        self.register_buffer("query_std",torch.stack(scales))
+        self.eval().requires_grad_(False)
+
+    def reconstruction_loss(self, prediction, target, case_ids, band_scale, base_coefficients=None):
+        """Target-anchored curved normal discrepancy in physical Haar MSE units.
+
+        For chart decoder g, this measures ||(p-y)-(g(q_p)-g(q_y))||^2 / 16.
+        Coordinates are Euclidean projections onto the *physical* PCA basis.
+        Both decodes are bounded to the fitted coordinate domain. The target
+        anchor cancels chart approximation bias exactly at p=y, while the
+        predicted coordinates retain gradients through the quadratic decoder.
+        The companion image/endpoint MSE supplies tangential supervision.
+        """
+        if self.geometry_mode != "paired_curved":
+            raise ValueError("reconstruction_loss requires geometry_mode='paired_curved'")
+        if (prediction.shape != target.shape or prediction.ndim < 3 or prediction.shape[1] != 16
+                or not len(prediction) or len(case_ids) != len(prediction)
+                or any(case not in self.folds for case in case_ids)):
+            raise ValueError("MLS reconstruction needs matching predictions and identified TRAIN targets")
+        if self.use_paired_base and (base_coefficients is None or base_coefficients.shape != target.shape):
+            raise ValueError("MLS reconstruction requires paired base_coefficients matching the residual grid")
+        # Model whitening adds epsilon. Callers pass that exact physical scale,
+        # or ones when whitening is disabled. The residual mean cancels in all
+        # differences, so it need not enter this metric or the fitted charts.
+        scale = torch.as_tensor(band_scale, device=prediction.device, dtype=torch.float32).detach().flatten()
+        if (scale.shape != (16,) or not torch.isfinite(scale).all() or (scale <= 0).any()
+                or not torch.allclose(scale, self.physical_scale, rtol=1.e-5, atol=1.e-9)):
+            raise ValueError("MLS physical band_scale differs from the fitted TRAIN bank")
+        budget = int(self.settings.get("loss_sites_per_patch",256))
+        chunk = int(self.settings.get("query_chunk",2048))
+        coordinate_limit = float(self.settings.get("coordinate_limit",3.))
+        if min(budget, chunk) < 1 or not np.isfinite(coordinate_limit) or coordinate_limit <= 0:
+            raise ValueError("Positive MLS query budgets and coordinate_limit required")
+        totals = []
+        # Keep chart algebra in float32 under AMP: tiny physical coefficients
+        # and their quadratic discrepancies otherwise underflow in float16.
+        with torch.autocast(device_type=prediction.device.type, enabled=False):
+            for b,case in enumerate(case_ids):
+                truth = _sites(target[b:b+1]).detach().float()
+                pred = _sites(prediction[b:b+1]).float()
+                base = (_sites(base_coefficients[b:b+1]).detach().float() if self.use_paired_base else None)
+                sites = (torch.arange(len(truth),device=truth.device) if budget >= len(truth)
+                         else torch.randperm(len(truth),device=truth.device)[:budget])
+                for indices in sites.split(chunk):
+                    with torch.no_grad():
+                        fold = self.folds[case]
+                        lo,hi = self.offsets[fold:fold+2]
+                        x = truth[indices]
+                        descriptor = torch.cat((x,base[indices]),-1) if base is not None else x
+                        query = (descriptor-self.query_mean[fold])/self.query_std[fold]
+                        distance, selected = torch.cdist(query,self.centers[lo:hi]).min(1)
+                        selected = selected+lo
+                        trust = (1+(distance/self.radius[selected,0]).square()).reciprocal()
+                        support = self.pca_supported[selected]*trust
+                        origin, basis = self.mean[selected], self.basis[selected]
+                        bandwidth = self.bandwidth[selected]
+                        lower = self.domain_lo[selected].clamp(-coordinate_limit, coordinate_limit)
+                        upper = self.domain_hi[selected].clamp(-coordinate_limit, coordinate_limit)
+                        x = x*scale
+                        q_target = ((x-origin).unsqueeze(-2) @ basis).squeeze(-2)/bandwidth
+                        decoded_target, _ = self._decode(selected,q_target.clamp(lower,upper))
+                    physical_pred = pred[indices]*scale
+                    q_pred = ((physical_pred-origin).unsqueeze(-2) @ basis).squeeze(-2)/bandwidth
+                    decoded_pred, _ = self._decode(selected,q_pred.clamp(lower,upper))
+                    defect = (physical_pred-x)-(decoded_pred-decoded_target)
+                    totals.append(defect.square().mean(-1)*support)
+        return torch.cat(totals).mean()
+
+    def normal_loss(self,prediction,target,case_ids):
+        from .atlas_geometry import normal_residual_energy
+
+        if self.geometry_mode != "normal":
+            raise ValueError("Paired curved MLS uses reconstruction_loss with physical scales and paired base coefficients")
+        if prediction.shape != target.shape or len(case_ids) != len(prediction) or any(c not in self.folds for c in case_ids):
+            raise ValueError("MLS normal loss needs matching predictions and identified TRAIN targets")
+        totals = []
+        budget = int(self.settings.get("loss_sites_per_patch",256))
+        chunk = int(self.settings.get("query_chunk",2048))
+        if min(budget,chunk) < 1:
+            raise ValueError("Positive MLS regularizer query budgets required")
+        for b,case in enumerate(case_ids):
+            truth = _sites(target[b:b+1]).detach()
+            pred = _sites(prediction[b:b+1])
+            sites = torch.randperm(len(truth),device=truth.device)[:budget]
+            for indices in sites.split(chunk):
+                with torch.no_grad():
+                    fold = self.folds[case]
+                    lo,hi = self.offsets[fold:fold+2]
+                    x = truth[indices]
+                    query = (x-self.query_mean[fold])/self.query_std[fold]
+                    selected = torch.cdist(query,self.centers[lo:hi]).argmin(1)+lo
+                    qn = ((x-self.mean[selected]).unsqueeze(-2) @ self.basis[selected]).squeeze(-2)
+                    qn = (qn/self.bandwidth[selected]).clamp(-3,3)
+                    _,jacobian = self._decode(selected,qn)
+                    tangent = torch.linalg.qr(jacobian,mode="reduced").Q
+                    supported = self.pca_supported[selected]
+                totals.append(normal_residual_energy(pred[indices]-x,tangent)*supported)
+        return torch.cat(totals).mean()
 
 
 def bank_provenance(path, identity, settings):

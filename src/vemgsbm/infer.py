@@ -12,7 +12,7 @@ import torch.nn.functional as functional
 
 from .bridge import reconstruct
 from .data import load_volume
-from .runtime import atomic_save, build_models, fingerprint, load_checkpoint, setup
+from .runtime import atomic_save, build_models, fingerprint, load_checkpoint, setup, sampling_noise
 
 
 def tile_starts(length, patch, stride, alignment=1):
@@ -100,7 +100,7 @@ def infer_volume(checkpoint_path, input_path, output_path, device_name="auto", s
                     base, mask = make_tile(lr, start, patch, scale)
                     prediction = reconstruct(model, base.to(device), mask.to(device), cfg["mode"],
                                              geometry=geometry, steps=steps or cfg["sampling"]["steps"],
-                                             sigma=cfg["sampling"]["sigma"], generator=generator)
+                                             sigma=sampling_noise(cfg), generator=generator)
                     array = prediction[0, 0].clamp(0, 1).cpu().numpy()
                     valid_shape = tuple(min(p, length - offset) for p, length, offset in zip(patch, shape, start))
                     region = tuple(slice(offset, offset + size) for offset, size in zip(start, valid_shape))

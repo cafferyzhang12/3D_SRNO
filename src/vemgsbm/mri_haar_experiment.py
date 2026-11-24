@@ -72,6 +72,8 @@ def overfit(config_path, inventory, directory, steps, device_name):
         ctx.main_call(lambda: directory.mkdir(parents=True, exist_ok=True))
         train, val, _, ids = training_data(cfg, inventory)
         model = make_haar_model(cfg).to(device)
+        if cfg.get("predict_target") == "x1" and cfg.get("use_band_whitening",True):
+            model.set_band_statistics(load_checkpoint(project_path(cfg["band_stats_cache"])))
         atlas = None
         if cfg.get("spatial_atlas"):
             from .spatial_atlas import load_spatial_atlas

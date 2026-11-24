@@ -25,6 +25,7 @@ from .mri_metrics import mean_xy_ssim
 from .network import DriftNetwork, integrate
 from .paths import optimize_path, sample_path
 from .haar_residual import HAAR_MODES, HaarObjective, make_haar_model
+from .training_state import ModelEMA, warmup_cosine
 from .runtime import (read_config, project_path, setup, atomic_save, load_checkpoint,
                       sampling_geometry_guidance, sampling_noise)
 
@@ -123,6 +124,10 @@ def _whole_case_validation(model, cases, cfg, context, run_dir, epoch, atlas=Non
                "val_mean_slice_ssim": ssim, "val_pixel_count": pixels, "val_case_count": len(records)}
     edge_voxels = sum(row["edge_voxels"] for row in records)
     metrics["val_edge_mse"] = (sum(row["edge_sse"] for row in records) / edge_voxels if edge_voxels else None)
+    band_count = sum(row.get("haar_band_count",0) for row in records)
+    if band_count:
+        metrics["val_haar_band_mse"] = [sum(row["haar_band_sse"][i] for row in records)/band_count for i in range(16)]
+        metrics["val_haar_high_frequency_mse"] = sum(metrics["val_haar_band_mse"][1:])/15
     context.main_call(lambda: atomic_save({"cases": records, **metrics},
                                           run_dir / "whole_val" / f"epoch_{epoch:04}.json", json_file=True))
     return metrics
@@ -176,6 +181,7 @@ def _publish_epoch_history(run_dir, records):
 def run_training(config_path, stage="bridge", device_name="auto", resume=None, case_inventory=None):
     cfg = read_config(config_path)
     haar = cfg["mode"] in HAAR_MODES
+    x1 = cfg.get("predict_target") == "x1"
     if haar and (stage != "bridge" or cfg.get("atlas")):
         raise ValueError("Train native LR residual models with stage=bridge and no legacy atlas")
     atlas_options = cfg.get("atlas")
@@ -252,6 +258,36 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
         old = load_checkpoint(project_path(resume)) if resume else None
         if haar:
             model = make_haar_model(cfg).to(device)
+            if x1 and cfg.get("use_band_whitening",True):
+                from .haar_stats import ensure_haar_statistics
+                if old is not None:
+                    band_stats = old["band_statistics"]
+                else:
+                    band_stats = context.main_call(lambda: ensure_haar_statistics(
+                        train_set.all_cases, project_path(cfg["band_stats_cache"]), device=device),
+                        broadcast_result=True)
+                model.set_band_statistics(band_stats)
+            else:
+                band_stats = None
+            teacher = None
+            if x1 and cfg.get("mls_reg_weight",0.):
+                from .spatial_atlas import TrainingMLSAtlas, prepare_training_mls
+                mls_payload = (old["training_mls"] if old else context.main_call(
+                    lambda: prepare_training_mls(train_set,model,cfg["mls_regularizer"]),broadcast_result=True))
+                metric = TrainingMLSAtlas(mls_payload,cfg["mls_regularizer"]).to(device).eval()
+            if x1 and cfg.get("straightening"):
+                from .runtime import build_models
+                saved_teacher = load_checkpoint(project_path(cfg["straightening"]["teacher_checkpoint"]))
+                if saved_teacher["data_identity"] != identity:
+                    raise ValueError("Straightening teacher must use the same data identity")
+                teacher, _ = build_models(saved_teacher,device)
+                if getattr(teacher,"predict_target",None) != "x1":
+                    raise ValueError("Straightening requires an x1 teacher")
+                if teacher.sigma_0 != model.sigma_0 or teacher.use_band_whitening != model.use_band_whitening:
+                    raise ValueError("Straightening requires the teacher prior and whitening convention")
+                if any(not torch.equal(getattr(teacher,key),getattr(model,key)) for key in ("band_mean","band_std")):
+                    raise ValueError("Straightening requires identical teacher/student whitening")
+                teacher.eval().requires_grad_(False)
             if cfg.get("spatial_atlas"):
                 from .spatial_atlas import load_spatial_atlas
 
@@ -264,7 +300,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     spatial_payload = load_checkpoint(bank_path)["payload"]
                 metric = load_spatial_atlas(spatial_payload, cfg["spatial_atlas"]).to(device).requires_grad_(False)
                 metric.eval()
-            objective = HaarObjective(model, cfg, metric)
+            objective = HaarObjective(model, cfg, metric, teacher)
         elif stage == "representation":
             objective = RepresentationObjective(encoder)
         else:
@@ -285,6 +321,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                                           cfg["path"].get("geometry_ramp_power", 0.0))
         parameters = [p for p in objective.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(parameters, lr=cfg["train"]["learning_rate"], weight_decay=1e-5)
+        scheduler = warmup_cosine(optimizer,cfg["train"],len(loader)) if x1 else None
+        ema = ModelEMA(model,cfg["train"].get("ema_decay",.999)) if x1 else None
         start, best, stale_epochs = 0, float("inf"), 0
         history = []
         if resume:
@@ -305,6 +343,10 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     raise ValueError("Resume requires the original MRI atlas and LR chart routing")
             (encoder if stage == "representation" else model).load_state_dict(old["model"])
             optimizer.load_state_dict(old["optimizer"])
+            if scheduler is not None:
+                scheduler.load_state_dict(old["scheduler"])
+                ema.model.load_state_dict(old["ema_model"])
+                ema.updates = old["ema_updates"]
             start, best = old["epoch"], old["best"]
             stale_epochs = old.get("stale_epochs", 0)
             if haar:
@@ -322,7 +364,9 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             print(json.dumps({"stage": stage, "world_size": context.world_size,
                               "per_rank_batch": cfg["train"]["batch_size"],
                               "global_patches": len(train_set), "method": cfg["mode"] if haar else "paired conditional variational GSBM",
-                              "geometry": (cfg.get("spatial_atlas", {}).get("method", "none") if haar else
+                              "geometry": ((cfg.get("mls_regularizer",{}).get("geometry_mode","training_mls")
+                                            if x1 and cfg.get("mls_reg_weight",0.) else
+                                            cfg.get("spatial_atlas", {}).get("method", "none")) if haar else
                                            ("source_conditioned_mls" if source_routing else ("mls" if atlas_options else "land"))),
                               "atlas": atlas_payload["diagnostics"] if atlas_payload else None}), flush=True)
         for epoch in range(start, cfg["train"]["epochs"]):
@@ -336,7 +380,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             if sampler:
                 sampler.set_epoch(epoch)
             objective.train()
-            if spatial_payload is not None:
+            if spatial_payload is not None or (x1 and cfg.get("mls_reg_weight",0.)):
                 metric.eval()
             totals = {}
             count = 0
@@ -380,8 +424,13 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     error = f"Forward: {type(exc).__name__}: {exc}"
                 context.check_errors(error)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
+                grad_norm = torch.nn.utils.clip_grad_norm_(parameters, cfg["train"].get("clip_grad_norm",1.0),
+                                                          error_if_nonfinite=True)
                 optimizer.step()
+                if ema is not None:
+                    ema.update(model)
+                    scheduler.step()
+                    terms["grad_norm"] = grad_norm.detach()
                 for key, value in terms.items():
                     totals[key] = totals.get(key, 0.0) + float(value.detach()) * len(hr)
                 for key, value in path_diagnostics.items():
@@ -391,6 +440,10 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 interval = cfg["train"].get("report_every_updates", 16 if haar else 0)
                 if interval and (iteration == 0 or (iteration + 1) % interval == 0):
                     names = [k for k in ("loss", "endpoint_pixel_mse", "rollout_pixel_mse",
+                                         "coefficient_loss", "mls_normal_loss", "grad_norm",
+                                         "start_pixel_mse", "start_hf_mse", "start_edge_mse",
+                                         "start_mls_reconstruction_mse", "rollout_hf_mse",
+                                         "rollout_edge_mse", "rollout_mls_reconstruction_mse",
                                          "forward_endpoint_equivalent_mse", "reverse_endpoint_equivalent_mse")
                              if k in totals]
                     values = context.sum([count - reported_count] +
@@ -416,6 +469,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     mse = record.get("rollout_pixel_mse", record["endpoint_pixel_mse"])
                     record["train_patch_recon_psnr_db"] = -10 * math.log10(mse) if mse > 0 else None
             raw_objective.eval()
+            eval_model = ema.model if ema is not None else model
             total, unguided_total, guidance_delta, items, error = 0.0, 0.0, 0.0, 0, None
             ssim_total, unguided_ssim_total, atlas_total, unguided_atlas_total = 0.0, 0.0, 0.0, 0.0
             try:
@@ -428,8 +482,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     for batch in val_loader:
                         hr, base, mask = (batch[k].to(device) for k in ("hr", "base", "mask"))
                         if haar:
-                            prediction = model.restore(batch["lr"].to(device), base, cfg["sampling"]["steps"],
-                                                       inference_sigma, atlas=metric).clamp(0, 1)
+                            prediction = eval_model.restore(batch["lr"].to(device), base, cfg["sampling"]["steps"],
+                                                       inference_sigma, atlas=None if x1 else metric).clamp(0, 1)
                             value = (prediction - hr).square().mean()
                         elif stage == "representation":
                             value = representation_loss(encoder, hr)["loss"]
@@ -475,8 +529,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             validation = total / items
             score = 1 - ssim_total / items if stage == "bridge" and selection_metric == "ssim" else validation
             if selection_metric == "pooled_psnr":
-                whole_metrics = _whole_case_validation(model, val_set.all_cases, cfg, context, run_dir, epoch + 1,
-                                                      atlas=metric)
+                whole_metrics = _whole_case_validation(eval_model, val_set.all_cases, cfg, context, run_dir, epoch + 1,
+                                                      atlas=None if x1 else metric)
                 record.update(whole_metrics)
                 score = whole_metrics["val_pooled_mse"]
             improved = score < best
@@ -484,6 +538,9 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
             best = min(best, score)
             record.update(validation=validation, validation_items=int(items), selection_score=score,
                           selection_metric=selection_metric if stage == "bridge" else "representation_loss")
+            if x1:
+                record.update(learning_rate=optimizer.param_groups[0]["lr"],ema_updates=ema.updates,
+                              peak_cuda_memory_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0)
             if stage == "bridge":
                 record["validation_inference_sigma"] = inference_sigma
             if measure_ssim:
@@ -519,7 +576,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 payload = metric_payload(metric)
 
             def save():
-                checkpoint = {"format_version": 4 if spatial_payload is not None else (3 if haar else 2),
+                checkpoint = {"format_version": 5 if x1 else (4 if spatial_payload is not None else (3 if haar else 2)),
                               "algorithm": cfg["mode"] if haar else "paired_conditional_variational_gsbm",
                               "stage": "representation" if stage == "representation" else "reconstruction",
                               "training_stage": stage, "config": cfg, "epoch": epoch + 1,
@@ -529,12 +586,20 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                               "metric": payload, "stale_epochs": stale_epochs}
                 if spatial_payload is not None:
                     checkpoint["spatial_atlas"] = spatial_payload
+                if x1:
+                    checkpoint.update(ema_model=ema.model.state_dict(),ema_updates=ema.updates,
+                                      evaluation_weights="ema",scheduler=scheduler.state_dict(),
+                                      band_statistics=band_stats)
+                    if cfg.get("mls_reg_weight",0.):
+                        checkpoint["training_mls"] = mls_payload
                 if haar:
                     history.append(record)
                     checkpoint["epoch_history"] = history
                 if improved:
                     atomic_save(checkpoint, run_dir / "best.pt")
                 atomic_save(checkpoint, run_dir / "last.pt")
+                if x1 and epoch+1 in cfg["train"].get("checkpoint_epochs",[15,24,40]):
+                    atomic_save(checkpoint, run_dir / f"epoch_{epoch+1:04}.pt")
                 if haar:
                     _publish_epoch_history(run_dir, history)
                 else:

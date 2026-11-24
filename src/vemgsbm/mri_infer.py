@@ -131,6 +131,9 @@ def case_metrics(prediction, case):
         raise ValueError("Prediction must cover every retained HQ slice exactly once")
     records, squared_error, pixel_count = [], 0.0, 0
     regional = _region_totals()
+    band_sse, band_count = np.zeros(16,dtype=np.float64), 0
+    from .momentum.model import HaarXY
+    band_codec = HaarXY().double()
     previous_error = None
     for z, (stem, original_index, reference_path) in enumerate(zip(case.stems, case.indices, case.hq)):
         reference = read_plane(
@@ -144,6 +147,10 @@ def case_metrics(prediction, case):
         if not np.isfinite(pred).all() or pred.min() < 0 or pred.max() > 1:
             raise ValueError("Metric inputs must be normalized finite values in [0, 1]")
         residual = pred - reference
+        if reference.shape[0] % 4 == 0 and reference.shape[1] % 4 == 0:
+            bands = band_codec.encode(torch.from_numpy(residual.copy())[None,None,None])
+            band_sse += bands.square().sum((0,2,3,4)).numpy()
+            band_count += bands.shape[-2]*bands.shape[-1]
         error = np.square(residual)
         foreground = reference > float(np.float32(2 / 255))
         regional["foreground_voxels"] += int(foreground.sum())
@@ -179,6 +186,7 @@ def case_metrics(prediction, case):
         "perfect_match": mse == 0,
         "mean_slice_ssim": float(np.mean(ssim_values)) if ssim_values else None,
         "ssim_slice_count": len(ssim_values), "slices": records,
+        "haar_band_sse": band_sse.tolist(), "haar_band_count": band_count,
         **regional, **_regional_metrics(regional),
     }
 
@@ -243,9 +251,24 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
                 options = {}
                 if native:
                     options["native_lr"] = native[0]
+                if config["mode"] == "haar_bridge" and config["sampling"].get("sampler_type"):
+                    options.update(sampler_type=config["sampling"]["sampler_type"],
+                                   solver=config["sampling"].get("solver", "euler"))
                 if momentum_guidance is not None:
                     options["momentum_guidance"] = momentum_guidance
-                if len(group) > 1 and config["mode"] == "haar_bridge" and steps > 1 and sigma:
+                if config.get("predict_target") == "x1":
+                    # Tile-major draws preserve X0 and SDE streams across tile_batch values.
+                    initials, by_tile = [], []
+                    noise_shape = (1,16,*native[0].shape[2:])
+                    for _ in group:
+                        initials.append(config.get("sigma_0",.03)*torch.randn(
+                            noise_shape,dtype=bases.dtype,device=device,generator=generator))
+                        by_tile.append([torch.randn(noise_shape,dtype=bases.dtype,device=device,generator=generator)
+                                        for _ in range(steps-1)] if sigma else [])
+                    options["initial_state"] = torch.cat(initials)
+                    if sigma and steps > 1:
+                        options["noise_steps"] = [torch.cat(step) for step in zip(*by_tile,strict=True)]
+                elif len(group) > 1 and config["mode"] == "haar_bridge" and steps > 1 and sigma:
                     # Draw in the historical tile-major order, with identical tensor sizes.
                     # CUDA Philox offsets depend on the shape of each individual draw.
                     noise_shape = (1, 16, *native[0].shape[2:])
@@ -442,6 +465,11 @@ def _collect_summary(staged, cases, checkpoint_hash, exported_case_ids=None, *, 
                        mean_slice_ssim=ssim_sum / ssim_count if ssim_count else None)
         regional = {key: sum(row[key] for row in available_metrics) for key in _region_totals()}
         summary.update(regional, **_regional_metrics(regional), metric_protocol=METRIC_PROTOCOL)
+        band_count = sum(row.get("haar_band_count",0) for row in available_metrics)
+        if band_count:
+            band_sse = np.sum([row["haar_band_sse"] for row in available_metrics],axis=0)
+            summary["haar_band_mse"] = (band_sse/band_count).tolist()
+            summary["haar_high_frequency_mse"] = float(band_sse[1:].sum()/(15*band_count))
     return summary
 
 
@@ -514,7 +542,7 @@ def infer_mri(
     channel_policy="identical_rgb_to_gray", save_volume_limit=None, test_fraction=None, subset_seed=20261110,
     inference_variant="legacy", subset_manifest=None, case_inventory=None, split=None, predictor="model",
     drift_sampler=None, inference_sigma=None, disable_guidance=False, readout=None, resume_cases=False,
-    archive_confirmation=None,
+    archive_confirmation=None, sampler_type=None, solver=None,
 ):
     """Publish all cases atomically; torchrun assigns each case to exactly one rank.
 
@@ -578,11 +606,24 @@ def infer_mri(
         checkpoint = load_checkpoint(checkpoint_path)
         config = _validate_mri_checkpoint(checkpoint)
         sampling = dict(config["sampling"])
+        selected_sampler = sampler_type or sampling.get("sampler_type", config.get("infer_sampler"))
+        if selected_sampler is not None:
+            if config["mode"] != "haar_bridge" or selected_sampler not in {"ode", "sde"}:
+                raise ValueError("sampler_type requires a Haar bridge and ode or sde")
+            sampling["sampler_type"] = selected_sampler
+            sampling["inference_sigma"] = (0.0 if selected_sampler == "ode" else
+                                           config.get("sigma_bridge", config["path"]["sigma"]))
+        if solver is not None:
+            if selected_sampler is None or solver not in {"euler", "heun"}:
+                raise ValueError("solver requires an explicit Haar sampler")
+            sampling["solver"] = solver
         if readout is not None:
             if config["mode"] != "haar_bridge" or readout not in {"integral", "endpoint"}:
                 raise ValueError("Readout override requires a Haar residual bridge")
             if readout == "endpoint" and config["train"].get("endpoint_weight", 1.) == 0:
                 raise ValueError("Endpoint readout requires endpoint supervision")
+            if config.get("predict_target") == "x1" and readout != "endpoint":
+                raise ValueError("x1 checkpoints only support endpoint readout")
             sampling["readout"] = readout
         if drift_sampler is not None:
             sampling["drift_sampler"] = drift_sampler
@@ -598,6 +639,7 @@ def infer_mri(
         if disable_guidance and config["mode"] not in {"gsbm", "haar_bridge", "haar_direct"}:
             raise ValueError("Online GSBM guidance override requires a supported MRI bridge")
         config = {**config, "sampling": sampling, "inference_variant": inference_variant, "predictor": predictor}
+        sampling_noise(config)  # Reject a mismatched SDE before doing any case work.
         if config["mode"] in {"haar_direct", "haar_bridge"}:
             config["inference_variant"] = "endpoint_safe"
         device = setup(seed, str(context.device), config["train"].get("threads", 4))
@@ -724,6 +766,13 @@ def infer_mri(
             if config["mode"] in {"haar_direct", "haar_bridge"} and predictor == "model":
                 summary["readout"] = config["sampling"].get("readout", "integral")
                 summary["network_calls_per_tile_sample"] = steps if config["mode"] == "haar_bridge" else 1
+                if config.get("predict_target") == "x1" and config["sampling"].get("solver") == "heun":
+                    summary["network_calls_per_tile_sample"] = 2*steps-1
+                summary["sampler_type"] = config["sampling"].get("sampler_type","legacy")
+                summary["solver"] = config["sampling"].get("solver","euler")
+                summary["ode_semantics"] = "noise_free_forward_endpoint_drift"
+                summary["initial_sigma"] = config.get("sigma_0",0.)
+                summary["evaluation_weights"] = "ema" if config.get("predict_target") == "x1" else "model"
             summary["sampling_sigma"] = sampling_noise(config)
             summary.update(_gsbm_sampler_metadata(config, steps))
             summary["reference_sigma"] = config["sampling"]["sigma"]
@@ -776,8 +825,10 @@ def main():
     parser.add_argument("--output-root", required=True, help="New directory for per-case volumes and metadata")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--steps", type=int)
-    parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--steps", "--num-steps", type=int)
+    parser.add_argument("--samples", "--num-samples", type=int, default=1)
+    parser.add_argument("--sampler-type", choices=["ode", "sde"])
+    parser.add_argument("--solver", choices=["euler", "heun"])
     parser.add_argument("--case", action="append", dest="case_ids", help="Case ID, repeat to select multiple")
     parser.add_argument("--max-cases", type=int, help="Limit sorted cases for a smoke test")
     parser.add_argument("--save-volume-limit", type=int, help=(
@@ -804,6 +855,7 @@ def main():
     output = infer_mri(
         args.checkpoint, args.root_lq, args.output_root, root_hq=args.root_hq, device_name=args.device,
         seed=args.seed, steps=args.steps, samples=args.samples, case_ids=args.case_ids,
+        sampler_type=args.sampler_type, solver=args.solver,
         max_cases=args.max_cases, scan_cache=args.scan_cache, channel_policy=args.channel_policy,
         save_volume_limit=args.save_volume_limit, test_fraction=args.test_fraction, subset_seed=args.subset_seed,
         inference_variant=args.inference_variant, subset_manifest=args.subset_manifest,

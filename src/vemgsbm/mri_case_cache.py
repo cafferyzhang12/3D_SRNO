@@ -73,7 +73,7 @@ def evaluation_identity(config, cases, subset, exported, checkpoint_hash, root_l
                        "image_bytes_sha256": digest, "exported": case.id in exported})
     src = Path(__file__).parent
     modules = ["mri_infer", "mri_metrics", "mri_data", "infer", "bridge", "models", "network",
-               "runtime", "haar_residual", "atlas_geometry", "metric", "spatial_atlas", "mri_external"]
+               "runtime", "haar_residual", "haar_stats", "atlas_geometry", "metric", "spatial_atlas", "mri_external"]
     sources = [src/(name+".py") for name in modules] + sorted((src/"momentum").glob("*.py"))
     return {"format_version": 1, "checkpoint_sha256": checkpoint_hash,
             "sources": {p.relative_to(src).as_posix(): fingerprint(p) for p in sources if p.is_file()},

@@ -24,6 +24,25 @@ SIDECAR = ".mri_sequence_positions.json"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
+def _haar_statistics(value, mean, std):
+    if value.ndim != 5 or value.shape[1] != 16:
+        raise ValueError("Haar whitening expects (B,16,Z,Y,X)")
+    mean, std = (torch.as_tensor(v, device=value.device, dtype=value.dtype) for v in (mean, std))
+    if mean.numel() != 16 or std.numel() != 16 or not (mean.isfinite().all() and std.isfinite().all()) or (std < 0).any():
+        raise ValueError("Expected 16 finite means and nonnegative standard deviations")
+    return mean.reshape(1,16,1,1,1), std.reshape(1,16,1,1,1)
+
+
+def normalize_haar(residual, mean, std):
+    mean, std = _haar_statistics(residual, mean, std)
+    return (residual - mean) / (std + 1.e-6)
+
+
+def denormalize_haar(residual, mean, std):
+    mean, std = _haar_statistics(residual, mean, std)
+    return residual * (std + 1.e-6) + mean
+
+
 def natural_key(value):
     text = str(value)
     tokens = tuple((1, int(part)) if part.isdigit() else (0, part.casefold())

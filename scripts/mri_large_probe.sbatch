@@ -15,5 +15,5 @@ gsbm_environment
 folder=$(dirname "${MRI_BATCH_FILE:?}")
 mkdir -p "$folder"
 "$GSBM_PYTHON" -m vemgsbm.mri_haar_experiment config --variant bridge --large-paired \
-    --template configs/mri_haar_bridge_x4.yaml --output "$folder/probe.yaml"
+    --template configs/mri_haar_bridge_legacy_x4.yaml --output "$folder/probe.yaml"
 gsbm_torchrun -m vemgsbm.mri_batch_probe "$folder/probe.yaml" "$folder"

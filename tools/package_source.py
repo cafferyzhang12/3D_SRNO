@@ -13,6 +13,8 @@ ROOT_FILES = (
     "configs/mri_x4.yaml", "configs/mri_momentum_x4.yaml",
     "configs/mri_gsbm_mls_x4.yaml", "configs/mri_gsbm_mls_guided_x4.yaml",
     "configs/mri_momentum_mls_x4.yaml", "configs/mri_momentum_tdm_x4.yaml", "reports/mri/summary.json",
+    "configs/mri_haar_direct_x4.yaml", "configs/mri_haar_bridge_x4.yaml", "configs/mri_haar_bridge_legacy_x4.yaml",
+    "configs/mri_haar_sr_mls_x4.yaml",
 )
 TREES = {
     "src/vemgsbm": {".py"},

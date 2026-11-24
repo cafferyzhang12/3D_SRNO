@@ -1,5 +1,27 @@
 mode: haar_bridge
-run_dir: runs/mri/haar_bridge_x4
+run_dir: runs/mri/haar_bridge_x1_x4
+predict_target: x1
+use_band_whitening: true
+band_stats_cache: reports/mri/x1/train_haar_statistics.pt
+sigma_0: 0.03
+sigma_bridge: 0.08
+infer_sampler: ode
+infer_steps: 8
+# Stage 3 first: enable 0.05 only after the core VAL gate has passed.
+mls_reg_weight: 0.0
+mls_regularizer:
+  bank: reports/mri/x1/train_mls_residuals.pt
+  dim: 4
+  folds: 5
+  centers: 128
+  neighbors: 64
+  sites_per_case: 256
+  patches_per_case: 4
+  loss_sites_per_patch: 256
+  query_chunk: 2048
+  ridge: 0.0001
+  condition_limit: 1000000
+  seed: 42
 data:
   kind: paired_mri_png
   degradation: paired_xy
@@ -29,39 +51,56 @@ data:
     test: data/private/scan_test.json
 model:
   widths:
-  - 48
   - 96
-  - 128
+  - 160
+  - 256
+  multiscale_xy: true
 path:
   knots: 5
   iterations: 0
   quadrature: 5
   optimize_std: true
-  sigma: 0.1
+  sigma: 0.08
   state_weight: 0
   metric_weight: 0
   control_weight: 1
 train:
-  epochs: 160
-  batch_size: 4
+  epochs: 40
+  batch_size: 64
   train_samples: 1
   val_samples: 1
-  samples_per_epoch: 4096
-  val_samples_per_epoch: 64
+  samples_per_epoch: 262144
+  val_samples_per_epoch: 256
   learning_rate: 0.0001
-  matching_time_min: 0.02
+  matching_time_min: 0.0001
   workers: 2
   threads: 4
   seed: 42
   validation_seed: 42
   selection_metric: pooled_psnr
-  whole_val_patience: 12
+  minimum_epochs: 40
+  whole_val_patience: 40
   endpoint_weight: 1.0
+  coefficient_loss: charbonnier
+  charbonnier_eps: 0.001
+  coefficient_weight: 1.0
+  pixel_weight: 1.0
+  rollout_weight: 1.0
+  rollout_steps: 3
+  clip_grad_norm: 1.0
+  warmup_epochs: 2
+  schedule_epochs: 40
+  min_lr_ratio: 0.05
+  ema_decay: 0.999
+  checkpoint_epochs: [15, 24, 40]
+  report_every_updates: 32
 sampling:
   tile_batch: 8
-  steps: 20
-  sigma: 0.1
-  inference_sigma: 0.05
+  steps: 8
+  sampler_type: ode
+  solver: euler
+  sigma: 0.08
+  inference_sigma: 0.0
   readout: endpoint
 test:
   fraction: 0.15

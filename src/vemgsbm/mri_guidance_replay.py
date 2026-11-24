@@ -40,6 +40,8 @@ class _ObservedGeometry:
 
 
 def trace_tile(model, base, mask, mode, *, geometry, generator, **options):
+    if getattr(model,"predict_target",None) == "x1":
+        raise ValueError("x1 uses training-only MLS regularization; online guidance replay is legacy-only")
     comparison = torch.Generator(device=base.device)
     comparison.set_state(generator.get_state())
     reference, differences = [], []

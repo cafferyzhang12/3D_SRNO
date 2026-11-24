@@ -14,7 +14,7 @@ source scripts/mri_common.sh
 gsbm_environment
 case "$VARIANT" in
     direct) template=configs/mri_haar_direct_x4.yaml;;
-    *) template=configs/mri_haar_bridge_x4.yaml;;
+    *) template=configs/mri_haar_bridge_legacy_x4.yaml;;
 esac
 run="runs/mri/$RUN_ID"
 mkdir -p "$run"

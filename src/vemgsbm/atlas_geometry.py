@@ -11,6 +11,13 @@ from torch import nn
 from .metric import Representation
 
 
+def normal_residual_energy(error, tangent_basis):
+    """Squared normal error; detached ground-truth geometry only supervises prediction."""
+    basis = tangent_basis.detach()
+    tangent = (basis @ (basis.mT @ error.unsqueeze(-1))).squeeze(-1)
+    return (error-tangent).square().mean(-1)
+
+
 def _routing_options(value):
     if value is False or value is None:
         return None
