@@ -365,6 +365,9 @@ def prepare_training_mls(dataset, model, settings):
     nsites, npatches = int(settings.get("sites_per_case",256)), int(settings.get("patches_per_case",4))
     if min(nsites,npatches) < 1:
         raise ValueError("Positive MLS sampling budgets required")
+    workers = settings.get("bank_workers", 0)
+    if type(workers) is not int or not 0 <= workers <= 8:
+        raise ValueError("bank_workers must be an integer from 0 to 8")
     seed = int(settings.get("seed",42))
     paired = settings.get("geometry_mode", "normal") == "paired_curved"
     identity = {"version":2 if paired else 1,"train":[[c.id,c.fingerprint] for c in dataset.cases],
@@ -385,10 +388,18 @@ def prepare_training_mls(dataset, model, settings):
         generator = torch.Generator().manual_seed(seed)
         records, bases, cases = [], [], []
         device = model.band_mean.device
+        # Dataset crops depend on (seed, epoch, index), and DataLoader yields
+        # them in index order. Worker count therefore cannot change bank rows
+        # or the independent balanced-site generator. Spawn avoids forking an
+        # already initialized CUDA runtime in the prebuild process.
+        loader_options = (dict(prefetch_factor=2, multiprocessing_context="spawn") if workers else {})
+        loader = torch.utils.data.DataLoader(
+            ds, batch_size=None, num_workers=workers,
+            generator=torch.Generator().manual_seed(seed+1729), **loader_options)
         if paired:
-            print(f"TRAIN MLS paired bank: sampling {len(ds)} patches from {len(ds.cases)} cases", flush=True)
-        for idx in range(len(ds)):
-            item = ds[idx]
+            print(f"TRAIN MLS paired bank: sampling {len(ds)} patches from {len(ds.cases)} cases "
+                  f"with {workers} workers", flush=True)
+        for idx, item in enumerate(loader):
             slot = idx % ds.samples_per_volume
             quota = nsites//ds.samples_per_volume + (slot < nsites%ds.samples_per_volume)
             sites = _balanced_sites(item["lr"],quota,generator)

@@ -177,6 +177,33 @@ def test_bank_rejects_nontrain_and_unaligned_pairs():
         _atlas(payload)
 
 
+def test_parallel_bank_workers_preserve_paired_rows_and_provenance(tmp_path):
+    from test_training import _write_case
+    from vemgsbm.haar_residual import X1HaarResidualNetwork
+    from vemgsbm.mri_data import PairedMRIPatchDataset
+
+    root = tmp_path/"train"
+    for index in range(2):
+        _write_case(root, f"train_{index}", 13+index*17, size=16, textured=True)
+    dataset = PairedMRIPatchDataset(root/"LQ/X4_png", root/"HQ_png", "train",
+                                    scale=4, patch_size=(3, 8, 8), samples_per_volume=3)
+    model = X1HaarResidualNetwork([4, 6, 8], use_band_whitening=False)
+    options = dict(geometry_mode="paired_curved", seed=72, sites_per_case=20, patches_per_case=3)
+    rng_before = torch.random.get_rng_state().clone()
+    serial = prepare_training_mls(dataset, model, dict(options, bank=str(tmp_path/"serial.pt"), bank_workers=0))
+    parallel = prepare_training_mls(dataset, model, dict(options, bank=str(tmp_path/"parallel.pt"), bank_workers=2))
+    assert torch.equal(rng_before, torch.random.get_rng_state())
+    for key in ("residuals", "base_coefficients", "band_scale", "case_indices"):
+        torch.testing.assert_close(serial[key], parallel[key], rtol=0, atol=0)
+    for key in ("identity", "provenance", "train_case_ids"):
+        assert serial[key] == parallel[key]
+    # Performance settings do not invalidate a previously built identical bank.
+    cached = prepare_training_mls(dataset, model, dict(options, bank=str(tmp_path/"serial.pt"), bank_workers=2))
+    torch.testing.assert_close(cached["residuals"], serial["residuals"], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="bank_workers"):
+        prepare_training_mls(dataset, model, dict(options, bank=str(tmp_path/"invalid.pt"), bank_workers=9))
+
+
 def test_paired_curved_training_bank_checkpoint_and_deployment(tmp_path):
     from test_x1_bridge import x1_config
     from vemgsbm.runtime import build_models, load_checkpoint

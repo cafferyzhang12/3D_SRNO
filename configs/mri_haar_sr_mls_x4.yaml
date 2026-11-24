@@ -20,6 +20,7 @@ mls_regularizer:
   max_fit_sites_per_fold: 65536
   sites_per_case: 256
   patches_per_case: 4
+  bank_workers: 8
   loss_sites_per_patch: 256
   query_chunk: 2048
   ridge: 0.0001

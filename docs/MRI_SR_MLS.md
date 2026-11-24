@@ -18,7 +18,8 @@ The paired curved atlas is fitted exclusively from TRAIN residuals and paired
 baseline Haar coefficients. Five case-disjoint folds prevent a training case
 from fitting the atlas used to score its own reconstruction. Each fold fits at
 most 65,536 sites, 128 centers, and 64 neighbors, with tangent dimension four.
-The bank retains 256 sites from four patches per TRAIN case. MLS is a training
+The bank retains 256 sites from four patches per TRAIN case. Eight ordered data
+workers overlap image reads without changing sampling order or random seeds. MLS is a training
 loss; deployment requires no atlas query or TEST fitting.
 
 Run preparation takes data paths from the historical checkpoint and verifies
