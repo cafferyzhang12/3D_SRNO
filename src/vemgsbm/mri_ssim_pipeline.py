@@ -34,7 +34,7 @@ def prepare(baseline, inventory, bank, run_id, epochs=8):
     cfg['train'].update(warm_start_checkpoint=str(baseline), selection_metric='ssim_psnr_guard',
         epochs=epochs,bridge_epochs=epochs,schedule_epochs=epochs,minimum_epochs=epochs,
         whole_val_patience=epochs,learning_rate=2.e-5,warmup_epochs=1,
-        samples_per_epoch=262144,batch_size=64,rollout_steps=4,checkpoint_epochs=[epochs])
+        samples_per_epoch=262144,batch_size=544,workers=4,rollout_steps=4,checkpoint_epochs=[epochs])
     paths = {}
     for name in VARIANTS:
         candidate = copy.deepcopy(cfg)
@@ -47,7 +47,8 @@ def prepare(baseline, inventory, bank, run_id, epochs=8):
         write_config(paths[name],candidate)
     smoke = copy.deepcopy(candidate)
     smoke['run_dir'] = str(root/'smoke')
-    smoke['train'].update(epochs=1,bridge_epochs=1,samples_per_epoch=1024,minimum_epochs=1,
+    # The bounded smoke retains its 64/rank, eight-rollout-item contract.
+    smoke['train'].update(epochs=1,bridge_epochs=1,batch_size=64,samples_per_epoch=1024,minimum_epochs=1,
                           whole_val_patience=1,checkpoint_epochs=[1])
     write_config(root/'smoke.yaml',smoke)
     atomic_save(dict(baseline=str(baseline),baseline_sha256=fingerprint(baseline),

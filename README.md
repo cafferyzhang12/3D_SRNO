@@ -39,11 +39,18 @@ and `NEURAL_ATLAS_SRC` before submission. Run from the synchronized project root
 Compute, including tests and pretrained feature smoke checks, runs inside Slurm.
 
 All four variants start from the same baseline EMA, use fresh optimizers, 8 epochs,
-262144 patches/epoch, batch 64/GPU, learning rate 2e-5, and four-step deployment:
+262144 patches/epoch, batch 544/GPU (global 2176), four data workers/rank,
+learning rate 2e-5, and four-step deployment:
 control; SSIM weight 0.3; SSIM plus stratified MLS; and the latter plus MLS XY
 neighbor weight 0.1 (inside MLS weight 0.05). SSIM uses the evaluation 7x7 uniform
 window/sample covariance and the existing one-eighth self-rollout budget.
 Neighbor constraints compare target-anchored curved defects, never Z differences.
+
+The 544/rank setting was measured on four 80-GiB A800 GPUs; the running SSIM
+variant occupied about 80% of device memory. This is workload-specific, not an
+OOM guarantee for other hardware. The fixed patch budget gives 121 optimizer
+updates/epoch (including the final partial batch), compared with 1024 at 64/rank.
+The bounded preflight smoke retains batch 64/rank and 1024 total patches.
 
 Whole-VAL PSNR must be at least the re-evaluated frozen baseline, with no dB
 allowance, and SSIM must improve before `best.pt` replaces the baseline fallback.
