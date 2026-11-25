@@ -109,3 +109,11 @@ bash scripts/submit_mri_v2_ablation.sh
 ```
 
 提交链：四卡gate→exp1四卡train→VAL→exp2→VAL→exp3→VAL→exp4→VAL；全部high QOS，fundiff，A800分区，afterok依赖，登录节点仅同步/提交。固定TEST不提交。实际作业号及同步commit见提交记录。
+
+## 实际部署与提交回执
+
+代码提交 `d75ec93` 已推送 GitHub main；source.tar.gz SHA256 `8e95697cba7f7125ca97698f1c6afd268898df684a6665411fd3fe6859388a9e` 本地与集群一致。部署 `/gpfs/share/home/t2504041104/3D_SRNO_4/jetatlas_freq_v2_20261125`。neural_atlas 使用本机基线通过的源码快照，避免其他工程改动影响本任务。
+
+北京时间2026-11-25 20:05核验：gate **5345082** 已在 **gpua800n24** 运行；4×A800、high QOS、fundiff。训练/VAL依赖任务依次为：exp1 **5345083/5345084**，exp2 **5345085/5345086**，exp3 **5345087/5345088**，exp4 **5345089/5345090**。九个任务全部实际核验为high、gres:gpu:4。原始回执v2_cluster_jobs.tsv，结构化记录v2_cluster_submission.json。
+
+当前只证明提交与gate启动，正式GPU显存、真实VAL天花板、训练改善和最终SSIM仍等待任务产出。依赖afterok会在预检失败时阻止重训练。按用户要求不持续监督长训练。

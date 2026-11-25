@@ -1,0 +1,27 @@
+{
+  "code_commit": "d75ec93dcf544cf839065fe15ad467a3b70f45aa",
+  "github_branch": "main",
+  "remote_project": "/gpfs/share/home/t2504041104/3D_SRNO_4/jetatlas_freq_v2_20261125",
+  "source_archive_sha256": "8e95697cba7f7125ca97698f1c6afd268898df684a6665411fd3fe6859388a9e",
+  "qos": "high",
+  "gpus_per_job": 4,
+  "environment": "fundiff",
+  "gate": {
+    "job_id": 5345082,
+    "observed_state": "RUNNING",
+    "node": "gpua800n24"
+  },
+  "jobs": {
+    "exp1_train": 5345083,
+    "exp1_val": 5345084,
+    "exp2_train": 5345085,
+    "exp2_val": 5345086,
+    "exp3_train": 5345087,
+    "exp3_val": 5345088,
+    "exp4_train": 5345089,
+    "exp4_val": 5345090
+  },
+  "test_submitted": false,
+  "observation_local": "2026-11-25 20:05 Asia/Shanghai",
+  "training_effectiveness_unverified": true
+}
