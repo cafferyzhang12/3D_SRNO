@@ -1,0 +1,122 @@
+{
+  "source": "synthetic verification",
+  "test_used": false,
+  "physical_ceiling_identified": false,
+  "baselines": {
+    "bicubic": {
+      "psnr": 24.63488015539277,
+      "ssim": 0.7772217658910843,
+      "local_variance_ratio": 0.5065199595216134,
+      "lpips": 0.22389216472705206,
+      "fid": 164.79341572816818,
+      "slice_count": 6,
+      "pixel_count": 24576
+    },
+    "lanczos": {
+      "psnr": 24.869055798347123,
+      "ssim": 0.7975846343651863,
+      "local_variance_ratio": 0.5243582707215735,
+      "lpips": 0.22711575031280518,
+      "fid": 142.11790064409178,
+      "slice_count": 6,
+      "pixel_count": 24576
+    }
+  },
+  "cases": [
+    {
+      "case_id": "synthetic_mri",
+      "noise": {
+        "background_sigma": 0.0013517077313736081,
+        "homogeneous_sigma": 0.011185773648321629,
+        "background_windows": 3246,
+        "homogeneous_windows": 4235,
+        "additive_noise_oracle_ssim_estimate": 0.968483030796051,
+        "physical_upper_bound_identified": false,
+        "assumptions": "Single-image iid additive noise approximation; not a physical SSIM bound"
+      },
+      "baselines": {
+        "bicubic": {
+          "psnr": 24.63488015539277,
+          "ssim": 0.7772217658910843,
+          "local_variance_ratio": 0.5065199595216134,
+          "textured_region_ssim": 0.7830990575705734,
+          "lpips": 0.22389216472705206
+        },
+        "lanczos": {
+          "psnr": 24.869055798347123,
+          "ssim": 0.7975846343651865,
+          "local_variance_ratio": 0.5243582707215735,
+          "textured_region_ssim": 0.8150903051452113,
+          "lpips": 0.22711575031280518
+        }
+      }
+    }
+  ],
+  "v2_loss_gradient_probe": {
+    "wrt": "prediction intensities",
+    "source": "synthetic",
+    "terms": {
+      "charbonnier": 0.03097814880311489,
+      "ssim": 0.21852805096964145,
+      "msssim": 0.0418628454208374,
+      "fft_log": 0.03848172724246979,
+      "fft_complex": 0.04416290298104286,
+      "local_std": 0.028318090364336967,
+      "lpips": 0.0,
+      "loss": 0.11181123887118169
+    },
+    "gradients": {
+      "charbonnier": {
+        "raw_norm": 0.009892309902995413,
+        "weighted_norm": 0.009892309902995413,
+        "norm_share": 0.1868864056528699
+      },
+      "ssim": {
+        "raw_norm": 0.12118806630974306,
+        "weighted_norm": 0.03635641989292292,
+        "norm_share": 0.6868487444107938
+      },
+      "msssim": {
+        "raw_norm": 0.0364903643226538,
+        "weighted_norm": 0.0036490364322653798,
+        "norm_share": 0.06893792345870112
+      },
+      "fft_log": {
+        "raw_norm": 0.011024012207995013,
+        "weighted_norm": 0.00011024012207995014,
+        "norm_share": 0.0020826662706975056
+      },
+      "fft_complex": {
+        "raw_norm": 0.011204696447393019,
+        "weighted_norm": 0.000560234822369651,
+        "norm_share": 0.010584006496049484
+      },
+      "local_std": {
+        "raw_norm": 0.007879885975139913,
+        "weighted_norm": 0.002363965792541974,
+        "norm_share": 0.04466025371088824
+      },
+      "lpips": {
+        "raw_norm": 0.0,
+        "weighted_norm": 0.0,
+        "norm_share": 0.0
+      }
+    }
+  },
+  "legacy_gradient_probe": {
+    "status": "unavailable",
+    "reason": "No legacy checkpoint supplied; synthetic gradients are reported separately"
+  },
+  "perceptual_status": "real pretrained models",
+  "perceptual_unavailable_reason": null,
+  "perceptual_protocol": {
+    "version": 1,
+    "lpips": "lpips 0.1.4, alex backbone, calibrated v0.1; grayscale repeated RGB, float32 [-1,1], native XY resolution; equal slice mean",
+    "fid": "torch-fidelity 0.3.0 TensorFlow-compatible InceptionV3 pool3 2048; grayscale repeated RGB; round(255*x) uint8; extractor TensorFlow-compatible bilinear resize to 299x299",
+    "fid_aggregation": "one cohort FID from float64 global feature sums and outer products, unbiased sample covariance (N-1); never mean case/rank FID",
+    "scope": "all retained slices, full field of view, no foreground cropping or per-image intensity normalization",
+    "interpretation": "2D ImageNet metrics on correlated MRI slices; FID is cohort-size dependent and is not a 3D anatomical or clinical metric",
+    "selection": "reporting only; LPIPS/FID never select TEST cases or checkpoints"
+  },
+  "peak_cuda_bytes": null
+}

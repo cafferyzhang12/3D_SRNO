@@ -5,6 +5,7 @@ from collections.abc import Mapping
 import torch
 
 from .network import integrate
+from .frequency_bridge import sample_frequency_bridge, integrate_frequency_bridge
 
 
 def sample_gaussian_bridge(target, sigma_0=.03, sigma_bridge=.08, time=None,

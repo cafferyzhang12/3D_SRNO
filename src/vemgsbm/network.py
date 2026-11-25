@@ -3,6 +3,7 @@ import math
 import torch
 from torch import nn
 from .models import Reconstructor, volume_inputs
+from .hybrid import HybridWaveletNAFNet25D
 
 
 class DriftNetwork(nn.Module):

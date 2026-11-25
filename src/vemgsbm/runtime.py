@@ -23,6 +23,9 @@ def project_path(value):
 def read_config(path):
     with Path(path).open(encoding="utf-8") as stream:
         cfg = yaml.safe_load(stream)
+    from .mri_v2 import is_v2, validate_config
+    if is_v2(cfg):
+        return validate_config(cfg)
     if cfg.get("mode") not in MODES:
         raise ValueError(f"Unsupported mode, expected one of {sorted(MODES)}")
     if cfg.get("predict_target") not in {None,"drift","x1"}:
@@ -148,6 +151,10 @@ def read_config(path):
 def sampling_noise(config):
     """Return the inference noise, with older checkpoints using reference noise."""
     sampling = config["sampling"]
+    from .mri_v2 import is_v2
+    if is_v2(config):
+        return (float(config.get('sigma_bridge',.08))*float(sampling.get('temperature',.1))
+                if sampling.get('sampler_type') == 'sde' else 0.)
     sampler = sampling.get("sampler_type", config.get("infer_sampler"))
     if sampler is not None:
         if sampler not in {"ode", "sde"}:
@@ -226,6 +233,20 @@ def load_checkpoint(path):
 
 def build_models(checkpoint, device):
     cfg = checkpoint["config"]
+    from .mri_v2 import is_v2, make_model
+    if is_v2(cfg):
+        if checkpoint.get('format_version') != 6:
+            raise ValueError('Hybrid MRI v2 requires checkpoint format 6')
+        model = make_model(cfg).to(device)
+        model.set_band_statistics(checkpoint['band_statistics'])
+        model.load_state_dict(checkpoint['ema_model'] if checkpoint.get('evaluation_weights') == 'ema' else checkpoint['model'])
+        geometry = None
+        if cfg.get('online_atlas',False):
+            from .jetatlas import JetAtlasRegularizer
+            geometry = JetAtlasRegularizer.from_payload(checkpoint['jetatlas']).to(device)
+            geometry.load_state_dict(checkpoint['jetatlas_state'])
+            geometry.eval()
+        return model.eval(), geometry
     guidance = sampling_geometry_guidance(cfg)
     geometry = None
     if cfg["mode"] == "external_2d":

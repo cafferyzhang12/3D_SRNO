@@ -1,0 +1,22 @@
+#!/bin/bash
+# Administrative submission only; every computation is in an A800 allocation.
+set -euo pipefail
+: "${RUN_ID:?}" "${MRI_CASE_INVENTORY:?}"
+export GSBM_PROJECT_ROOT="$PWD" MRI_GPUS=4 RUN_ID MRI_CASE_INVENTORY
+source scripts/mri_slurm_dependencies.sh
+mkdir -p reports/slurm reports/mri
+receipt="reports/mri/${RUN_ID}_v2_jobs.tsv"
+(set -o noclobber; : > "$receipt")
+gate=$(mri_slurm_submit "" scripts/mri_v2_gate.sbatch)
+printf 'gate\t%s\n' "$gate" >> "$receipt"
+previous="$gate"
+for V2_ARM in 1 2 3 4; do
+    export V2_ARM
+    train=$(mri_slurm_submit "$previous" scripts/mri_v2_train.sbatch)
+    printf 'exp%s_train\t%s\n' "$V2_ARM" "$train" >> "$receipt"
+    eval_job=$(mri_slurm_submit "$train" scripts/mri_v2_eval.sbatch)
+    printf 'exp%s_val\t%s\n' "$V2_ARM" "$eval_job" >> "$receipt"
+    # Serialize arms so the study uses four A800s rather than sixteen at once.
+    previous="$eval_job"
+done
+cat "$receipt"

@@ -208,13 +208,15 @@ def _validate_mri_checkpoint(checkpoint):
 
 
 @torch.no_grad()
-def _infer_case(case, folder, model, geometry, config, device, seed, steps, samples, *, replay_tile=None):
+def _infer_case(case, folder, model, geometry, config, device, seed, steps, samples, *, replay_tile=None,
+                volume_predictor=None):
     scale = config["data"]["scale"]
     patch = tuple(config.get("external", {}).get("eval_patch_zyx", config["data"]["patch_size"]))
     guidance = sampling_geometry_guidance(config)
     momentum_guidance = sampling_momentum_guidance(config)
     sigma = sampling_noise(config)
-    improved = guidance is not None or config.get("inference_variant") == "endpoint_safe" or config["mode"] == "momentum"
+    improved = (volume_predictor is not None or guidance is not None
+                or config.get("inference_variant") == "endpoint_safe" or config["mode"] == "momentum")
     shape = (len(case.lq), case.lr_shape[0] * scale, case.lr_shape[1] * scale)
     if config.get("external"):
         patch = (1, min(patch[1], shape[1]), min(patch[2], shape[2]))
@@ -225,7 +227,7 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
     variance[:] = 0
     axes = [np.hanning(n + 2)[1:-1].astype("float32") for n in patch]
     window = axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
-    native_input = config["mode"] in {"haar_direct", "haar_bridge", "external_2d"}
+    native_input = volume_predictor is not None or config["mode"] in {"haar_direct", "haar_bridge", "external_2d"}
     def spatial_starts(length, size):
         unit = scale if native_input else 1
         return [i * unit for i in tile_starts(length // unit, size // unit, max(1, size // unit // 2))]
@@ -236,7 +238,8 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
     def reader(index):
         return _read_lq(case, index)
 
-    tile_batch = config.get("sampling", {}).get("tile_batch", 1) if config["mode"] in {"haar_direct", "haar_bridge"} else 1
+    batched = volume_predictor is not None or config["mode"] in {"haar_direct", "haar_bridge"}
+    tile_batch = config.get("sampling", {}).get("tile_batch", 1) if batched else 1
     if type(tile_batch) is not int or tile_batch < 1:
         raise ValueError("tile_batch must be a positive integer")
 
@@ -245,7 +248,11 @@ def _infer_case(case, folder, model, geometry, config, device, seed, steps, samp
             inputs = [make_mri_tile(case, run, start, patch, scale, reader=reader,
                                     with_native_lr=native_input) for start in group]
             bases, masks, *native = [torch.cat(tensors).to(device) for tensors in zip(*inputs, strict=True)]
-            if config.get("predictor") == "bilinear":
+            if volume_predictor is not None:
+                predictions = volume_predictor(native[0], generator)
+                if predictions.shape != bases.shape:
+                    raise ValueError(f"Volumetric predictor produced {predictions.shape}, expected {bases.shape}")
+            elif config.get("predictor") == "bilinear":
                 predictions = bases
             else:
                 options = {}

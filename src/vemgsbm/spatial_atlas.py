@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from .haar_residual import LRConditionEncoder
 from .momentum.model import HaarXY
 from .runtime import atomic_save, fingerprint, load_checkpoint, setup
+from .jetatlas import SCJetAtlas, JetAtlasRegularizer, SoftAtlasRouter
 
 
 def _sites(x):

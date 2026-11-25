@@ -486,6 +486,9 @@ class X1HaarResidualNetwork(HaarResidualNetwork):
 
 
 def make_haar_model(config):
+    from .mri_v2 import is_v2, make_model
+    if is_v2(config):
+        return make_model(config)
     if config.get("predict_target") == "x1":
         return X1HaarResidualNetwork(config["model"]["widths"], config.get("sigma_0",.03),
                     config.get("sigma_bridge",.08), config.get("use_band_whitening",True),

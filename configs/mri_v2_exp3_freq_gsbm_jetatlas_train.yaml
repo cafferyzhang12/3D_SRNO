@@ -1,0 +1,113 @@
+mode: haar_bridge
+predict_target: x1
+data:
+  kind: paired_mri_png
+  degradation: paired_xy
+  scale: 4
+  patch_size:
+  - 7
+  - 256
+  - 256
+  channel_policy: identical_rgb_to_gray
+  scan_workers: 4
+  train:
+    root_lq: data/MRI_SR/train/LQ/X4_png
+    root_hq: data/MRI_SR/train/HQ_png
+  val:
+    root_lq: data/MRI_SR/val_small/LQ/X4_png
+    root_hq: data/MRI_SR/val_small/HQ_png
+  scan_cache:
+    train: reports/mri/gsbm_mls_x4/index_train.json
+    val: reports/mri/gsbm_mls_x4/index_val.json
+  legacy_scan_cache:
+    train: data/private/scan_train.json
+    val: data/private/scan_val.json
+base_interpolation: bicubic
+sigma_0: 0.0
+sigma_bridge: 0.08
+use_band_whitening: true
+model:
+  architecture: HybridWaveletNAFNet25D
+  widths:
+  - 64
+  - 128
+  - 192
+  blocks:
+  - 2
+  - 2
+  - 4
+  window_size: 8
+  heads: 4
+  refine_width: 16
+  gradient_checkpointing: true
+train:
+  epochs: 60
+  batch_size: 32
+  accumulation_steps: 1
+  train_samples: 1
+  val_samples: 1
+  samples_per_epoch: 262144
+  val_samples_per_epoch: 256
+  learning_rate: 0.00025
+  warmup_epochs: 3
+  schedule_epochs: 60
+  min_lr_ratio: 0.02
+  workers: 4
+  threads: 4
+  seed: 42
+  validation_seed: 42
+  selection_metric: ssim_soft_pareto
+  baseline_psnr: 32.552259
+  psnr_tolerance: 0.5
+  clip_grad_norm: 1.0
+  ema_decay: 0.999
+  amp_dtype: bfloat16
+  bridge_weight: 1.0
+  noise_weight: 0.05
+  rollout_fraction: 0.25
+  rollout_weight: 0.25
+  report_every_updates: 32
+loss:
+  charbonnier: 1.0
+  ssim: 0.3
+  msssim: 0.1
+  fft_log: 0.01
+  fft_complex: 0.05
+  local_std: 0.3
+  lpips: 0.0
+  ssim_chunk_slices: 4
+sampling:
+  steps: 8
+  sampler_type: ode
+  solver: heun
+  temperature: 0.1
+  tile_batch: 4
+  sigma: 0.08
+  inference_sigma: 0.0
+path:
+  sigma: 0.08
+perceptual:
+  weights_dir: cache/perceptual/torch
+  batch_size: 8
+jetatlas:
+  folds: 5
+  centers: 512
+  dim: 8
+  pca_dim: 32
+  neighbors: 256
+  normal_rank: 8
+  blend_gamma: 0.5
+  patches_per_case: 1
+  sites_per_case: 64
+  loss_sites_per_patch: 128
+  lambda_normal: 1.0
+  lambda_tangent: 0.05
+  neighbor_weight: 0.1
+  potential_weight: 0.02
+  router_weight: 0.05
+  lr_dim: 1
+inference_variant: endpoint_safe
+run_dir: runs/mri/v2/exp3
+frequency_split: true
+atlas_weight: 0.05
+online_atlas: false

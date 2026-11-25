@@ -1,0 +1,1190 @@
+{
+  "device": "cpu",
+  "torch": "2.13.0+cpu",
+  "synthetic": true,
+  "test_accessed": false,
+  "steps": 20,
+  "memory_note": "CUDA allocator peaks measured on CUDA; CPU has no GPU allocation and reports null",
+  "phantom": "TRAIN synthetic contrast-recovery phantom, LR 3x8x8 to HR 3x32x32",
+  "overrides": {
+    "widths": [
+      4,
+      8,
+      12
+    ],
+    "blocks": [
+      1,
+      1,
+      1
+    ],
+    "heads": 2,
+    "refine_width": 4,
+    "gradient_checkpointing": false,
+    "use_band_whitening": false,
+    "learning_rate": 0.002
+  },
+  "variants": {
+    "exp1": {
+      "curve": [
+        {
+          "psnr": 25.59265900385703,
+          "ssim": 0.9269374245053937,
+          "local_variance_ratio": 0.4444455659594761,
+          "finite": true,
+          "max_abs": 0.7158839702606201,
+          "step": 0,
+          "training_loss": 0.07858008872924477
+        },
+        {
+          "psnr": 25.718386716721838,
+          "ssim": 0.9174666946693861,
+          "local_variance_ratio": 0.48487721204769196,
+          "finite": true,
+          "max_abs": 0.7426034212112427,
+          "step": 1,
+          "training_loss": 0.07982102333238714
+        },
+        {
+          "psnr": 26.0510813215665,
+          "ssim": 0.9354051415973869,
+          "local_variance_ratio": 0.4858504764612411,
+          "finite": true,
+          "max_abs": 0.7374864220619202,
+          "step": 2,
+          "training_loss": 0.07212735611798528
+        },
+        {
+          "psnr": 26.249721230731282,
+          "ssim": 0.9390623555124549,
+          "local_variance_ratio": 0.5127662742387943,
+          "finite": true,
+          "max_abs": 0.7467907667160034,
+          "step": 3,
+          "training_loss": 0.06912145200567536
+        },
+        {
+          "psnr": 26.509455822391242,
+          "ssim": 0.9457797405362686,
+          "local_variance_ratio": 0.5394424655921973,
+          "finite": true,
+          "max_abs": 0.7584303617477417,
+          "step": 4,
+          "training_loss": 0.06494928309477593
+        },
+        {
+          "psnr": 26.883265750882796,
+          "ssim": 0.9536023009841503,
+          "local_variance_ratio": 0.5654683215650813,
+          "finite": true,
+          "max_abs": 0.7647435069084167,
+          "step": 5,
+          "training_loss": 0.06001953601207185
+        },
+        {
+          "psnr": 27.40316864127475,
+          "ssim": 0.9591128433636649,
+          "local_variance_ratio": 0.5930565059964531,
+          "finite": true,
+          "max_abs": 0.7678130269050598,
+          "step": 6,
+          "training_loss": 0.05535580128753712
+        },
+        {
+          "psnr": 28.03083573891037,
+          "ssim": 0.9642485661025136,
+          "local_variance_ratio": 0.622267703920046,
+          "finite": true,
+          "max_abs": 0.7710134983062744,
+          "step": 7,
+          "training_loss": 0.050539108207872586
+        },
+        {
+          "psnr": 28.738726250834713,
+          "ssim": 0.9708697311731848,
+          "local_variance_ratio": 0.6546319096624915,
+          "finite": true,
+          "max_abs": 0.7733584642410278,
+          "step": 8,
+          "training_loss": 0.0451061475147046
+        },
+        {
+          "psnr": 29.525258653596147,
+          "ssim": 0.9771053189681635,
+          "local_variance_ratio": 0.6961054267739969,
+          "finite": true,
+          "max_abs": 0.7773135900497437,
+          "step": 9,
+          "training_loss": 0.03960156801132878
+        },
+        {
+          "psnr": 30.434241813623153,
+          "ssim": 0.9820989205047617,
+          "local_variance_ratio": 0.7496474539917023,
+          "finite": true,
+          "max_abs": 0.7844036817550659,
+          "step": 10,
+          "training_loss": 0.03419530447029243
+        },
+        {
+          "psnr": 31.501593531955358,
+          "ssim": 0.9860462792237624,
+          "local_variance_ratio": 0.8156114563000032,
+          "finite": true,
+          "max_abs": 0.7949954867362976,
+          "step": 11,
+          "training_loss": 0.0288197235543192
+        },
+        {
+          "psnr": 32.65954288750916,
+          "ssim": 0.988882605627662,
+          "local_variance_ratio": 0.893504867734589,
+          "finite": true,
+          "max_abs": 0.8081494569778442,
+          "step": 12,
+          "training_loss": 0.023771250721335624
+        },
+        {
+          "psnr": 33.77884326933191,
+          "ssim": 0.9902612414161446,
+          "local_variance_ratio": 0.9779799162437756,
+          "finite": true,
+          "max_abs": 0.8209617137908936,
+          "step": 13,
+          "training_loss": 0.019856026300581753
+        },
+        {
+          "psnr": 34.35446252509389,
+          "ssim": 0.9902289915135498,
+          "local_variance_ratio": 1.0506722417021332,
+          "finite": true,
+          "max_abs": 0.8258637189865112,
+          "step": 14,
+          "training_loss": 0.018322546134900176
+        },
+        {
+          "psnr": 34.54281486178257,
+          "ssim": 0.9884786127952258,
+          "local_variance_ratio": 1.1282367665347448,
+          "finite": true,
+          "max_abs": 0.8447210788726807,
+          "step": 15,
+          "training_loss": 0.01798085026523738
+        },
+        {
+          "psnr": 34.748133991226716,
+          "ssim": 0.9875853210190942,
+          "local_variance_ratio": 1.163915198860687,
+          "finite": true,
+          "max_abs": 0.8486026525497437,
+          "step": 16,
+          "training_loss": 0.019051980191201124
+        },
+        {
+          "psnr": 34.93724655905964,
+          "ssim": 0.9875848698490622,
+          "local_variance_ratio": 1.1754643618575566,
+          "finite": true,
+          "max_abs": 0.8517731428146362,
+          "step": 17,
+          "training_loss": 0.019125505543700037
+        },
+        {
+          "psnr": 35.401854989014495,
+          "ssim": 0.9886227094614515,
+          "local_variance_ratio": 1.1627331127485216,
+          "finite": true,
+          "max_abs": 0.8514427542686462,
+          "step": 18,
+          "training_loss": 0.01785729658142011
+        },
+        {
+          "psnr": 36.18311262307892,
+          "ssim": 0.9904613631016463,
+          "local_variance_ratio": 1.1266078470435819,
+          "finite": true,
+          "max_abs": 0.8445655107498169,
+          "step": 19,
+          "training_loss": 0.015598076409207273
+        },
+        {
+          "psnr": 37.03477496279978,
+          "ssim": 0.9922707960809592,
+          "local_variance_ratio": 1.0866717669631623,
+          "finite": true,
+          "max_abs": 0.8398531675338745,
+          "step": 20
+        }
+      ],
+      "step_stability": {
+        "ode": {
+          "1": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          },
+          "4": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          },
+          "8": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          },
+          "16": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          }
+        },
+        "sde": {
+          "1": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          },
+          "4": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          },
+          "8": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          },
+          "16": {
+            "psnr": 37.03477496279978,
+            "ssim": 0.9922707960809592,
+            "local_variance_ratio": 1.0866717669631623,
+            "finite": true,
+            "max_abs": 0.8398531675338745
+          }
+        }
+      },
+      "gradient_probe": {
+        "start_ssim": {
+          "raw_model_gradient_norm": 0.4097599402631418,
+          "finite": true
+        },
+        "start_local_std": {
+          "raw_model_gradient_norm": 0.060255633043838686,
+          "finite": true
+        }
+      },
+      "peak_cuda_allocated_bytes": null,
+      "peak_cuda_reserved_bytes": null,
+      "perceptual": {
+        "status": "measured_pretrained",
+        "lpips": 0.00157741104097416,
+        "fid": 119.52781006979095,
+        "slices": 3,
+        "dimension": 2048
+      },
+      "atlas": null,
+      "seconds": 3.603017900022678,
+      "overfit_passed": true,
+      "inference_stable": true
+    },
+    "exp2": {
+      "curve": [
+        {
+          "psnr": 25.59265900385703,
+          "ssim": 0.9269374245053937,
+          "local_variance_ratio": 0.4444455659594761,
+          "finite": true,
+          "max_abs": 0.7158839702606201,
+          "step": 0,
+          "training_loss": 0.22802860807161546
+        },
+        {
+          "psnr": 25.722225252708295,
+          "ssim": 0.9178197105885512,
+          "local_variance_ratio": 0.48438933795709477,
+          "finite": true,
+          "max_abs": 0.7416467666625977,
+          "step": 1,
+          "training_loss": 0.23122202859876262
+        },
+        {
+          "psnr": 26.04840087269466,
+          "ssim": 0.9352535204848873,
+          "local_variance_ratio": 0.4859736482416769,
+          "finite": true,
+          "max_abs": 0.7366234660148621,
+          "step": 2,
+          "training_loss": 0.21319836861017016
+        },
+        {
+          "psnr": 26.247354365453177,
+          "ssim": 0.9390676641929547,
+          "local_variance_ratio": 0.5125260818648515,
+          "finite": true,
+          "max_abs": 0.7471367716789246,
+          "step": 3,
+          "training_loss": 0.2046649528695755
+        },
+        {
+          "psnr": 26.505679970273906,
+          "ssim": 0.9456351414628074,
+          "local_variance_ratio": 0.5392115166541028,
+          "finite": true,
+          "max_abs": 0.7589206695556641,
+          "step": 4,
+          "training_loss": 0.1970275894806717
+        },
+        {
+          "psnr": 26.873080913156603,
+          "ssim": 0.9534886007947321,
+          "local_variance_ratio": 0.5654003971770937,
+          "finite": true,
+          "max_abs": 0.7654698491096497,
+          "step": 5,
+          "training_loss": 0.18433597831210286
+        },
+        {
+          "psnr": 27.38368031134934,
+          "ssim": 0.9587684030792571,
+          "local_variance_ratio": 0.5935192818873598,
+          "finite": true,
+          "max_abs": 0.7680269479751587,
+          "step": 6,
+          "training_loss": 0.17429244971187144
+        },
+        {
+          "psnr": 27.998918422545806,
+          "ssim": 0.9629184942681247,
+          "local_variance_ratio": 0.6237586064127522,
+          "finite": true,
+          "max_abs": 0.7720133662223816,
+          "step": 7,
+          "training_loss": 0.16175524718427806
+        },
+        {
+          "psnr": 28.697764034160677,
+          "ssim": 0.9692734141098065,
+          "local_variance_ratio": 0.655953955826973,
+          "finite": true,
+          "max_abs": 0.7747180461883545,
+          "step": 8,
+          "training_loss": 0.10211660813061275
+        },
+        {
+          "psnr": 29.488526356629706,
+          "ssim": 0.9761312352199614,
+          "local_variance_ratio": 0.6960077410527751,
+          "finite": true,
+          "max_abs": 0.7786481380462646,
+          "step": 9,
+          "training_loss": 0.14029055576941207
+        },
+        {
+          "psnr": 30.412025430618495,
+          "ssim": 0.9819464550818658,
+          "local_variance_ratio": 0.747803075773958,
+          "finite": true,
+          "max_abs": 0.7854190468788147,
+          "step": 10,
+          "training_loss": 0.1279201192732372
+        },
+        {
+          "psnr": 31.48194739101686,
+          "ssim": 0.9861486770667639,
+          "local_variance_ratio": 0.8128547708136411,
+          "finite": true,
+          "max_abs": 0.7955643534660339,
+          "step": 11,
+          "training_loss": 0.11634846756931456
+        },
+        {
+          "psnr": 32.61811432198583,
+          "ssim": 0.9887376982632053,
+          "local_variance_ratio": 0.8905844267765033,
+          "finite": true,
+          "max_abs": 0.8083449006080627,
+          "step": 12,
+          "training_loss": 0.10277892910702802
+        },
+        {
+          "psnr": 33.72268020822553,
+          "ssim": 0.9898882369259917,
+          "local_variance_ratio": 0.9743716718236999,
+          "finite": true,
+          "max_abs": 0.8206899166107178,
+          "step": 13,
+          "training_loss": 0.09282858788987161
+        },
+        {
+          "psnr": 34.23896451271928,
+          "ssim": 0.9899624091550312,
+          "local_variance_ratio": 1.0455338611789433,
+          "finite": true,
+          "max_abs": 0.8253728151321411,
+          "step": 14,
+          "training_loss": 0.042038098212420646
+        },
+        {
+          "psnr": 34.597921313887106,
+          "ssim": 0.9886354313203807,
+          "local_variance_ratio": 1.1217463722338301,
+          "finite": true,
+          "max_abs": 0.8440545797348022,
+          "step": 15,
+          "training_loss": 0.08959711191060578
+        },
+        {
+          "psnr": 34.514622443318316,
+          "ssim": 0.9874896265097257,
+          "local_variance_ratio": 1.1658527176013491,
+          "finite": true,
+          "max_abs": 0.8508706092834473,
+          "step": 16,
+          "training_loss": 0.09414396756437474
+        },
+        {
+          "psnr": 34.76785013862414,
+          "ssim": 0.9873323389825603,
+          "local_variance_ratio": 1.1678372250842675,
+          "finite": true,
+          "max_abs": 0.8456970453262329,
+          "step": 17,
+          "training_loss": 0.09738261768066865
+        },
+        {
+          "psnr": 35.22740473484893,
+          "ssim": 0.9876502479146825,
+          "local_variance_ratio": 1.1667284421098345,
+          "finite": true,
+          "max_abs": 0.8507709503173828,
+          "step": 18,
+          "training_loss": 0.09240499090997634
+        },
+        {
+          "psnr": 35.67515691767025,
+          "ssim": 0.9891775397372873,
+          "local_variance_ratio": 1.1438423012171217,
+          "finite": true,
+          "max_abs": 0.8513504862785339,
+          "step": 19,
+          "training_loss": 0.08569264281811273
+        },
+        {
+          "psnr": 36.5856147285467,
+          "ssim": 0.9914322938455857,
+          "local_variance_ratio": 1.0962122790280655,
+          "finite": true,
+          "max_abs": 0.8402072191238403,
+          "step": 20
+        }
+      ],
+      "step_stability": {
+        "ode": {
+          "1": {
+            "psnr": 36.5856147285467,
+            "ssim": 0.9914322938455857,
+            "local_variance_ratio": 1.0962122790280655,
+            "finite": true,
+            "max_abs": 0.8402072191238403
+          },
+          "4": {
+            "psnr": 36.643692411774275,
+            "ssim": 0.9916255345071727,
+            "local_variance_ratio": 1.096043396039179,
+            "finite": true,
+            "max_abs": 0.8392492532730103
+          },
+          "8": {
+            "psnr": 36.62363695909613,
+            "ssim": 0.9915532293316102,
+            "local_variance_ratio": 1.0962790703588086,
+            "finite": true,
+            "max_abs": 0.8390964269638062
+          },
+          "16": {
+            "psnr": 36.610279346849616,
+            "ssim": 0.9914996479340094,
+            "local_variance_ratio": 1.0964350985229157,
+            "finite": true,
+            "max_abs": 0.8390271067619324
+          }
+        },
+        "sde": {
+          "1": {
+            "psnr": 36.5856147285467,
+            "ssim": 0.9914322938455857,
+            "local_variance_ratio": 1.0962122790280655,
+            "finite": true,
+            "max_abs": 0.8402072191238403
+          },
+          "4": {
+            "psnr": 36.643712948951105,
+            "ssim": 0.9916257681569294,
+            "local_variance_ratio": 1.0960547130485794,
+            "finite": true,
+            "max_abs": 0.8392560482025146
+          },
+          "8": {
+            "psnr": 36.623627687636294,
+            "ssim": 0.9915539078926344,
+            "local_variance_ratio": 1.0962818434077626,
+            "finite": true,
+            "max_abs": 0.8390969634056091
+          },
+          "16": {
+            "psnr": 36.61004611595551,
+            "ssim": 0.9914992079028911,
+            "local_variance_ratio": 1.096435463794271,
+            "finite": true,
+            "max_abs": 0.839040994644165
+          }
+        }
+      },
+      "gradient_probe": {
+        "start_ssim": {
+          "raw_model_gradient_norm": 0.4097599402631418,
+          "finite": true
+        },
+        "start_local_std": {
+          "raw_model_gradient_norm": 0.060255633043838686,
+          "finite": true
+        },
+        "noise_loss": {
+          "raw_model_gradient_norm": 0.07379535198225394,
+          "finite": true
+        }
+      },
+      "peak_cuda_allocated_bytes": null,
+      "peak_cuda_reserved_bytes": null,
+      "perceptual": {
+        "status": "measured_pretrained",
+        "lpips": 0.0016940366476774216,
+        "fid": 123.34064615667533,
+        "slices": 3,
+        "dimension": 2048
+      },
+      "atlas": null,
+      "seconds": 4.784029999980703,
+      "overfit_passed": true,
+      "inference_stable": true
+    },
+    "exp3": {
+      "curve": [
+        {
+          "psnr": 25.59265900385703,
+          "ssim": 0.9269374245053937,
+          "local_variance_ratio": 0.4444455659594761,
+          "finite": true,
+          "max_abs": 0.7158839702606201,
+          "step": 0,
+          "training_loss": 0.22921218495350099
+        },
+        {
+          "psnr": 25.724855019285666,
+          "ssim": 0.9180176595587629,
+          "local_variance_ratio": 0.48410373242455146,
+          "finite": true,
+          "max_abs": 0.7413840889930725,
+          "step": 1,
+          "training_loss": 0.2303480445067006
+        },
+        {
+          "psnr": 26.046772256016204,
+          "ssim": 0.9352384483875851,
+          "local_variance_ratio": 0.48640564523235674,
+          "finite": true,
+          "max_abs": 0.7363300919532776,
+          "step": 2,
+          "training_loss": 0.2139346237582863
+        },
+        {
+          "psnr": 26.246837887236598,
+          "ssim": 0.9392836370662309,
+          "local_variance_ratio": 0.5127014890452849,
+          "finite": true,
+          "max_abs": 0.7471252679824829,
+          "step": 3,
+          "training_loss": 0.15802314088169278
+        },
+        {
+          "psnr": 26.512814554864747,
+          "ssim": 0.9463669917736918,
+          "local_variance_ratio": 0.5385723155339328,
+          "finite": true,
+          "max_abs": 0.75885409116745,
+          "step": 4,
+          "training_loss": 0.19951473505234496
+        },
+        {
+          "psnr": 26.883883357758172,
+          "ssim": 0.9536908876165545,
+          "local_variance_ratio": 0.565122219864055,
+          "finite": true,
+          "max_abs": 0.764637291431427,
+          "step": 5,
+          "training_loss": 0.187034672348154
+        },
+        {
+          "psnr": 27.40479584254323,
+          "ssim": 0.9593693818967357,
+          "local_variance_ratio": 0.5926130913431256,
+          "finite": true,
+          "max_abs": 0.7662938237190247,
+          "step": 6,
+          "training_loss": 0.1766556553253414
+        },
+        {
+          "psnr": 28.037966193024776,
+          "ssim": 0.9642034278230113,
+          "local_variance_ratio": 0.6215226294181432,
+          "finite": true,
+          "max_abs": 0.76934415102005,
+          "step": 7,
+          "training_loss": 0.16428458345245225
+        },
+        {
+          "psnr": 28.73532835586954,
+          "ssim": 0.9705214416709733,
+          "local_variance_ratio": 0.6540173323994305,
+          "finite": true,
+          "max_abs": 0.7724813222885132,
+          "step": 8,
+          "training_loss": 0.15634176003479597
+        },
+        {
+          "psnr": 29.516493328539678,
+          "ssim": 0.9769782043132286,
+          "local_variance_ratio": 0.6950978135107775,
+          "finite": true,
+          "max_abs": 0.7773348689079285,
+          "step": 9,
+          "training_loss": 0.14035588787891892
+        },
+        {
+          "psnr": 30.43197077366849,
+          "ssim": 0.9824137256688613,
+          "local_variance_ratio": 0.7479817607240443,
+          "finite": true,
+          "max_abs": 0.7850050330162048,
+          "step": 10,
+          "training_loss": 0.1281847321613876
+        },
+        {
+          "psnr": 31.50635706147026,
+          "ssim": 0.9865019048736303,
+          "local_variance_ratio": 0.8138044388885777,
+          "finite": true,
+          "max_abs": 0.7957801222801208,
+          "step": 11,
+          "training_loss": 0.11843731958639514
+        },
+        {
+          "psnr": 32.66234470560815,
+          "ssim": 0.9891890576717671,
+          "local_variance_ratio": 0.8920168083466785,
+          "finite": true,
+          "max_abs": 0.80878746509552,
+          "step": 12,
+          "training_loss": 0.10653237404892098
+        },
+        {
+          "psnr": 33.79748502336362,
+          "ssim": 0.9904128919477626,
+          "local_variance_ratio": 0.976231062401766,
+          "finite": true,
+          "max_abs": 0.8210511803627014,
+          "step": 13,
+          "training_loss": 0.046165584996035576
+        },
+        {
+          "psnr": 34.41380910594578,
+          "ssim": 0.9903982134161349,
+          "local_variance_ratio": 1.0498371459180635,
+          "finite": true,
+          "max_abs": 0.8259816765785217,
+          "step": 14,
+          "training_loss": 0.09250458089272626
+        },
+        {
+          "psnr": 34.63695234902539,
+          "ssim": 0.9888344810304933,
+          "local_variance_ratio": 1.1278979036449737,
+          "finite": true,
+          "max_abs": 0.8440878391265869,
+          "step": 15,
+          "training_loss": 0.09245107591152414
+        },
+        {
+          "psnr": 34.8931939653428,
+          "ssim": 0.9880579125656922,
+          "local_variance_ratio": 1.1629366295005257,
+          "finite": true,
+          "max_abs": 0.8461321592330933,
+          "step": 16,
+          "training_loss": 0.09396769107329128
+        },
+        {
+          "psnr": 35.04918316582443,
+          "ssim": 0.9879499014316593,
+          "local_variance_ratio": 1.1774489579686778,
+          "finite": true,
+          "max_abs": 0.8505584001541138,
+          "step": 17,
+          "training_loss": 0.09600687842280657
+        },
+        {
+          "psnr": 35.60292756044734,
+          "ssim": 0.9889772108229397,
+          "local_variance_ratio": 1.1627772549638944,
+          "finite": true,
+          "max_abs": 0.8486766815185547,
+          "step": 18,
+          "training_loss": 0.04178188861551619
+        },
+        {
+          "psnr": 36.40400115040178,
+          "ssim": 0.990695853990208,
+          "local_variance_ratio": 1.1277599227619275,
+          "finite": true,
+          "max_abs": 0.8425521850585938,
+          "step": 19,
+          "training_loss": 0.08614688011463625
+        },
+        {
+          "psnr": 37.32450956135364,
+          "ssim": 0.9925016601604452,
+          "local_variance_ratio": 1.0871502184073052,
+          "finite": true,
+          "max_abs": 0.838314414024353,
+          "step": 20
+        }
+      ],
+      "step_stability": {
+        "ode": {
+          "1": {
+            "psnr": 37.32450956135364,
+            "ssim": 0.9925016601604452,
+            "local_variance_ratio": 1.0871502184073052,
+            "finite": true,
+            "max_abs": 0.838314414024353
+          },
+          "4": {
+            "psnr": 37.39814638077014,
+            "ssim": 0.9926338661574972,
+            "local_variance_ratio": 1.0872608426169457,
+            "finite": true,
+            "max_abs": 0.8379938006401062
+          },
+          "8": {
+            "psnr": 37.397351098458145,
+            "ssim": 0.9926647792693095,
+            "local_variance_ratio": 1.0873983865169454,
+            "finite": true,
+            "max_abs": 0.8380860090255737
+          },
+          "16": {
+            "psnr": 37.39417400978638,
+            "ssim": 0.9926714984554801,
+            "local_variance_ratio": 1.0874891168903729,
+            "finite": true,
+            "max_abs": 0.8381333351135254
+          }
+        },
+        "sde": {
+          "1": {
+            "psnr": 37.32450956135364,
+            "ssim": 0.9925016601604452,
+            "local_variance_ratio": 1.0871502184073052,
+            "finite": true,
+            "max_abs": 0.838314414024353
+          },
+          "4": {
+            "psnr": 37.39813150871653,
+            "ssim": 0.9926339126351557,
+            "local_variance_ratio": 1.0872749389168066,
+            "finite": true,
+            "max_abs": 0.8379974365234375
+          },
+          "8": {
+            "psnr": 37.39735290665123,
+            "ssim": 0.9926653302591516,
+            "local_variance_ratio": 1.0873998481453662,
+            "finite": true,
+            "max_abs": 0.8380887508392334
+          },
+          "16": {
+            "psnr": 37.39401830052706,
+            "ssim": 0.9926715898831272,
+            "local_variance_ratio": 1.0874880784373055,
+            "finite": true,
+            "max_abs": 0.8381332755088806
+          }
+        }
+      },
+      "gradient_probe": {
+        "start_ssim": {
+          "raw_model_gradient_norm": 0.4097599402631418,
+          "finite": true
+        },
+        "start_local_std": {
+          "raw_model_gradient_norm": 0.060255633043838686,
+          "finite": true
+        },
+        "jet_potential": {
+          "raw_model_gradient_norm": 0.0027925562410703493,
+          "finite": true
+        },
+        "jet_asym": {
+          "raw_model_gradient_norm": 0.03890420682118851,
+          "finite": true
+        },
+        "router_kl": {
+          "raw_model_gradient_norm": 0.0,
+          "finite": true,
+          "raw_router_gradient_norm": 0.18845186687828677
+        },
+        "noise_loss": {
+          "raw_model_gradient_norm": 0.06763932124942668,
+          "finite": true
+        }
+      },
+      "peak_cuda_allocated_bytes": null,
+      "peak_cuda_reserved_bytes": null,
+      "perceptual": {
+        "status": "measured_pretrained",
+        "lpips": 0.0014320089248940349,
+        "fid": 112.4406231086835,
+        "slices": 3,
+        "dimension": 2048
+      },
+      "atlas": {
+        "quadratic_support_fraction": 1.0,
+        "effective_neighbors": 46.8148078918457,
+        "median_gcv_ridge": 0.014483842998743057,
+        "train_case_count": 5,
+        "folds": 5,
+        "texture_neighbourhood": "3x3 Haar HF = 12x12 HR",
+        "support_is_measured_not_guaranteed": true
+      },
+      "seconds": 5.370685299974866,
+      "overfit_passed": true,
+      "inference_stable": true
+    },
+    "exp4": {
+      "curve": [
+        {
+          "psnr": 25.59265900385703,
+          "ssim": 0.9269374245053937,
+          "local_variance_ratio": 0.4444455659594761,
+          "finite": true,
+          "max_abs": 0.7158839702606201,
+          "step": 0,
+          "training_loss": 0.22921218495350099
+        },
+        {
+          "psnr": 25.724855019285666,
+          "ssim": 0.9180176595587629,
+          "local_variance_ratio": 0.48410373242455146,
+          "finite": true,
+          "max_abs": 0.7413840889930725,
+          "step": 1,
+          "training_loss": 0.2303480445067006
+        },
+        {
+          "psnr": 26.046772256016204,
+          "ssim": 0.9352384483875851,
+          "local_variance_ratio": 0.48640564523235674,
+          "finite": true,
+          "max_abs": 0.7363300919532776,
+          "step": 2,
+          "training_loss": 0.2139346237582863
+        },
+        {
+          "psnr": 26.246837887236598,
+          "ssim": 0.9392836370662309,
+          "local_variance_ratio": 0.5127014890452849,
+          "finite": true,
+          "max_abs": 0.7471252679824829,
+          "step": 3,
+          "training_loss": 0.15802314088169278
+        },
+        {
+          "psnr": 26.512814554864747,
+          "ssim": 0.9463669917736918,
+          "local_variance_ratio": 0.5385723155339328,
+          "finite": true,
+          "max_abs": 0.75885409116745,
+          "step": 4,
+          "training_loss": 0.19951473505234496
+        },
+        {
+          "psnr": 26.883883357758172,
+          "ssim": 0.9536908876165545,
+          "local_variance_ratio": 0.565122219864055,
+          "finite": true,
+          "max_abs": 0.764637291431427,
+          "step": 5,
+          "training_loss": 0.187034672348154
+        },
+        {
+          "psnr": 27.40479584254323,
+          "ssim": 0.9593693818967357,
+          "local_variance_ratio": 0.5926130913431256,
+          "finite": true,
+          "max_abs": 0.7662938237190247,
+          "step": 6,
+          "training_loss": 0.1766556553253414
+        },
+        {
+          "psnr": 28.037966193024776,
+          "ssim": 0.9642034278230113,
+          "local_variance_ratio": 0.6215226294181432,
+          "finite": true,
+          "max_abs": 0.76934415102005,
+          "step": 7,
+          "training_loss": 0.16428458345245225
+        },
+        {
+          "psnr": 28.73532835586954,
+          "ssim": 0.9705214416709733,
+          "local_variance_ratio": 0.6540173323994305,
+          "finite": true,
+          "max_abs": 0.7724813222885132,
+          "step": 8,
+          "training_loss": 0.15634176003479597
+        },
+        {
+          "psnr": 29.516493328539678,
+          "ssim": 0.9769782043132286,
+          "local_variance_ratio": 0.6950978135107775,
+          "finite": true,
+          "max_abs": 0.7773348689079285,
+          "step": 9,
+          "training_loss": 0.14035588787891892
+        },
+        {
+          "psnr": 30.43197077366849,
+          "ssim": 0.9824137256688613,
+          "local_variance_ratio": 0.7479817607240443,
+          "finite": true,
+          "max_abs": 0.7850050330162048,
+          "step": 10,
+          "training_loss": 0.1281847321613876
+        },
+        {
+          "psnr": 31.50635706147026,
+          "ssim": 0.9865019048736303,
+          "local_variance_ratio": 0.8138044388885777,
+          "finite": true,
+          "max_abs": 0.7957801222801208,
+          "step": 11,
+          "training_loss": 0.11843731958639514
+        },
+        {
+          "psnr": 32.66234470560815,
+          "ssim": 0.9891890576717671,
+          "local_variance_ratio": 0.8920168083466785,
+          "finite": true,
+          "max_abs": 0.80878746509552,
+          "step": 12,
+          "training_loss": 0.10653237404892098
+        },
+        {
+          "psnr": 33.79748502336362,
+          "ssim": 0.9904128919477626,
+          "local_variance_ratio": 0.976231062401766,
+          "finite": true,
+          "max_abs": 0.8210511803627014,
+          "step": 13,
+          "training_loss": 0.046165584996035576
+        },
+        {
+          "psnr": 34.41380910594578,
+          "ssim": 0.9903982134161349,
+          "local_variance_ratio": 1.0498371459180635,
+          "finite": true,
+          "max_abs": 0.8259816765785217,
+          "step": 14,
+          "training_loss": 0.09250458089272626
+        },
+        {
+          "psnr": 34.63695234902539,
+          "ssim": 0.9888344810304933,
+          "local_variance_ratio": 1.1278979036449737,
+          "finite": true,
+          "max_abs": 0.8440878391265869,
+          "step": 15,
+          "training_loss": 0.09245107591152414
+        },
+        {
+          "psnr": 34.8931939653428,
+          "ssim": 0.9880579125656922,
+          "local_variance_ratio": 1.1629366295005257,
+          "finite": true,
+          "max_abs": 0.8461321592330933,
+          "step": 16,
+          "training_loss": 0.09396769107329128
+        },
+        {
+          "psnr": 35.04918316582443,
+          "ssim": 0.9879499014316593,
+          "local_variance_ratio": 1.1774489579686778,
+          "finite": true,
+          "max_abs": 0.8505584001541138,
+          "step": 17,
+          "training_loss": 0.09600687842280657
+        },
+        {
+          "psnr": 35.60292756044734,
+          "ssim": 0.9889772108229397,
+          "local_variance_ratio": 1.1627772549638944,
+          "finite": true,
+          "max_abs": 0.8486766815185547,
+          "step": 18,
+          "training_loss": 0.04178188861551619
+        },
+        {
+          "psnr": 36.40400115040178,
+          "ssim": 0.990695853990208,
+          "local_variance_ratio": 1.1277599227619275,
+          "finite": true,
+          "max_abs": 0.8425521850585938,
+          "step": 19,
+          "training_loss": 0.08614688011463625
+        },
+        {
+          "psnr": 37.32450956135364,
+          "ssim": 0.9925016601604452,
+          "local_variance_ratio": 1.0871502184073052,
+          "finite": true,
+          "max_abs": 0.838314414024353,
+          "step": 20
+        }
+      ],
+      "step_stability": {
+        "ode": {
+          "1": {
+            "psnr": 37.32803064493687,
+            "ssim": 0.9925012034528307,
+            "local_variance_ratio": 1.087190527287317,
+            "finite": true,
+            "max_abs": 0.8382297158241272
+          },
+          "4": {
+            "psnr": 37.40214488989912,
+            "ssim": 0.992635896548471,
+            "local_variance_ratio": 1.0873004665960109,
+            "finite": true,
+            "max_abs": 0.8379154205322266
+          },
+          "8": {
+            "psnr": 37.401355955808725,
+            "ssim": 0.9926674245987477,
+            "local_variance_ratio": 1.0874377614563098,
+            "finite": true,
+            "max_abs": 0.8380101919174194
+          },
+          "16": {
+            "psnr": 37.39817116452938,
+            "ssim": 0.9926743825353799,
+            "local_variance_ratio": 1.0875337287343783,
+            "finite": true,
+            "max_abs": 0.838058590888977
+          }
+        },
+        "sde": {
+          "1": {
+            "psnr": 37.32803064493687,
+            "ssim": 0.9925012034528307,
+            "local_variance_ratio": 1.087190527287317,
+            "finite": true,
+            "max_abs": 0.8382297158241272
+          },
+          "4": {
+            "psnr": 37.40212598024504,
+            "ssim": 0.9926359209179038,
+            "local_variance_ratio": 1.0873131238228007,
+            "finite": true,
+            "max_abs": 0.8379190564155579
+          },
+          "8": {
+            "psnr": 37.40135735436569,
+            "ssim": 0.9926679646509606,
+            "local_variance_ratio": 1.0874379219931152,
+            "finite": true,
+            "max_abs": 0.8380129933357239
+          },
+          "16": {
+            "psnr": 37.398015454727634,
+            "ssim": 0.9926744755520289,
+            "local_variance_ratio": 1.0875292980820446,
+            "finite": true,
+            "max_abs": 0.8380586504936218
+          }
+        }
+      },
+      "gradient_probe": {
+        "start_ssim": {
+          "raw_model_gradient_norm": 0.4097599402631418,
+          "finite": true
+        },
+        "start_local_std": {
+          "raw_model_gradient_norm": 0.060255633043838686,
+          "finite": true
+        },
+        "jet_potential": {
+          "raw_model_gradient_norm": 0.0027925562410703493,
+          "finite": true
+        },
+        "jet_asym": {
+          "raw_model_gradient_norm": 0.03890420682118851,
+          "finite": true
+        },
+        "router_kl": {
+          "raw_model_gradient_norm": 0.0,
+          "finite": true,
+          "raw_router_gradient_norm": 0.18845186687828677
+        },
+        "noise_loss": {
+          "raw_model_gradient_norm": 0.06763932124942668,
+          "finite": true
+        }
+      },
+      "peak_cuda_allocated_bytes": null,
+      "peak_cuda_reserved_bytes": null,
+      "perceptual": {
+        "status": "measured_pretrained",
+        "lpips": 0.0014288105303421617,
+        "fid": 113.60642092999271,
+        "slices": 3,
+        "dimension": 2048
+      },
+      "atlas": {
+        "quadratic_support_fraction": 1.0,
+        "effective_neighbors": 46.8148078918457,
+        "median_gcv_ridge": 0.014483842998743057,
+        "train_case_count": 5,
+        "folds": 5,
+        "texture_neighbourhood": "3x3 Haar HF = 12x12 HR",
+        "support_is_measured_not_guaranteed": true
+      },
+      "seconds": 5.621747100027278,
+      "overfit_passed": true,
+      "inference_stable": true
+    }
+  }
+}

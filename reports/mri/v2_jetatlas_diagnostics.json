@@ -1,0 +1,53 @@
+{
+  "device": "cpu",
+  "analytic": {
+    "jacobian_max_error": 0.0,
+    "hessian_max_error": 0.0,
+    "mean_curvature_fd_max_error": 1.8028702752914683e-08,
+    "tangent_idempotence_max_error": 7.771561172376096e-16,
+    "certified_quadratic_fraction": 1.0,
+    "min_soft_boundary_derivative": 9.998500187478887e-07,
+    "projection_mse": 0.0002196158285843285
+  },
+  "crossfit": {
+    "quadratic_support_fraction": 1.0,
+    "effective_neighbors": 63.18389892578125,
+    "median_gcv_ridge": 0.4194798171520233,
+    "train_case_count": 5,
+    "folds": 5,
+    "texture_neighbourhood": "3x3 Haar HF = 12x12 HR",
+    "support_is_measured_not_guaranteed": true
+  },
+  "geometry_loss": {
+    "jet_asym": 9.192738798446953e-05,
+    "jet_neighbor": 9.730129386298358e-05,
+    "jet_potential": 0.006565585266798735,
+    "router_kl": 0.1177680715918541,
+    "loss": 0.0013449940597638488,
+    "jet_query_sites": 32.0
+  },
+  "gradient_norms_prediction_state": {
+    "jet_asym": [
+      0.0018155095167458057,
+      0.0
+    ],
+    "jet_neighbor": [
+      0.0015750996535643935,
+      0.0
+    ],
+    "jet_potential": [
+      0.0,
+      0.009340306743979454
+    ],
+    "router_kl": [
+      0.0,
+      0.0
+    ]
+  },
+  "finite_backward": true,
+  "online_ll_exact": true,
+  "curvature_ll_zero": true,
+  "gpu_peak_mib": null,
+  "small_bank_fit_forward_seconds": 0.18477819999679923,
+  "evidence_scope": "Synthetic analytic manifold and TRAIN-labelled synthetic coefficients; no MRI/VAL/TEST read"
+}
