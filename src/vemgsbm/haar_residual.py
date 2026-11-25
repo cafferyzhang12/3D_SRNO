@@ -250,8 +250,9 @@ class HaarObjective(nn.Module):
 
         A full batch learns the clean endpoint from the deployment initial state.
         One eighth also learns from detached final and intermediate sampler states.
-        Every component uses the same fixed TRAIN variance normalization; neither
-        the target nor per-outcome weights enter the main network's input state.
+        Physical terms share fixed TRAIN variance normalization; dimensionless
+        SSIM is added afterward. Neither the target nor per-outcome weights enter
+        the main network's input state.
         """
         from .bridge import integrate_endpoint, sample_gaussian_bridge
 
@@ -266,6 +267,7 @@ class HaarObjective(nn.Module):
                    "rollout": train.get("rollout_weight", 1.),
                    "hf": train.get("hf_weight", .1),
                    "edge": train.get("edge_weight", .05),
+                   "ssim": train.get("ssim_weight", 0.),
                    "mls": cfg.get("mls_reg_weight", 0.),
                    "bridge_aux": train.get("bridge_aux_weight", 0.)}
         if any(not math.isfinite(value) or value < 0 for value in weights.values()):
@@ -284,6 +286,8 @@ class HaarObjective(nn.Module):
             initial = model.initial_state(lr, base)
         start, _ = model(initial, condition, 0.)
 
+        ssim_budget = max(1, len(lr) // 8)
+
         def components(prediction, target, image_base, image_hr, ids):
             coefficients = model.denormalize_haar(prediction)
             reconstructed = image_base + model.codec.decode(coefficients)
@@ -297,13 +301,30 @@ class HaarObjective(nn.Module):
             # before squaring so this term stays in physical pixel-MSE units.
             edge = .5 * ((error[..., 1:, :] - error[..., :-1, :]).div(2).square().mean()
                          + (error[..., 1:] - error[..., :-1]).div(2).square().mean())
-            mls = (self.atlas.reconstruction_loss(prediction, target, ids, band_scale,
-                                                 base_coefficients=model.codec.encode(image_base))
-                   if weights["mls"] else pixel.new_zeros(()))
+            mls_terms = {}
+            if weights["mls"] and hasattr(self.atlas, "reconstruction_terms"):
+                mls_terms = self.atlas.reconstruction_terms(
+                    prediction, target, ids, band_scale,
+                    base_coefficients=model.codec.encode(image_base), reference_image=image_hr)
+                mls = (mls_terms["local_mse"] + self.atlas.settings.get("neighbor_weight", 0.)
+                       * mls_terms["neighbor_mse"])
+            else:
+                mls = (self.atlas.reconstruction_loss(prediction, target, ids, band_scale,
+                                                     base_coefficients=model.codec.encode(image_base))
+                       if weights["mls"] else pixel.new_zeros(()))
             raw = dict(pixel_mse=pixel, hf_mse=high_frequency, edge_mse=edge,
                        mls_reconstruction_mse=mls)
+            raw.update({"mls_" + name: value for name, value in mls_terms.items()})
             combined = (pixel + weights["hf"] * high_frequency + weights["edge"] * edge
                         + weights["mls"] * mls) / normalization
+            if weights["ssim"]:
+                from .mri_metrics import mean_xy_ssim
+                # Exact evaluation window/covariance convention, on a bounded
+                # subset. Keep unclipped physical MSE above to correct outliers.
+                count = min(len(prediction), ssim_budget)
+                structural = 1 - mean_xy_ssim(reconstructed[:count].clamp(0, 1), image_hr[:count])
+                combined = combined + weights["ssim"] * structural
+                raw.update(ssim_loss=structural, ssim_items=pixel.new_tensor(count))
             return combined, raw
 
         start_loss, start_terms = components(start, truth, base, hr, case_ids)

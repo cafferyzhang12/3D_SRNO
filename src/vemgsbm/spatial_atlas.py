@@ -7,6 +7,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .haar_residual import LRConditionEncoder
 from .momentum.model import HaarXY
@@ -19,6 +20,73 @@ def _sites(x):
 
 def _volume(x, shape):
     return x.reshape(shape[0], *shape[2:], -1).movedim(-1, 1)
+
+
+@torch.no_grad()
+def _structure_labels(reference, grid_shape):
+    """Detached TRAIN HR strata on the Haar grid: background/weak/texture/edge.
+
+    Local variance uses a 7x7 XY window. No pooling or finite difference mixes
+    slices. These training strata do not change the whole-case metric mask.
+    """
+    if (reference.ndim != 5 or reference.shape[:2] != (1, 1)
+            or tuple(reference.shape[2:]) != (grid_shape[0], 4*grid_shape[1], 4*grid_shape[2])):
+        raise ValueError("Structural MLS sampling needs aligned B1ZYX HR at four times the Haar XY grid")
+    image = reference.detach().float().reshape(-1, 1, *reference.shape[-2:])
+    if not torch.isfinite(image).all():
+        raise ValueError("Structural MLS reference must be finite")
+    mean = F.avg_pool2d(F.pad(image, (3, 3, 3, 3), mode="replicate"), 7, stride=1)
+    second = F.avg_pool2d(F.pad(image.square(), (3, 3, 3, 3), mode="replicate"), 7, stride=1)
+    variance = (49/48*(second-mean.square())).clamp_min(0)
+    gradient = (F.pad((image[..., 1:, :]-image[..., :-1, :]).abs(), (0, 0, 0, 1))
+                + F.pad((image[..., 1:]-image[..., :-1]).abs(), (0, 1, 0, 0)))
+    foreground = F.avg_pool2d(image, 4, stride=4).flatten() > 2/255
+    variance = F.avg_pool2d(variance, 4, stride=4).flatten()
+    gradient = F.avg_pool2d(gradient, 4, stride=4).flatten()
+    edge = torch.zeros_like(foreground)
+    if foreground.any():
+        edge = foreground & (gradient > 0) & (gradient >= torch.quantile(gradient[foreground], .9))
+    labels = torch.zeros_like(foreground, dtype=torch.long)
+    labels[foreground] = 2
+    labels[foreground & (variance < 1.e-4)] = 1
+    labels[edge] = 3
+    return labels
+
+
+@torch.no_grad()
+def _stratified_sites(labels, budget, fractions):
+    """Balanced training objective, intentionally not a uniform-loss estimator.
+
+    Sample without replacement; reassign missing/undersized stratum quotas to
+    remaining sites. Thus black patches and tiny patches always remain valid.
+    """
+    budget = min(budget, len(labels))
+    if budget == len(labels):
+        return torch.arange(len(labels), device=labels.device)
+    exact = np.asarray(fractions)*budget
+    quotas = np.floor(exact).astype(int)
+    for index in np.argsort(-(exact-quotas), kind="stable")[:budget-int(quotas.sum())]:
+        quotas[index] += 1
+    selected = []
+    used = torch.zeros_like(labels, dtype=torch.bool)
+    for group, quota in enumerate(quotas):
+        available = (labels == group).nonzero()[:, 0]
+        ids = available[torch.randperm(len(available), device=labels.device)[:int(quota)]]
+        used[ids] = True
+        selected.append(ids)
+    missing = budget-sum(len(ids) for ids in selected)
+    if missing:
+        remaining = (~used).nonzero()[:, 0]
+        selected.append(remaining[torch.randperm(len(remaining), device=labels.device)[:missing]])
+    return torch.cat(selected)
+
+
+def _xy_neighbor_pairs(sites, grid_shape):
+    """Positive XY neighbors of anchors, never a row wrap or a Z neighbor."""
+    _, height, width = grid_shape
+    right = sites[sites.remainder(width) < width-1]
+    down = sites[sites.div(width, rounding_mode="floor").remainder(height) < height-1]
+    return torch.cat((right, down)), torch.cat((right+1, down+width))
 
 
 def _balanced_sites(lr, budget, generator):
@@ -441,6 +509,18 @@ class TrainingMLSAtlas(nn.Module):
         self.geometry_mode = settings.get("geometry_mode", "normal")
         if self.geometry_mode not in {"normal", "paired_curved"}:
             raise ValueError("Unknown training MLS geometry_mode")
+        self.loss_sampling = settings.get("loss_sampling", "uniform")
+        if self.loss_sampling not in {"uniform", "structure_stratified"}:
+            raise ValueError("MLS loss_sampling must be uniform or structure_stratified")
+        self.structure_fractions = tuple(settings.get("structure_fractions", (.1, .2, .5, .2)))
+        if (len(self.structure_fractions) != 4 or not np.isfinite(self.structure_fractions).all()
+                or min(self.structure_fractions) < 0 or not np.isclose(sum(self.structure_fractions), 1.)):
+            raise ValueError("MLS structure_fractions must be four nonnegative fractions summing to one")
+        self.neighbor_weight = float(settings.get("neighbor_weight", 0.))
+        if not np.isfinite(self.neighbor_weight) or self.neighbor_weight < 0:
+            raise ValueError("MLS neighbor_weight must be finite and nonnegative")
+        if self.geometry_mode != "paired_curved" and (self.loss_sampling != "uniform" or self.neighbor_weight):
+            raise ValueError("Structural sampling and neighbor loss require paired_curved MLS")
         self.paired_base_weight = float(settings.get("paired_base_weight", 1.))
         if not np.isfinite(self.paired_base_weight) or self.paired_base_weight < 0:
             raise ValueError("paired_base_weight must be finite and nonnegative")
@@ -500,7 +580,14 @@ class TrainingMLSAtlas(nn.Module):
         self.register_buffer("query_std",torch.stack(scales))
         self.eval().requires_grad_(False)
 
-    def reconstruction_loss(self, prediction, target, case_ids, band_scale, base_coefficients=None):
+    def reconstruction_loss(self, prediction, target, case_ids, band_scale, base_coefficients=None,
+                            reference_image=None):
+        terms = self.reconstruction_terms(prediction, target, case_ids, band_scale,
+                                          base_coefficients, reference_image)
+        return terms["local_mse"] + self.neighbor_weight*terms["neighbor_mse"]
+
+    def reconstruction_terms(self, prediction, target, case_ids, band_scale, base_coefficients=None,
+                             reference_image=None):
         """Target-anchored curved normal discrepancy in physical Haar MSE units.
 
         For chart decoder g, this measures ||(p-y)-(g(q_p)-g(q_y))||^2 / 16.
@@ -509,6 +596,11 @@ class TrainingMLSAtlas(nn.Module):
         anchor cancels chart approximation bias exactly at p=y, while the
         predicted coordinates retain gradients through the quadratic decoder.
         The companion image/endpoint MSE supplies tangential supervision.
+        The optional neighbor term penalizes XY differences of these *curved
+        defects*, not image gradients, in their common physical ambient space.
+        It is target-anchored and vanishes for exact predictions even across
+        charts. An anchor budget queries at most three times as many sites
+        when neighbors are enabled, with bounded chart-query chunks.
         """
         if self.geometry_mode != "paired_curved":
             raise ValueError("reconstruction_loss requires geometry_mode='paired_curved'")
@@ -518,6 +610,13 @@ class TrainingMLSAtlas(nn.Module):
             raise ValueError("MLS reconstruction needs matching predictions and identified TRAIN targets")
         if self.use_paired_base and (base_coefficients is None or base_coefficients.shape != target.shape):
             raise ValueError("MLS reconstruction requires paired base_coefficients matching the residual grid")
+        structural = self.loss_sampling == "structure_stratified"
+        if structural and reference_image is None:
+            raise ValueError("structure_stratified MLS needs the detached TRAIN reference_image")
+        if (structural or self.neighbor_weight or reference_image is not None) and prediction.ndim != 5:
+            raise ValueError("Structural MLS losses require B16ZYX Haar volumes")
+        if reference_image is not None and len(reference_image) != len(prediction):
+            raise ValueError("MLS reference_image batch differs")
         # Model whitening adds epsilon. Callers pass that exact physical scale,
         # or ones when whitening is disabled. The residual mean cancels in all
         # differences, so it need not enter this metric or the fitted charts.
@@ -530,7 +629,9 @@ class TrainingMLSAtlas(nn.Module):
         coordinate_limit = float(self.settings.get("coordinate_limit",3.))
         if min(budget, chunk) < 1 or not np.isfinite(coordinate_limit) or coordinate_limit <= 0:
             raise ValueError("Positive MLS query budgets and coordinate_limit required")
-        totals = []
+        totals, neighbor_totals = [], []
+        coverage = prediction.new_zeros(4, dtype=torch.float32)
+        sampled_sites, pair_count = 0, 0
         # Keep chart algebra in float32 under AMP: tiny physical coefficients
         # and their quadratic discrepancies otherwise underflow in float16.
         with torch.autocast(device_type=prediction.device.type, enabled=False):
@@ -538,9 +639,19 @@ class TrainingMLSAtlas(nn.Module):
                 truth = _sites(target[b:b+1]).detach().float()
                 pred = _sites(prediction[b:b+1]).float()
                 base = (_sites(base_coefficients[b:b+1]).detach().float() if self.use_paired_base else None)
-                sites = (torch.arange(len(truth),device=truth.device) if budget >= len(truth)
-                         else torch.randperm(len(truth),device=truth.device)[:budget])
-                for indices in sites.split(chunk):
+                labels = (_structure_labels(reference_image[b:b+1], prediction.shape[2:])
+                          if reference_image is not None else None)
+                sites = (_stratified_sites(labels, budget, self.structure_fractions) if structural else
+                         torch.arange(len(truth),device=truth.device) if budget >= len(truth) else
+                         torch.randperm(len(truth),device=truth.device)[:budget])
+                sampled_sites += len(sites)
+                if labels is not None:
+                    coverage += torch.bincount(labels[sites], minlength=4).to(coverage)
+                left, right = (_xy_neighbor_pairs(sites, prediction.shape[2:]) if self.neighbor_weight else
+                               (sites[:0], sites[:0]))
+                query_sites = torch.unique(torch.cat((sites, right)), sorted=True)
+                defects, supports = [], []
+                for indices in query_sites.split(chunk):
                     with torch.no_grad():
                         fold = self.folds[case]
                         lo,hi = self.offsets[fold:fold+2]
@@ -562,8 +673,26 @@ class TrainingMLSAtlas(nn.Module):
                     q_pred = ((physical_pred-origin).unsqueeze(-2) @ basis).squeeze(-2)/bandwidth
                     decoded_pred, _ = self._decode(selected,q_pred.clamp(lower,upper))
                     defect = (physical_pred-x)-(decoded_pred-decoded_target)
-                    totals.append(defect.square().mean(-1)*support)
-        return torch.cat(totals).mean()
+                    defects.append(defect)
+                    supports.append(support)
+                defects, supports = torch.cat(defects), torch.cat(supports)
+                anchor_ids = torch.searchsorted(query_sites, sites)
+                totals.append(defects[anchor_ids].square().mean(-1)*supports[anchor_ids])
+                if len(left):
+                    a, b = torch.searchsorted(query_sites, left), torch.searchsorted(query_sites, right)
+                    # Divide the difference by two, retaining physical MSE units.
+                    # Both endpoints must be supported by their TRAIN chart.
+                    neighbor_totals.append((defects[a]-defects[b]).div(2).square().mean(-1)
+                                           * torch.minimum(supports[a], supports[b]))
+                    pair_count += len(left)
+        terms = dict(local_mse=torch.cat(totals).mean(),
+                     neighbor_mse=(torch.cat(neighbor_totals).mean() if neighbor_totals
+                                   else prediction.reshape(-1)[0].float()*0.),
+                     sampled_sites=prediction.new_tensor(sampled_sites, dtype=torch.float32),
+                     neighbor_pairs=prediction.new_tensor(pair_count, dtype=torch.float32))
+        terms.update({"sample_fraction_"+name: coverage[i]/max(sampled_sites, 1)
+                      for i, name in enumerate(("background", "weak", "texture", "edge"))})
+        return terms
 
     def normal_loss(self,prediction,target,case_ids):
         from .atlas_geometry import normal_residual_energy

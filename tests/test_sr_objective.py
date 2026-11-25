@@ -214,3 +214,22 @@ def test_sr_rejects_teacher_coupling_and_missing_train_atlas():
     cfg["mls_reg_weight"] = .05
     with pytest.raises(ValueError, match="TRAIN atlas and case IDs"):
         HaarObjective(model, cfg)(lr, base, hr)
+
+
+def test_sr_ssim_uses_deployed_reconstruction_and_adds_dimensionless_loss():
+    from vemgsbm.mri_metrics import mean_xy_ssim
+    model, (lr, base, hr) = ToyEndpoint(), batch(16)
+    torch.manual_seed(21)
+    original = HaarObjective(model, config(steps=4))(lr, base, hr)
+    torch.manual_seed(21)
+    updated = HaarObjective(model, config(steps=4, ssim_weight=.3))(lr, base, hr)
+    extra = .3 * (updated["start_ssim_loss"] + .5 * (updated["rollout_ssim_loss"] + updated["intermediate_ssim_loss"]))
+    torch.testing.assert_close(updated["loss"], original["loss"] + extra)
+    assert all(updated[f"{phase}_ssim_items"] == 2 for phase in ("start", "rollout", "intermediate"))
+    cond = model.lr_encoder(lr[:2])
+    with torch.no_grad():
+        endpoint = integrate_endpoint(lambda x,t: model(x,cond,t)[0], model.initial_state(lr[:2],base[:2]),4,sigma_bridge=0.)
+        image = (base[:2] + model.codec.decode(model.denormalize_haar(endpoint))).clamp(0,1)
+    torch.testing.assert_close(updated["rollout_ssim_loss"], 1-mean_xy_ssim(image,hr[:2]))
+    updated["rollout_ssim_loss"].backward()
+    assert model.gain.grad.abs().sum() > 0 and torch.isfinite(model.gain.grad).all()

@@ -178,6 +178,40 @@ def _publish_epoch_history(run_dir, records):
         temp.unlink(missing_ok=True)
 
 
+def guarded_selection(metrics, baseline, best_score):
+    """Maximize whole-case SSIM subject to the frozen baseline's pooled PSNR.
+
+    No tolerated PSNR regression, and no metric rounding before comparison.
+    Eligibility is a validation result, not a promise about unseen TEST cases.
+    """
+    names = ("val_pooled_psnr_db", "val_mean_slice_ssim")
+    if any(not isinstance(row.get(k), (int, float)) or not math.isfinite(row[k])
+           for row in (metrics, baseline) for k in names):
+        raise ValueError("Finite whole-case PSNR and SSIM required for guarded selection")
+    score = 1 - metrics["val_mean_slice_ssim"]
+    eligible = metrics["val_pooled_psnr_db"] >= baseline["val_pooled_psnr_db"]
+    improved = eligible and score < best_score
+    return score, eligible, improved
+
+
+def validate_warm_start(saved, cfg, digest, identity):
+    """Require identical restoration contract while allowing new loss settings."""
+    prior = saved["config"]
+    if (saved.get("format_version") != 5 or prior.get("predict_target") != "x1"
+            or saved.get("stage") != "reconstruction"
+            or saved["manifest_sha256"] != digest or saved["data_identity"] != identity):
+        raise ValueError("Warm start requires an x1 checkpoint with identical data identity")
+    for key in ("mode", "model", "use_band_whitening", "sigma_0", "sigma_bridge"):
+        if cfg.get(key) != prior.get(key):
+            raise ValueError(f"Warm start restoration contract differs: {key}")
+    for key in ("steps", "sampler_type", "solver", "inference_sigma", "readout"):
+        if cfg["sampling"].get(key) != prior["sampling"].get(key):
+            raise ValueError(f"Warm start deployment contract differs: {key}")
+    for key in ("kind", "degradation", "scale", "patch_size", "channel_policy"):
+        if cfg["data"].get(key) != prior["data"].get(key):
+            raise ValueError(f"Warm start input contract differs: {key}")
+
+
 def run_training(config_path, stage="bridge", device_name="auto", resume=None, case_inventory=None):
     cfg = read_config(config_path)
     haar = cfg["mode"] in HAAR_MODES
@@ -195,8 +229,14 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
     if stage not in {"representation", "bridge"}:
         raise ValueError("Unknown stage")
     selection_metric = cfg["train"].get("selection_metric", "mse")
-    if selection_metric not in ("mse", "ssim") and not (haar and selection_metric == "pooled_psnr"):
+    if selection_metric not in ("mse", "ssim") and not (haar and selection_metric in {"pooled_psnr", "ssim_psnr_guard"}):
         raise ValueError("train.selection_metric must be mse or ssim")
+    guarded = selection_metric == "ssim_psnr_guard"
+    warm_path = cfg["train"].get("warm_start_checkpoint")
+    if warm_path and (not x1 or cfg["train"].get("objective") != "sr_reconstruction"):
+        raise ValueError("Warm start requires x1 SR reconstruction")
+    if guarded and (not warm_path or not x1):
+        raise ValueError("Guarded selection requires an x1 warm_start_checkpoint")
     paired_mri = cfg["data"].get("kind") == "paired_mri_png"
     if selection_metric == "ssim" and not paired_mri:
         raise ValueError("SSIM checkpoint selection requires paired MRI")
@@ -256,12 +296,21 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
         atlas_payload = None
         spatial_payload = None
         old = load_checkpoint(project_path(resume)) if resume else None
+        warm = load_checkpoint(project_path(warm_path)) if warm_path and not resume else None
+        baseline_validation = old.get("baseline_validation") if old else None
+        warm_start_provenance = old.get("warm_start_provenance") if old else None
+        if warm is not None:
+            from .runtime import fingerprint
+            validate_warm_start(warm, cfg, digest, identity)
+            warm_start_provenance = dict(checkpoint=str(project_path(warm_path)),
+                                         sha256=fingerprint(project_path(warm_path)), epoch=warm["epoch"],
+                                         weights="ema_model" if warm.get("evaluation_weights") == "ema" else "model")
         if haar:
             model = make_haar_model(cfg).to(device)
             if x1 and cfg.get("use_band_whitening",True):
                 from .haar_stats import ensure_haar_statistics
-                if old is not None:
-                    band_stats = old["band_statistics"]
+                if old is not None or warm is not None:
+                    band_stats = (old if old is not None else warm)["band_statistics"]
                 else:
                     band_stats = context.main_call(lambda: ensure_haar_statistics(
                         train_set.all_cases, project_path(cfg["band_stats_cache"]), device=device),
@@ -269,6 +318,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 model.set_band_statistics(band_stats)
             else:
                 band_stats = None
+            if warm is not None:
+                model.load_state_dict(warm[warm_start_provenance["weights"]])
             teacher = None
             if x1 and cfg.get("mls_reg_weight",0.):
                 from .spatial_atlas import TrainingMLSAtlas, prepare_training_mls
@@ -356,6 +407,43 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 elif (run_dir / "metrics.jsonl").is_file():
                     history = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()]
                     history = [row for row in history if row["epoch"] <= start]
+        if guarded and resume and baseline_validation is None:
+            raise ValueError("Guarded resume requires saved baseline validation")
+
+        def make_checkpoint(epoch_number, payload, origin):
+            checkpoint = {"format_version": 5 if x1 else (4 if spatial_payload is not None else (3 if haar else 2)),
+                          "algorithm": cfg["mode"] if haar else "paired_conditional_variational_gsbm",
+                          "stage": "representation" if stage == "representation" else "reconstruction",
+                          "training_stage": stage, "config": cfg, "epoch": epoch_number,
+                          "model": (encoder if stage == "representation" else model).state_dict(),
+                          "optimizer": optimizer.state_dict(), "best": best, "world_size": context.world_size,
+                          "manifest_sha256": digest, "data_identity": identity,
+                          "metric": payload, "stale_epochs": stale_epochs}
+            if spatial_payload is not None:
+                checkpoint["spatial_atlas"] = spatial_payload
+            if x1:
+                checkpoint.update(ema_model=ema.model.state_dict(), ema_updates=ema.updates,
+                                  evaluation_weights="ema", scheduler=scheduler.state_dict(),
+                                  band_statistics=band_stats)
+                if cfg.get("mls_reg_weight", 0.):
+                    checkpoint["training_mls"] = mls_payload
+            if haar:
+                checkpoint["epoch_history"] = history
+            if warm_start_provenance is not None:
+                checkpoint["warm_start_provenance"] = warm_start_provenance
+            if guarded:
+                checkpoint.update(baseline_validation=baseline_validation, selection_origin=origin)
+            return checkpoint
+
+        if guarded and not resume:
+            ema.model.eval()
+            baseline_validation = _whole_case_validation(ema.model, val_set.all_cases, cfg, context, run_dir, 0)
+            best = 1 - baseline_validation["val_mean_slice_ssim"]
+            baseline_record = dict(epoch=0, selection_origin="warm_start_fallback", **baseline_validation)
+            context.main_call(lambda: atomic_save(baseline_record, run_dir / "baseline_validation.json", json_file=True))
+            context.main_call(lambda: atomic_save(make_checkpoint(0, None, "warm_start_fallback"), run_dir / "best.pt"))
+            context.main_call(lambda: print(json.dumps(baseline_record), flush=True))
+        del warm
         raw_objective = objective
         if context.is_distributed:
             objective = DistributedDataParallel(objective, device_ids=[context.local_rank] if device.type == "cuda" else None,
@@ -370,7 +458,7 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                                            ("source_conditioned_mls" if source_routing else ("mls" if atlas_options else "land"))),
                               "atlas": atlas_payload["diagnostics"] if atlas_payload else None}), flush=True)
         for epoch in range(start, cfg["train"]["epochs"]):
-            if (selection_metric == "pooled_psnr" and cfg["train"].get("whole_val_patience") is not None
+            if (selection_metric in {"pooled_psnr", "ssim_psnr_guard"} and cfg["train"].get("whole_val_patience") is not None
                     and epoch >= cfg["train"].get("minimum_epochs", 0)
                     and stale_epochs >= cfg["train"]["whole_val_patience"]):
                 break
@@ -442,7 +530,8 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                     names = [k for k in ("loss", "endpoint_pixel_mse", "rollout_pixel_mse",
                                          "coefficient_loss", "mls_normal_loss", "grad_norm",
                                          "start_pixel_mse", "start_hf_mse", "start_edge_mse",
-                                         "start_mls_reconstruction_mse", "rollout_hf_mse",
+                                         "start_mls_reconstruction_mse", "start_ssim_loss", "rollout_ssim_loss",
+                                         "rollout_mls_local_mse", "rollout_mls_neighbor_mse", "rollout_hf_mse",
                                          "rollout_edge_mse", "rollout_mls_reconstruction_mse",
                                          "forward_endpoint_equivalent_mse", "reverse_endpoint_equivalent_mse")
                              if k in totals]
@@ -528,14 +617,21 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 raise RuntimeError("Invalid validation accounting/score")
             validation = total / items
             score = 1 - ssim_total / items if stage == "bridge" and selection_metric == "ssim" else validation
-            if selection_metric == "pooled_psnr":
+            if selection_metric in {"pooled_psnr", "ssim_psnr_guard"}:
                 whole_metrics = _whole_case_validation(eval_model, val_set.all_cases, cfg, context, run_dir, epoch + 1,
                                                       atlas=None if x1 else metric)
                 record.update(whole_metrics)
                 score = whole_metrics["val_pooled_mse"]
-            improved = score < best
+            if guarded:
+                score, eligible, improved = guarded_selection(whole_metrics, baseline_validation, best)
+                record.update(selection_eligible=eligible,
+                              psnr_delta_from_baseline=whole_metrics["val_pooled_psnr_db"] - baseline_validation["val_pooled_psnr_db"],
+                              ssim_delta_from_baseline=whole_metrics["val_mean_slice_ssim"] - baseline_validation["val_mean_slice_ssim"])
+            else:
+                improved = score < best
             stale_epochs = 0 if improved else stale_epochs + 1
-            best = min(best, score)
+            if improved:
+                best = score
             record.update(validation=validation, validation_items=int(items), selection_score=score,
                           selection_metric=selection_metric if stage == "bridge" else "representation_loss")
             if x1:
@@ -576,25 +672,10 @@ def run_training(config_path, stage="bridge", device_name="auto", resume=None, c
                 payload = metric_payload(metric)
 
             def save():
-                checkpoint = {"format_version": 5 if x1 else (4 if spatial_payload is not None else (3 if haar else 2)),
-                              "algorithm": cfg["mode"] if haar else "paired_conditional_variational_gsbm",
-                              "stage": "representation" if stage == "representation" else "reconstruction",
-                              "training_stage": stage, "config": cfg, "epoch": epoch + 1,
-                              "model": (encoder if stage == "representation" else model).state_dict(),
-                              "optimizer": optimizer.state_dict(), "best": best, "world_size": context.world_size,
-                              "manifest_sha256": digest, "data_identity": identity,
-                              "metric": payload, "stale_epochs": stale_epochs}
-                if spatial_payload is not None:
-                    checkpoint["spatial_atlas"] = spatial_payload
-                if x1:
-                    checkpoint.update(ema_model=ema.model.state_dict(),ema_updates=ema.updates,
-                                      evaluation_weights="ema",scheduler=scheduler.state_dict(),
-                                      band_statistics=band_stats)
-                    if cfg.get("mls_reg_weight",0.):
-                        checkpoint["training_mls"] = mls_payload
                 if haar:
                     history.append(record)
-                    checkpoint["epoch_history"] = history
+                checkpoint = make_checkpoint(epoch + 1, payload,
+                                             "eligible_finetune" if improved else "training_candidate")
                 if improved:
                     atomic_save(checkpoint, run_dir / "best.pt")
                 atomic_save(checkpoint, run_dir / "last.pt")

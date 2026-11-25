@@ -43,3 +43,4 @@ outputs/
 *.zip
 slurm-*.out
 *.log
+/reports/test_tmp*/

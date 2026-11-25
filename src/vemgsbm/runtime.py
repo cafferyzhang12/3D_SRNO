@@ -98,7 +98,7 @@ def read_config(path):
                     raise ValueError("SR rollout and deployment must use the same time grid")
                 if cfg.get("straightening"):
                     raise ValueError("SR reconstruction is supervised by paired HR, not a teacher endpoint")
-                for key, default in (("start_weight",1.),("rollout_weight",1.),("hf_weight",.1),("edge_weight",.05)):
+                for key, default in (("start_weight",1.),("rollout_weight",1.),("hf_weight",.1),("edge_weight",.05),("ssim_weight",0.)):
                     value = cfg["train"].get(key,default)
                     if not isinstance(value,(int,float)) or not math.isfinite(value) or value < 0:
                         raise ValueError(f"Invalid SR {key}")
