@@ -1,0 +1,72 @@
+{
+  "source": "VAL",
+  "test_used": false,
+  "physical_ceiling_identified": false,
+  "baselines": {
+    "bicubic": {
+      "psnr": 28.787419496072673,
+      "ssim": 0.8671308567407398,
+      "local_variance_ratio": 0.4352685267025506,
+      "lpips": 0.3163735640650036,
+      "fid": 107.27208680693504,
+      "slice_count": 595,
+      "pixel_count": 155975680
+    },
+    "lanczos": {
+      "psnr": 28.86913465800813,
+      "ssim": 0.8676906773541427,
+      "local_variance_ratio": 0.4524587577594317,
+      "lpips": 0.3190268313183504,
+      "fid": 107.89041221090962,
+      "slice_count": 595,
+      "pixel_count": 155975680
+    }
+  },
+  "legacy_gradient_probe": {
+    "status": "measured_train",
+    "items": 2,
+    "ssim_items": 1,
+    "values": {
+      "L_pixel": 0.4780553877353668,
+      "L_HaarHF": 0.4564768075942993,
+      "L_edge": 0.09660930186510086,
+      "L_SSIM": 0.06472398637199617,
+      "L_MLS": 0.03450889140367508
+    },
+    "gradient_norms": {
+      "L_pixel": {
+        "raw_norm": 2.2560050530320037,
+        "weighted_norm": 2.2560050530320037,
+        "norm_share": 0.8233560605288499
+      },
+      "L_HaarHF": {
+        "raw_norm": 2.249623096097371,
+        "weighted_norm": 0.22496230960973712,
+        "norm_share": 0.08210268889194593
+      },
+      "L_edge": {
+        "raw_norm": 0.47472695655309244,
+        "weighted_norm": 0.023736347827654623,
+        "norm_share": 0.008662864390509409
+      },
+      "L_SSIM": {
+        "raw_norm": 0.706078836965965,
+        "weighted_norm": 0.21182365108978948,
+        "norm_share": 0.07730757812520403
+      },
+      "L_MLS": {
+        "raw_norm": 0.46968224870739567,
+        "weighted_norm": 0.023484112435369783,
+        "norm_share": 0.008570808063490778
+      }
+    },
+    "atlas_coordinate_clipping": {
+      "probed_sites": 512,
+      "hard_clipped_fraction": 0.775390625,
+      "quadratic_supported_fraction": 0.7250000238418579
+    },
+    "peak_cuda_bytes": 2517796352
+  },
+  "perceptual_status": "real pretrained models",
+  "peak_cuda_bytes": 2517796352
+}

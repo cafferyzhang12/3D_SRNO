@@ -117,3 +117,7 @@ bash scripts/submit_mri_v2_ablation.sh
 北京时间2026-11-25 20:05核验：gate **5345082** 已在 **gpua800n24** 运行；4×A800、high QOS、fundiff。训练/VAL依赖任务依次为：exp1 **5345083/5345084**，exp2 **5345085/5345086**，exp3 **5345087/5345088**，exp4 **5345089/5345090**。九个任务全部实际核验为high、gres:gpu:4。原始回执v2_cluster_jobs.tsv，结构化记录v2_cluster_submission.json。
 
 当前只证明提交与gate启动，正式GPU显存、真实VAL天花板、训练改善和最终SSIM仍等待任务产出。依赖afterok会在预检失败时阻止重训练。按用户要求不持续监督长训练。
+
+## 2026-11-26 启动修复
+
+上面2026-11-25提交的预检5345082后来因完整尺寸跨Z SDPA CUDA启动限制失败，依赖训练/VAL均取消，未产生正式训练结果。该错误已复现定位并修复；新集群全量356项通过、四组全尺寸显存校准和四rank更新验证通过。新预检5362246成功完成，训练5362247已启动。详见 [CUDA修复记录](MRI_V2_CUDA_FIX_20261126.md) 及 `reports/mri/v2_cuda_fix_submission.json`。

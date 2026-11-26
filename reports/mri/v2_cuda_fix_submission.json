@@ -1,0 +1,86 @@
+{
+  "source_commit": "a00a03b",
+  "github_branch": "main",
+  "source_sha256": "d3d5651c5f4701aa2adddd78fdd71be4f11fc14b4d3be6f34afc27d67aa0c6d7",
+  "remote_project": "/gpfs/share/home/t2504041104/3D_SRNO_4/jetatlas_freq_v2_cuda_fix_20261126",
+  "run_id": "mri_v2_cuda_fix_20261126",
+  "qos": "high",
+  "gpus_per_job": 4,
+  "environment": "fundiff",
+  "test_used": false,
+  "diagnosis": {
+    "original_shape": [
+      131072,
+      4,
+      7,
+      16
+    ],
+    "failure_operator": "cross-Z scaled_dot_product_attention",
+    "repro_job": 5362197,
+    "fixed_gpu_job": 5362215
+  },
+  "gate": {
+    "job_id": 5362246,
+    "state": "COMPLETED",
+    "exit_code": "0:0",
+    "elapsed": "00:08:51",
+    "node": "gpua800n04",
+    "pytest_passed": 356,
+    "ddp_all_four_arms_passed": true
+  },
+  "training": {
+    "exp1": {
+      "job_id": 5362247,
+      "state": "RUNNING",
+      "node": "gpua800n04",
+      "first_real_batch_confirmed": true,
+      "first_batch": {
+        "epoch": 1,
+        "batch": 1,
+        "loss": 0.06594937340893706,
+        "gpu_peak_allocated_gib": 41.846014976501465
+      }
+    },
+    "exp2": {
+      "job_id": 5362249,
+      "state": "PENDING",
+      "reason": "Dependency"
+    },
+    "exp3": {
+      "job_id": 5362251,
+      "state": "PENDING",
+      "reason": "Dependency"
+    },
+    "exp4": {
+      "job_id": 5362253,
+      "state": "PENDING",
+      "reason": "Dependency"
+    }
+  },
+  "validation_jobs": [
+    5362248,
+    5362250,
+    5362252,
+    5362254
+  ],
+  "budget": {
+    "batch_per_gpu": 48,
+    "accumulation_steps": 1,
+    "global_batch": 192,
+    "epochs": 60,
+    "learning_rate": 0.00025,
+    "amp": "bfloat16",
+    "gradient_checkpointing": true,
+    "lr_patch": [
+      7,
+      64,
+      64
+    ],
+    "hr_patch": [
+      7,
+      256,
+      256
+    ]
+  },
+  "observed_local": "2026-11-26 Asia/Shanghai"
+}

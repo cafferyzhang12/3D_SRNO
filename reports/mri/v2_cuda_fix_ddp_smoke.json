@@ -1,0 +1,219 @@
+{
+  "status": "passed",
+  "world_size": 4,
+  "real_mri_quality_claim": false,
+  "arms": [
+    {
+      "arm": 1,
+      "batch_per_gpu": 48,
+      "accumulation_steps": 1,
+      "effective_global_batch": 192,
+      "updates": 2,
+      "ranks": [
+        {
+          "rank": 0,
+          "losses": [
+            0.007359740094665191,
+            0.007577448346805338
+          ],
+          "gradient_norm": 0.3042272925376892,
+          "peak_allocated_bytes": 45144154112,
+          "peak_reserved_bytes": 54748250112,
+          "parameters_synced": true
+        },
+        {
+          "rank": 1,
+          "losses": [
+            0.007360720664388665,
+            0.00758127481940758
+          ],
+          "gradient_norm": 0.3042272925376892,
+          "peak_allocated_bytes": 45144154112,
+          "peak_reserved_bytes": 54748250112,
+          "parameters_synced": true
+        },
+        {
+          "rank": 2,
+          "losses": [
+            0.007368762258536698,
+            0.007587117218543904
+          ],
+          "gradient_norm": 0.3042272925376892,
+          "peak_allocated_bytes": 45144154112,
+          "peak_reserved_bytes": 54748250112,
+          "parameters_synced": true
+        },
+        {
+          "rank": 3,
+          "losses": [
+            0.007359451193899735,
+            0.007578900069724404
+          ],
+          "gradient_norm": 0.3042272925376892,
+          "peak_allocated_bytes": 45144154112,
+          "peak_reserved_bytes": 54748250112,
+          "parameters_synced": true
+        }
+      ]
+    },
+    {
+      "arm": 2,
+      "batch_per_gpu": 48,
+      "accumulation_steps": 1,
+      "effective_global_batch": 192,
+      "updates": 2,
+      "ranks": [
+        {
+          "rank": 0,
+          "losses": [
+            0.06656006028621753,
+            0.06705171976011391
+          ],
+          "gradient_norm": 0.6846531629562378,
+          "peak_allocated_bytes": 50688544768,
+          "peak_reserved_bytes": 61815652352,
+          "parameters_synced": true
+        },
+        {
+          "rank": 1,
+          "losses": [
+            0.06656162908198954,
+            0.06700936614803821
+          ],
+          "gradient_norm": 0.6846531629562378,
+          "peak_allocated_bytes": 50688544768,
+          "peak_reserved_bytes": 61815652352,
+          "parameters_synced": true
+        },
+        {
+          "rank": 2,
+          "losses": [
+            0.0666086904371243,
+            0.06706526049529726
+          ],
+          "gradient_norm": 0.6846531629562378,
+          "peak_allocated_bytes": 50688346624,
+          "peak_reserved_bytes": 61821943808,
+          "parameters_synced": true
+        },
+        {
+          "rank": 3,
+          "losses": [
+            0.06657376975586927,
+            0.06703669070450684
+          ],
+          "gradient_norm": 0.6846531629562378,
+          "peak_allocated_bytes": 50688544768,
+          "peak_reserved_bytes": 61815652352,
+          "parameters_synced": true
+        }
+      ]
+    },
+    {
+      "arm": 3,
+      "batch_per_gpu": 48,
+      "accumulation_steps": 1,
+      "effective_global_batch": 192,
+      "updates": 2,
+      "ranks": [
+        {
+          "rank": 0,
+          "losses": [
+            0.06679165874644943,
+            0.0672695604084875
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50734503936,
+          "peak_reserved_bytes": 62084087808,
+          "parameters_synced": true
+        },
+        {
+          "rank": 1,
+          "losses": [
+            0.06680867112605543,
+            0.06726428965733224
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50734503936,
+          "peak_reserved_bytes": 62086184960,
+          "parameters_synced": true
+        },
+        {
+          "rank": 2,
+          "losses": [
+            0.06685354337837472,
+            0.06730516104017685
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50734074368,
+          "peak_reserved_bytes": 62090379264,
+          "parameters_synced": true
+        },
+        {
+          "rank": 3,
+          "losses": [
+            0.0668099161261675,
+            0.06730821328169868
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50734503936,
+          "peak_reserved_bytes": 62084087808,
+          "parameters_synced": true
+        }
+      ]
+    },
+    {
+      "arm": 4,
+      "batch_per_gpu": 48,
+      "accumulation_steps": 1,
+      "effective_global_batch": 192,
+      "updates": 2,
+      "ranks": [
+        {
+          "rank": 0,
+          "losses": [
+            0.06679165874644943,
+            0.0672695604084875
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50733123072,
+          "peak_reserved_bytes": 62084087808,
+          "parameters_synced": true
+        },
+        {
+          "rank": 1,
+          "losses": [
+            0.06680867112605543,
+            0.06726428965733224
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50734074368,
+          "peak_reserved_bytes": 62090379264,
+          "parameters_synced": true
+        },
+        {
+          "rank": 2,
+          "losses": [
+            0.06685354337837472,
+            0.06730516104017685
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50732924928,
+          "peak_reserved_bytes": 62090379264,
+          "parameters_synced": true
+        },
+        {
+          "rank": 3,
+          "losses": [
+            0.0668099161261675,
+            0.06730821328169868
+          ],
+          "gradient_norm": 0.6845811605453491,
+          "peak_allocated_bytes": 50732924928,
+          "peak_reserved_bytes": 62090379264,
+          "parameters_synced": true
+        }
+      ]
+    }
+  ]
+}

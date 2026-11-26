@@ -1,0 +1,322 @@
+{
+  "status": "ok",
+  "trials": [
+    {
+      "batch": 32,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        32,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        32,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 9623063040,
+      "loss": 0.007401375446991665,
+      "gradient_norm": 0.04291415587067604,
+      "peak_allocated_bytes": 30125314560,
+      "peak_reserved_bytes": 36582719488,
+      "budget_peak_bytes": 36582719488,
+      "ddp_bucket_reserve_bytes": 13976616,
+      "full_atlas_extra_reserve_bytes": 0,
+      "elapsed_seconds": 3.950101777911186,
+      "persistent_reserved_tensor_bytes": 13976616,
+      "arm": 1
+    },
+    {
+      "batch": 32,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        32,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        32,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 13068521472,
+      "loss": 0.06664867682464504,
+      "gradient_norm": 0.09663441777229309,
+      "peak_allocated_bytes": 33831653888,
+      "peak_reserved_bytes": 41284534272,
+      "budget_peak_bytes": 41284534272,
+      "ddp_bucket_reserve_bytes": 13976616,
+      "full_atlas_extra_reserve_bytes": 0,
+      "elapsed_seconds": 5.03301022015512,
+      "persistent_reserved_tensor_bytes": 13976616,
+      "arm": 2
+    },
+    {
+      "batch": 32,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        32,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        32,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 13098255360,
+      "loss": 0.06689302720095114,
+      "gradient_norm": 0.09663678705692291,
+      "peak_allocated_bytes": 33890804224,
+      "peak_reserved_bytes": 41475375104,
+      "budget_peak_bytes": 41475375104,
+      "ddp_bucket_reserve_bytes": 14025336,
+      "full_atlas_extra_reserve_bytes": 29436060,
+      "elapsed_seconds": 28.623161423951387,
+      "persistent_reserved_tensor_bytes": 43461396,
+      "arm": 3
+    },
+    {
+      "batch": 32,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        32,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        32,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 13098255360,
+      "loss": 0.06689302720095114,
+      "gradient_norm": 0.09663678705692291,
+      "peak_allocated_bytes": 33890804224,
+      "peak_reserved_bytes": 41475375104,
+      "budget_peak_bytes": 41475375104,
+      "ddp_bucket_reserve_bytes": 14025336,
+      "full_atlas_extra_reserve_bytes": 29436060,
+      "elapsed_seconds": 29.033882284536958,
+      "persistent_reserved_tensor_bytes": 43461396,
+      "arm": 4
+    },
+    {
+      "batch": 48,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        48,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        48,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 14351358464,
+      "loss": 0.007409584107497813,
+      "gradient_norm": 0.04319590702652931,
+      "peak_allocated_bytes": 45107649024,
+      "peak_reserved_bytes": 54748250112,
+      "budget_peak_bytes": 54748250112,
+      "ddp_bucket_reserve_bytes": 13976616,
+      "full_atlas_extra_reserve_bytes": 0,
+      "elapsed_seconds": 4.371810223907232,
+      "persistent_reserved_tensor_bytes": 13976616,
+      "arm": 1
+    },
+    {
+      "batch": 48,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        48,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        48,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 19519352320,
+      "loss": 0.06665738516091538,
+      "gradient_norm": 0.09724283218383789,
+      "peak_allocated_bytes": 50661321728,
+      "peak_reserved_bytes": 61798875136,
+      "budget_peak_bytes": 61798875136,
+      "ddp_bucket_reserve_bytes": 13976616,
+      "full_atlas_extra_reserve_bytes": 0,
+      "elapsed_seconds": 6.3608584720641375,
+      "persistent_reserved_tensor_bytes": 13976616,
+      "arm": 2
+    },
+    {
+      "batch": 48,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        48,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        48,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 19549086208,
+      "loss": 0.06690966618550179,
+      "gradient_norm": 0.09724531322717667,
+      "peak_allocated_bytes": 50735134720,
+      "peak_reserved_bytes": 62423826432,
+      "budget_peak_bytes": 62423826432,
+      "ddp_bucket_reserve_bytes": 14025336,
+      "full_atlas_extra_reserve_bytes": 29436060,
+      "elapsed_seconds": 42.1255709156394,
+      "persistent_reserved_tensor_bytes": 43461396,
+      "arm": 3
+    },
+    {
+      "batch": 48,
+      "status": "ok",
+      "total_bytes": 85094825984,
+      "gpu": "NVIDIA A800-SXM4-80GB",
+      "lr_shape": [
+        48,
+        1,
+        7,
+        64,
+        64
+      ],
+      "hr_shape": [
+        48,
+        1,
+        7,
+        256,
+        256
+      ],
+      "amp": "bfloat16",
+      "checkpointing": true,
+      "torch_version": "2.8.0+cu128",
+      "cuda_version": "12.8",
+      "forward_peak_bytes": 19549086208,
+      "loss": 0.06690966618550179,
+      "gradient_norm": 0.09724531322717667,
+      "peak_allocated_bytes": 50735134720,
+      "peak_reserved_bytes": 62423826432,
+      "budget_peak_bytes": 62423826432,
+      "ddp_bucket_reserve_bytes": 14025336,
+      "full_atlas_extra_reserve_bytes": 29436060,
+      "elapsed_seconds": 41.588534163311124,
+      "persistent_reserved_tensor_bytes": 43461396,
+      "arm": 4
+    },
+    {
+      "arm": 1,
+      "batch": 64,
+      "status": "skipped_predicted_oom",
+      "total_bytes": 85094825984,
+      "prediction_only_bytes": 83231768576.0
+    },
+    {
+      "arm": 2,
+      "batch": 64,
+      "status": "skipped_predicted_oom",
+      "total_bytes": 85094825984,
+      "prediction_only_bytes": 83231768576.0
+    },
+    {
+      "arm": 3,
+      "batch": 64,
+      "status": "skipped_predicted_oom",
+      "total_bytes": 85094825984,
+      "prediction_only_bytes": 83231768576.0
+    },
+    {
+      "arm": 4,
+      "batch": 64,
+      "status": "skipped_predicted_oom",
+      "total_bytes": 85094825984,
+      "prediction_only_bytes": 83231768576.0
+    }
+  ],
+  "budget": {
+    "batch_size": 48,
+    "accumulation_steps": 1,
+    "effective_global_batch": 192,
+    "world_size": 4,
+    "safety_fraction": 0.82
+  },
+  "configs_changed": true,
+  "limitation": "Synthetic forward/backward plus optimizer/EMA/extractor/DDP/full-atlas reserves; VAL inference peak measured separately"
+}
