@@ -10,6 +10,27 @@ from .models import batch_time
 from .momentum.model import HaarXY
 
 
+def batched_attention(query, key, value, max_batch=16384):
+    """SDPA over independent sequences without exceeding CUDA launch grids.
+
+    Cross-Z attention expands B*Y*X into SDPA's batch dimension. Fused CUDA
+    backends in the deployed PyTorch 2.8 fail for large batches (e.g. 131072).
+    Splitting only that dimension preserves every token, head and gradient;
+    attention within each independent window/Z sequence remains unchanged.
+    """
+    if type(max_batch) is not int or max_batch < 1:
+        raise ValueError('Attention max_batch must be a positive integer')
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError('Expected attention tensors shaped batch,heads,tokens,features')
+    if not (query.shape[0] == key.shape[0] == value.shape[0]) or query.shape[0] < 1:
+        raise ValueError('Attention tensors require aligned nonempty sequence batches')
+    if query.shape[0] <= max_batch:
+        return F.scaled_dot_product_attention(query,key,value)
+    return torch.cat([F.scaled_dot_product_attention(query[i:i+max_batch],
+        key[i:i+max_batch],value[i:i+max_batch])
+        for i in range(0,query.shape[0],max_batch)],dim=0)
+
+
 def _lanczos_axis(value, output, axis, radius=3):
     """Separable Lanczos with pixel-centre alignment and replicated boundaries."""
     size = value.shape[axis]
@@ -97,7 +118,7 @@ class WindowAttention25D(nn.Module):
         tokens = tokens.reshape(-1,size*size,c)
         qkv = self.qkv(self.norm(tokens)).reshape(-1,size*size,3,self.heads,c//self.heads)
         q,k,v = qkv.permute(2,0,3,1,4).unbind(0)
-        attended = F.scaled_dot_product_attention(q,k,v).transpose(1,2).reshape_as(tokens)
+        attended = batched_attention(q,k,v).transpose(1,2).reshape_as(tokens)
         attended = self.projection(attended).reshape(b*z,hp//size,wp//size,size,size,c)
         attended = attended.permute(0,5,1,3,2,4).reshape(b*z,c,hp,wp)
         attended = attended[...,top:top+h,left:left+w].reshape(b,z,c,h,w).permute(0,2,1,3,4)
@@ -119,7 +140,7 @@ class CrossSliceAttention(nn.Module):
         tokens = x.permute(0,3,4,2,1).reshape(b*h*w,z,c)
         qkv = self.qkv(self.norm(tokens)).reshape(b*h*w,z,3,self.heads,c//self.heads)
         q,k,v = qkv.permute(2,0,3,1,4).unbind(0)
-        attended = F.scaled_dot_product_attention(q,k,v).transpose(1,2).reshape_as(tokens)
+        attended = batched_attention(q,k,v).transpose(1,2).reshape_as(tokens)
         attended = self.projection(attended).reshape(b,h,w,z,c).permute(0,4,3,1,2)
         return x+self.scale*attended
 

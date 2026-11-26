@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 import yaml
 
@@ -118,7 +119,9 @@ def worker(config,batch,output,atlas_file):
     torch.cuda.reset_peak_memory_stats(device)
     started=time.perf_counter()
     result=dict(batch=batch,status='error',total_bytes=total,gpu=torch.cuda.get_device_name(device),
-                lr_shape=[batch,1,7,64,64],hr_shape=[batch,1,7,256,256],amp='bfloat16',checkpointing=True)
+                lr_shape=[batch,1,7,64,64],hr_shape=[batch,1,7,256,256],amp='bfloat16',checkpointing=True,
+                torch_version=str(torch.__version__),cuda_version=torch.version.cuda)
+    phase='setup'
     try:
         model=make_model(cfg).to(device).train()
         model.set_band_statistics(dict(mean=torch.zeros(16),std=torch.ones(16)*.1))
@@ -154,6 +157,7 @@ def worker(config,batch,output,atlas_file):
             xx=torch.linspace(-1,1,256,device=device)[None,None,None,None,:]
             hr=(base+.015*torch.sin(27*xx)*torch.cos(23*yy)).clamp(0,1)
         ids=[f'probe-TRAIN-{i%5}' for i in range(batch)]
+        phase='forward'
         with torch.autocast('cuda',dtype=torch.bfloat16):
             terms=objective(lr,hr,ids)
             loss=terms['loss']
@@ -161,7 +165,9 @@ def worker(config,batch,output,atlas_file):
         result['forward_peak_bytes']=torch.cuda.max_memory_allocated(device)
         if not torch.isfinite(loss):
             raise FloatingPointError('Nonfinite forward loss')
+        phase='backward'
         loss.backward()
+        phase='optimizer'
         norm=torch.nn.utils.clip_grad_norm_(parameters,cfg['train'].get('clip_grad_norm',1.),error_if_nonfinite=True)
         optimizer.step();ema.update(model)
         torch.cuda.synchronize(device)
@@ -179,6 +185,7 @@ def worker(config,batch,output,atlas_file):
             elapsed_seconds=time.perf_counter()-started)
     except Exception as exc:
         result.update(status='error',error=f'{type(exc).__name__}: {exc}',budget_peak_bytes=total+1,
+            failure_phase=phase,traceback=traceback.format_exc(),
             elapsed_seconds=time.perf_counter()-started)
     Path(output).write_text(json.dumps(result,indent=2,allow_nan=False),encoding='utf-8')
     return result
@@ -212,6 +219,11 @@ def run(configs_dir,output,*,candidates=DEFAULT_CANDIDATES,safety=.82,world_size
         atlas_file=Path(temp)/'tiny_train_atlas.pt'
         torch.save(tiny_atlas_payload(configs[2]),atlas_file)
         for batch in order:
+            # Once a larger common batch fits, smaller trials add no information.
+            if any(all(any(r['batch']==larger and r['arm']==arm and r['status']=='ok'
+                           and r['budget_peak_bytes']<=safety*r['total_bytes'] for r in rows)
+                       for arm in range(1,5)) for larger in candidates if larger>batch):
+                continue
             if batch>32:
                 previous=[r for r in rows if r['status']=='ok' and r['batch']<batch]
                 by_arm={arm:[r for r in previous if r['arm']==arm] for arm in range(1,5)}

@@ -1,0 +1,34 @@
+{
+  "batch": 32,
+  "status": "ok",
+  "total_bytes": 85094825984,
+  "gpu": "NVIDIA A800-SXM4-80GB",
+  "lr_shape": [
+    32,
+    1,
+    7,
+    64,
+    64
+  ],
+  "hr_shape": [
+    32,
+    1,
+    7,
+    256,
+    256
+  ],
+  "amp": "bfloat16",
+  "checkpointing": true,
+  "torch_version": "2.8.0+cu128",
+  "cuda_version": "12.8",
+  "forward_peak_bytes": 9623063040,
+  "loss": 0.007401375446991665,
+  "gradient_norm": 0.04291415587067604,
+  "peak_allocated_bytes": 30125314560,
+  "peak_reserved_bytes": 36582719488,
+  "budget_peak_bytes": 36582719488,
+  "ddp_bucket_reserve_bytes": 13976616,
+  "full_atlas_extra_reserve_bytes": 0,
+  "elapsed_seconds": 6.900053409859538,
+  "persistent_reserved_tensor_bytes": 13976616
+}

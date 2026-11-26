@@ -228,7 +228,7 @@ def run(config, inventory=None, device='auto', resume=None, evaluate=False):
                     optimizer.step();scheduler.step();optimizer.zero_grad(set_to_none=True);ema.update(model)
                 for k,v in terms.items(): sums[k]=sums.get(k,0.)+float(v.detach())
                 batches+=1
-                if (index+1)%cfg['train'].get('report_every_updates',32)==0 and context.is_main:
+                if (index==0 or (index+1)%cfg['train'].get('report_every_updates',32)==0) and context.is_main:
                     print(json.dumps({'epoch':epoch+1,'batch':index+1,'loss':float(loss)*window,
                         'gpu_peak_gib':torch.cuda.max_memory_allocated()/2**30 if bf16 else None}),flush=True)
             ema.model.eval()
