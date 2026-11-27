@@ -1,0 +1,53 @@
+{
+  "identity": {
+    "checkpoint_sha256": "2fbc17894b857b5cf7236bc1a7856cdca07067d6a3325b0759f03fe3e099cfcd",
+    "source_checkpoint": "D:\\3D_SRNO_4\\outputs\\v2-e2e-d966o1je\\exp3\\last.pt",
+    "frozen_checkpoint": "D:\\3D_SRNO_4\\outputs\\exp3_shared_compare_cpu_20261127\\checkpoint.pt",
+    "epoch": 1,
+    "weights": "ema",
+    "selection": "frozen exp3 offline-VAL selection; online metrics do not reselect weights",
+    "inventory_sha256": "8747a91b98ebf2b260d9b7ee9a39b0a51ccf7a2ad588589a6ced3d666a28b1d1",
+    "test_used": false,
+    "sampling": {
+      "steps": 4,
+      "sampler_type": "ode",
+      "solver": "heun",
+      "temperature": 0.1,
+      "tile_batch": 1,
+      "sigma": 0.08,
+      "inference_sigma": 0.0
+    },
+    "validation_seed": 42,
+    "world_size": 1
+  },
+  "results": {
+    "offline": {
+      "psnr": 20.812028071150866,
+      "ssim": 0.6443909010795665,
+      "lpips": 0.29204119245211285,
+      "fid": 276.6810697536754,
+      "local_variance_ratio": 0.5200859903590743,
+      "textured_region_ssim": 0.6346693548340022,
+      "pixel_count": 3072,
+      "slice_count": 3
+    },
+    "online": {
+      "psnr": 20.812027955579225,
+      "ssim": 0.6443909010185608,
+      "lpips": 0.2920413513978322,
+      "fid": 276.6810697536754,
+      "local_variance_ratio": 0.5200857583180786,
+      "textured_region_ssim": 0.6346693548956313,
+      "pixel_count": 3072,
+      "slice_count": 3
+    }
+  },
+  "online_minus_offline": {
+    "psnr": -1.1557164114606167e-07,
+    "ssim": -6.100575600243019e-11,
+    "lpips": 1.5894571936403423e-07,
+    "fid": 0.0,
+    "local_variance_ratio": -2.3204099575124815e-07,
+    "textured_region_ssim": 6.162903520845475e-11
+  }
+}
