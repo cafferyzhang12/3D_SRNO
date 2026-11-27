@@ -1,0 +1,44 @@
+diff --git a/src/metrics.py b/src/metrics.py
+index a44f23b..2680daf 100644
+--- a/src/metrics.py
++++ b/src/metrics.py
+@@ -9,13 +9,18 @@ import torch
+ import torch.nn.functional as F
+ from torch import Tensor
+ 
+-import lpips as _lpips_lib
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    import lpips as _lpips_lib
+ 
+ _LPIPS_NET: _lpips_lib.LPIPS | None = None
+ 
+ 
+ def _get_lpips_net(device: torch.device) -> _lpips_lib.LPIPS:
+     """Lazy-init a singleton AlexNet LPIPS model."""
++    import lpips as _lpips_lib
++
+     global _LPIPS_NET
+     if _LPIPS_NET is None or next(_LPIPS_NET.parameters()).device != device:
+         _LPIPS_NET = _lpips_lib.LPIPS(net="alex").to(device)
+diff --git a/src/utils.py b/src/utils.py
+index 6a96c5c..646c5f8 100644
+--- a/src/utils.py
++++ b/src/utils.py
+@@ -12,7 +12,6 @@ from torch import Tensor
+ from torch.optim.lr_scheduler import LambdaLR
+ import torch.nn as nn
+ from torch.optim import AdamW
+-import wandb
+ 
+ 
+ Logs = List[Dict[str, float]]
+@@ -187,5 +186,7 @@ def try_until_no_except(func: Callable) -> None:
+ 
+ 
+ def wandb_log(logs: Logs, epoch: int):
++    import wandb
++
+     for d in logs:
+         wandb.log({"epoch": epoch, **d})

@@ -1,0 +1,204 @@
+{
+  "exp1": {
+    "completed_epochs": 35,
+    "last": {
+      "epoch": 35,
+      "psnr": 32.40330604600628,
+      "ssim": 0.9097083781475229,
+      "lpips": 0.20426114707433876,
+      "fid": 59.79610263579019,
+      "local_variance_ratio": 0.8806480043323717,
+      "textured_region_ssim": 0.8197696423743382,
+      "pixel_count": 155975680,
+      "slice_count": 595,
+      "train": {
+        "loss": 0.04907201326614325,
+        "start_charbonnier": 0.011782173980927398,
+        "start_fft_complex": 0.01747312874391424,
+        "start_fft_log": 0.01144170366966685,
+        "start_local_std": 0.005803181131378547,
+        "start_lpips": 0.0,
+        "start_msssim": 0.02622161376921359,
+        "start_ssim": 0.10646216655982511
+      },
+      "selection_eligible": true,
+      "learning_rate": 0.00010401272420468707
+    },
+    "best": {
+      "epoch": 35,
+      "psnr": 32.40330604600628,
+      "ssim": 0.9097083781475229,
+      "lpips": 0.20426114707433876,
+      "fid": 59.79610263579019,
+      "local_variance_ratio": 0.8806480043323717,
+      "textured_region_ssim": 0.8197696423743382,
+      "pixel_count": 155975680,
+      "slice_count": 595,
+      "train": {
+        "loss": 0.04907201326614325,
+        "start_charbonnier": 0.011782173980927398,
+        "start_fft_complex": 0.01747312874391424,
+        "start_fft_log": 0.01144170366966685,
+        "start_local_std": 0.005803181131378547,
+        "start_lpips": 0.0,
+        "start_msssim": 0.02622161376921359,
+        "start_ssim": 0.10646216655982511
+      },
+      "selection_eligible": true,
+      "learning_rate": 0.00010401272420468707
+    }
+  },
+  "edm_val": {
+    "method": "3d-edm",
+    "upstream_commit": "d9d82789f1b182cf05f7b654e77bf30a71a57250",
+    "config_sha256": "dd78f8842e5826e7a368aeb9fa691aded0dcb595b4dd34fd2c8fc0273a920192",
+    "inventory_sha256": "d5afbe3c1af2a773593ebb30a427c557cec21cb40dc9d3f91e3fadbc2f719703",
+    "manifest_sha256": "daa7c15eef632a9fbe9361d3dd7803969533241c7b8d7be26a2a131ec02110de",
+    "source_sha256": "81d1f405eb16faa74395c92459fcd41e6e71abd091d4b19dd5e43b322eb39e62",
+    "steps": 20,
+    "effective_batch": 2176,
+    "micro_batch": 8,
+    "train_patches_per_epoch": 262144,
+    "epochs": 8,
+    "initialization": "scratch",
+    "selection": "max whole-VAL pooled PSNR, then slice SSIM",
+    "model_parameters": 50713153,
+    "checkpoint_sha256": "430d7c3cadc19953c2c8580c0956c58f3647c3cf80eeb7017960a570fe39be98",
+    "epoch": 8,
+    "split": "val",
+    "case_count": 10,
+    "slice_count": 595,
+    "pixel_count": 155975680,
+    "all_mse": 0.0009374850096422126,
+    "all_psnr_db": 30.280356679007422,
+    "mean_slice_ssim": 0.8834532348744657,
+    "lpips": 0.26035439116614206,
+    "fid": 77.05977249729841,
+    "perceptual_protocol": {
+      "version": 1,
+      "lpips": "lpips 0.1.4, alex backbone, calibrated v0.1; grayscale repeated RGB, float32 [-1,1], native XY resolution; equal slice mean",
+      "fid": "torch-fidelity 0.3.0 TensorFlow-compatible InceptionV3 pool3 2048; grayscale repeated RGB; round(255*x) uint8; extractor TensorFlow-compatible bilinear resize to 299x299",
+      "fid_aggregation": "one cohort FID from float64 global feature sums and outer products, unbiased sample covariance (N-1); never mean case/rank FID",
+      "scope": "all retained slices, full field of view, no foreground cropping or per-image intensity normalization",
+      "interpretation": "2D ImageNet metrics on correlated MRI slices; FID is cohort-size dependent and is not a 3D anatomical or clinical metric",
+      "selection": "reporting only; LPIPS/FID never select TEST cases or checkpoints"
+    },
+    "weights": {
+      "sha256": {
+        "alexnet": "7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02",
+        "inception": "6726825d0af5f729cebd5821db510b11b1cfad8faad88a03f1befd49fb9129b2",
+        "lpips_calibration": "df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0"
+      },
+      "packages": {
+        "lpips": "0.1.4",
+        "torch-fidelity": "0.3.0",
+        "torch": "2.8.0+cu128",
+        "torchvision": "0.23.0"
+      },
+      "protocol": {
+        "version": 1,
+        "lpips": "lpips 0.1.4, alex backbone, calibrated v0.1; grayscale repeated RGB, float32 [-1,1], native XY resolution; equal slice mean",
+        "fid": "torch-fidelity 0.3.0 TensorFlow-compatible InceptionV3 pool3 2048; grayscale repeated RGB; round(255*x) uint8; extractor TensorFlow-compatible bilinear resize to 299x299",
+        "fid_aggregation": "one cohort FID from float64 global feature sums and outer products, unbiased sample covariance (N-1); never mean case/rank FID",
+        "scope": "all retained slices, full field of view, no foreground cropping or per-image intensity normalization",
+        "interpretation": "2D ImageNet metrics on correlated MRI slices; FID is cohort-size dependent and is not a 3D anatomical or clinical metric",
+        "selection": "reporting only; LPIPS/FID never select TEST cases or checkpoints"
+      },
+      "preflight": "real pretrained models: finite 2048 features and identical-image LPIPS zero"
+    }
+  },
+  "edm_test": {
+    "method": "3d-edm",
+    "upstream_commit": "d9d82789f1b182cf05f7b654e77bf30a71a57250",
+    "config_sha256": "dd78f8842e5826e7a368aeb9fa691aded0dcb595b4dd34fd2c8fc0273a920192",
+    "inventory_sha256": "d5afbe3c1af2a773593ebb30a427c557cec21cb40dc9d3f91e3fadbc2f719703",
+    "manifest_sha256": "daa7c15eef632a9fbe9361d3dd7803969533241c7b8d7be26a2a131ec02110de",
+    "source_sha256": "81d1f405eb16faa74395c92459fcd41e6e71abd091d4b19dd5e43b322eb39e62",
+    "steps": 20,
+    "effective_batch": 2176,
+    "micro_batch": 8,
+    "train_patches_per_epoch": 262144,
+    "epochs": 8,
+    "initialization": "scratch",
+    "selection": "max whole-VAL pooled PSNR, then slice SSIM",
+    "model_parameters": 50713153,
+    "checkpoint_sha256": "430d7c3cadc19953c2c8580c0956c58f3647c3cf80eeb7017960a570fe39be98",
+    "epoch": 8,
+    "split": "test",
+    "case_count": 84,
+    "slice_count": 14991,
+    "pixel_count": 3929800704,
+    "all_mse": 0.000850852664888897,
+    "all_psnr_db": 30.701456365845743,
+    "mean_slice_ssim": 0.9163855975694645,
+    "lpips": 0.1322986993810209,
+    "fid": 49.124829326130424,
+    "perceptual_protocol": {
+      "version": 1,
+      "lpips": "lpips 0.1.4, alex backbone, calibrated v0.1; grayscale repeated RGB, float32 [-1,1], native XY resolution; equal slice mean",
+      "fid": "torch-fidelity 0.3.0 TensorFlow-compatible InceptionV3 pool3 2048; grayscale repeated RGB; round(255*x) uint8; extractor TensorFlow-compatible bilinear resize to 299x299",
+      "fid_aggregation": "one cohort FID from float64 global feature sums and outer products, unbiased sample covariance (N-1); never mean case/rank FID",
+      "scope": "all retained slices, full field of view, no foreground cropping or per-image intensity normalization",
+      "interpretation": "2D ImageNet metrics on correlated MRI slices; FID is cohort-size dependent and is not a 3D anatomical or clinical metric",
+      "selection": "reporting only; LPIPS/FID never select TEST cases or checkpoints"
+    },
+    "weights": {
+      "sha256": {
+        "alexnet": "7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02",
+        "inception": "6726825d0af5f729cebd5821db510b11b1cfad8faad88a03f1befd49fb9129b2",
+        "lpips_calibration": "df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0"
+      },
+      "packages": {
+        "lpips": "0.1.4",
+        "torch-fidelity": "0.3.0",
+        "torch": "2.8.0+cu128",
+        "torchvision": "0.23.0"
+      },
+      "protocol": {
+        "version": 1,
+        "lpips": "lpips 0.1.4, alex backbone, calibrated v0.1; grayscale repeated RGB, float32 [-1,1], native XY resolution; equal slice mean",
+        "fid": "torch-fidelity 0.3.0 TensorFlow-compatible InceptionV3 pool3 2048; grayscale repeated RGB; round(255*x) uint8; extractor TensorFlow-compatible bilinear resize to 299x299",
+        "fid_aggregation": "one cohort FID from float64 global feature sums and outer products, unbiased sample covariance (N-1); never mean case/rank FID",
+        "scope": "all retained slices, full field of view, no foreground cropping or per-image intensity normalization",
+        "interpretation": "2D ImageNet metrics on correlated MRI slices; FID is cohort-size dependent and is not a 3D anatomical or clinical metric",
+        "selection": "reporting only; LPIPS/FID never select TEST cases or checkpoints"
+      },
+      "preflight": "real pretrained models: finite 2048 features and identical-image LPIPS zero"
+    }
+  },
+  "mri-v2-train-5362247.out": "{\"epoch\": 36, \"batch\": 1120, \"loss\": 0.04500286017985894, \"gpu_peak_gib\": 41.88001251220703}\n{\"epoch\": 36, \"batch\": 1152, \"loss\": 0.052365973088437864, \"gpu_peak_gib\": 41.88001251220703}\n",
+  "medgssr-xy4-5344315.out": "{\"epoch\": 2, \"update\": 78, \"samples\": 169728, \"loss\": 0.04416133463382721, \"elapsed_seconds\": 5734.274527356029}\n{\"epoch\": 2, \"update\": 79, \"samples\": 171904, \"loss\": 0.04673222452402115, \"elapsed_seconds\": 5808.81580725126}\n",
+  "snapshot_time": "2026-11-27 23:15 Asia/Shanghai",
+  "scope": "Existing aggregate results only; no raw images or case-level identifiers",
+  "v2_data_inventory": {
+    "train": {
+      "cases": 3919,
+      "slices": 292657
+    },
+    "val": {
+      "cases": 10,
+      "slices": 595
+    },
+    "bits": 8,
+    "lr_shape": [
+      128,
+      128
+    ],
+    "normalization_scale": 255.0,
+    "normalization_offset": 0.0
+  },
+  "job_states": {
+    "5362247": "RUNNING",
+    "5362248": "PENDING Dependency",
+    "5393973": "CANCELLED 2026-11-27T18:19:13",
+    "5393974": "CANCELLED before start",
+    "5344286": "COMPLETED 2026-11-27T19:10:55",
+    "5344315": "RUNNING"
+  },
+  "medgssr_epoch1_val": {
+    "psnr": 23.26734093838089,
+    "ssim": 0.6353056893780369,
+    "cases": 10,
+    "slices": 595
+  }
+}

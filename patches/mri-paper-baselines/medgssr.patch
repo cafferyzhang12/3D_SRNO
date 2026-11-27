@@ -1,0 +1,561 @@
+diff --git a/gs_utils/Compute_intensity.py b/gs_utils/Compute_intensity.py
+index 536f30b..cc4b50f 100644
+--- a/gs_utils/Compute_intensity.py
++++ b/gs_utils/Compute_intensity.py
+@@ -38,7 +38,7 @@ class IntensityComputation(Function):
+         
+         # Call the backward CUDA function
+         grad_gaussian_centers, grad_intensities, grad_inv_covariances, grad_intensity_grid = compute_intensity_cuda.compute_intensity_backward(
+-            grad_output,
++            grad_output.contiguous(),
+             gaussian_centers,
+             grid_points,
+             intensities,
+@@ -51,4 +51,4 @@ class IntensityComputation(Function):
+ 
+ 
+ def compute_intensity(gaussian_centers, grid_points, intensities, inv_covariances, scalings, intensity_grid):
+-    return IntensityComputation.apply(gaussian_centers, grid_points, intensities, inv_covariances, scalings, intensity_grid)
+\ No newline at end of file
++    return IntensityComputation.apply(gaussian_centers, grid_points, intensities, inv_covariances, scalings, intensity_grid)
+diff --git a/gs_utils/discretize_grid.cu b/gs_utils/discretize_grid.cu
+index b4f91dd..f54c1ee 100644
+--- a/gs_utils/discretize_grid.cu
++++ b/gs_utils/discretize_grid.cu
+@@ -1,368 +1,105 @@
+ #include <torch/extension.h>
+-#include <cuda.h>
+-#include <cuda_runtime.h>
+-#include <thrust/device_vector.h>
+-#include <thrust/sequence.h>
+-#include <thrust/execution_policy.h>
+-#include <thrust/sequence.h>
+-
+-// 
+-__constant__ int const_num_gaussians;
+-__constant__ int const_grid_size_z;
+-__constant__ int const_grid_size_x;
+-__constant__ int const_grid_size_y;
+-
+-
+-// CUDA kernel function to compute intensity
+-__global__ void compute_intensity_forward_kernel(
+-    const float* __restrict__ grid_points,
+-    const float* __restrict__ inv_covariances,
+-    const float* __restrict__ gaussian_centers,
+-    const float* __restrict__ intensities,
+-    const float* __restrict__ scalings,
+-    float* __restrict__ intensity_grid,
+-    int* work_queue,
+-    int* work_counter
+-    ) {
+-
+-    __shared__ float inv_cov[256][9];
+-    __shared__ float centers[256][3];
+-    __shared__ float scales[256][3];
+-
+-    // 
+-    int gaussian_idx;
+-    while ((gaussian_idx = atomicAdd(work_counter, 1)) < const_num_gaussians) {
+-        if (gaussian_idx >= const_num_gaussians) return;
+-
+-        for (int i = 0; i < 9; ++i) {
+-            inv_cov[threadIdx.x][i] = inv_covariances[gaussian_idx * 9 + i];
+-        }
+-
+-        centers[threadIdx.x][0] = gaussian_centers[gaussian_idx * 3];
+-        centers[threadIdx.x][1] = gaussian_centers[gaussian_idx * 3 + 1];
+-        centers[threadIdx.x][2] = gaussian_centers[gaussian_idx * 3 + 2];
+-
+-        scales[threadIdx.x][0] = scalings[gaussian_idx * 3];
+-        scales[threadIdx.x][1] = scalings[gaussian_idx * 3 + 1];
+-        scales[threadIdx.x][2] = scalings[gaussian_idx * 3 + 2];
+-        __syncthreads();
+-
+-        // Compute mean coordinates
+-        int center_idx = gaussian_idx * 3;
+-        float mean_z = centers[threadIdx.x][0] * (float)const_grid_size_z;
+-        float mean_x = centers[threadIdx.x][1] * (float)const_grid_size_x;
+-        float mean_y = centers[threadIdx.x][2] * (float)const_grid_size_y;
+-
+-        // 
+-        float coeff = 1.0;
+-
+-        float norm_expand_z = coeff * scales[threadIdx.x][0];
+-        float norm_expand_x = coeff * scales[threadIdx.x][1];
+-        float norm_expand_y = coeff * scales[threadIdx.x][2];
+-
+-        float expand_z = norm_expand_z * const_grid_size_z;
+-        float expand_x = norm_expand_x * const_grid_size_x;
+-        float expand_y = norm_expand_y * const_grid_size_y;
+-        
+-
+-        int z_start = max(0, (int)(mean_z - expand_z));
+-        int x_start = max(0, (int)(mean_x - expand_x));
+-        int y_start = max(0, (int)(mean_y - expand_y));
+-
+-        int z_end = min(const_grid_size_z-1, (int)(mean_z + expand_z));
+-        int x_end = min(const_grid_size_x-1, (int)(mean_x + expand_x));
+-        int y_end = min(const_grid_size_y-1, (int)(mean_y + expand_y));
+-
+-        int grid_xy = const_grid_size_x * const_grid_size_y;
+-        float intensity = intensities[gaussian_idx];
+-
+-        for (int z = z_start; z <= z_end; ++z){
+-            for (int x = x_start; x <= x_end; ++x) {
+-                for (int y = y_start; y <= y_end; ++y){
+-                    // Compute distance from the grid point to the Gaussian center
+-                    int grid_idx = 3 * (z * grid_xy + x * const_grid_size_y + y);
+-                    float dz = grid_points[grid_idx] - gaussian_centers[center_idx];
+-                    float dx = grid_points[grid_idx + 1] - gaussian_centers[center_idx + 1];
+-                    float dy = grid_points[grid_idx + 2] - gaussian_centers[center_idx + 2];
+-
+-                    // Compute the expoential term
+-                    float power = -0.5f * (
+-                        dz * (inv_cov[threadIdx.x][0] * dz + inv_cov[threadIdx.x][1] * dx + inv_cov[threadIdx.x][2] * dy) +
+-                        dx * (inv_cov[threadIdx.x][3] * dz + inv_cov[threadIdx.x][4] * dx + inv_cov[threadIdx.x][5] * dy) +
+-                        dy * (inv_cov[threadIdx.x][6] * dz + inv_cov[threadIdx.x][7] * dx + inv_cov[threadIdx.x][8] * dy)
+-                    );
+-                    
+-                    // Compute the intensity value
+-                    float intensity_value = intensity * __expf(power);
+-
+-                    // Atomic add
+-                    atomicAdd(&intensity_grid[z * grid_xy + x * const_grid_size_y + y], intensity_value);
+-
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAException.h>
++
++// One thread per Gaussian. Forward and backward visit the same 3-sigma
++// ellipsoid (paper Eq. 7); the AABB merely skips points outside its support.
++template <bool Backward>
++__global__ void splat(
++    int count, int depth, int height, int width,
++    const float* centers, const float* points, const float* intensity,
++    const float* inverse_covariance, const float* axis_std, float* output,
++    const float* grad_output, float* grad_centers, float* grad_intensity,
++    float* grad_inverse_covariance) {
++    const int index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (index >= count) return;
++    const float* center = centers + index * 3;
++    const float* inverse = inverse_covariance + index * 9;
++    const float* std = axis_std + index * 3;
++    const int sizes[3] = {depth, height, width};
++    int low[3], high[3];
++    for (int axis = 0; axis < 3; ++axis) {
++        const float radius = 3.0f * std[axis];
++        // Grid coordinates are voxel centers, (i + 0.5) / size.
++        low[axis] = max(0, static_cast<int>(floorf((center[axis] - radius) * sizes[axis] - 0.5f)));
++        high[axis] = min(sizes[axis] - 1, static_cast<int>(ceilf((center[axis] + radius) * sizes[axis] - 0.5f)));
++    }
++    float center_gradient[3] = {};
++    float covariance_gradient[9] = {};
++    float intensity_gradient = 0.0f;
++    for (int z = low[0]; z <= high[0]; ++z) {
++        for (int y = low[1]; y <= high[1]; ++y) {
++            for (int x = low[2]; x <= high[2]; ++x) {
++                const int voxel = (z * height + y) * width + x;
++                float delta[3], product[3] = {};
++                for (int axis = 0; axis < 3; ++axis) {
++                    delta[axis] = points[voxel * 3 + axis] - center[axis];
++                }
++                float distance = 0.0f;
++                for (int i = 0; i < 3; ++i) {
++                    for (int j = 0; j < 3; ++j) {
++                        product[i] += inverse[i * 3 + j] * delta[j];
++                    }
++                    distance += delta[i] * product[i];
++                }
++                if (distance >= 9.0f) continue;
++                const float weight = __expf(-0.5f * distance);
++                if constexpr (Backward) {
++                    const float weighted_grad = grad_output[voxel] * weight;
++                    const float common = weighted_grad * intensity[index];
++                    intensity_gradient += weighted_grad;
++                    for (int i = 0; i < 3; ++i) {
++                        float transpose_product = 0.0f;
++                        for (int j = 0; j < 3; ++j) {
++                            transpose_product += inverse[j * 3 + i] * delta[j];
++                            covariance_gradient[i * 3 + j] -= 0.5f * common * delta[i] * delta[j];
++                        }
++                        center_gradient[i] += 0.5f * common * (product[i] + transpose_product);
++                    }
++                } else {
++                    atomicAdd(output + voxel, intensity[index] * weight);
+                 }
+             }
+         }
+     }
++    if constexpr (Backward) {
++        grad_intensity[index] = intensity_gradient;
++        for (int i = 0; i < 3; ++i) grad_centers[index * 3 + i] = center_gradient[i];
++        for (int i = 0; i < 9; ++i) grad_inverse_covariance[index * 9 + i] = covariance_gradient[i];
++    }
+ }
+ 
+-
+ torch::Tensor compute_intensity(
+-    torch::Tensor gaussian_centers,
+-    torch::Tensor grid_points, //
+-    torch::Tensor intensities,
+-    torch::Tensor inv_covariances,
+-    torch::Tensor scalings,
+-    torch::Tensor intensity_grid
+-    ){
+-    
+-    const int num_gaussians = gaussian_centers.size(0);
+-    const int grid_size_z = intensity_grid.size(1);
+-    const int grid_size_x = intensity_grid.size(2);
+-    const int grid_size_y = intensity_grid.size(3);
+-
+-    // 
+-    cudaMemcpyToSymbol(const_num_gaussians, &num_gaussians, sizeof(int));
+-    cudaMemcpyToSymbol(const_grid_size_z, &grid_size_z, sizeof(int));
+-    cudaMemcpyToSymbol(const_grid_size_x, &grid_size_x, sizeof(int));
+-    cudaMemcpyToSymbol(const_grid_size_y, &grid_size_y, sizeof(int));
+-
+-    const int threads_per_block = 256;
+-    const int num_blocks = (num_gaussians + threads_per_block - 1) / threads_per_block;
+-
+-    // Initialize work queue and counter
+-    int* d_work_queue;
+-    int* d_work_counter;
+-    cudaMalloc(&d_work_queue, num_gaussians * sizeof(int));
+-    cudaMalloc(&d_work_counter, sizeof(int));
+-    cudaMemset(d_work_counter, 0, sizeof(int));
+-
+-    // Fill the work queue
+-    thrust::sequence(thrust::device, d_work_queue, d_work_queue + num_gaussians);
+-
+-    compute_intensity_forward_kernel<<<num_blocks, threads_per_block>>>(
+-        grid_points.data_ptr<float>(),
+-        inv_covariances.data_ptr<float>(),
+-        gaussian_centers.data_ptr<float>(),
+-        intensities.data_ptr<float>(),
+-        scalings.data_ptr<float>(),
+-        intensity_grid.data_ptr<float>(),
+-        d_work_queue,
+-        d_work_counter
+-    );
+-
+-    cudaFree(d_work_queue);
+-    cudaFree(d_work_counter);
+-
+-
+-    return intensity_grid;
+-}
+-
+-
+-__forceinline__ __device__ void compute_grad_gaussian_center(
+-    float dz, float dx, float dy,
+-    const float* __restrict__ inv_cov,
+-    float intensity_value,
+-    float grad_output_val,
+-    float* __restrict__ grad_gaussian_center) {
+-
+-    float common_term = 0.5f * intensity_value * grad_output_val;
+-    atomicAdd(&grad_gaussian_center[0], common_term * (2 * inv_cov[0] * dz + (inv_cov[1] + inv_cov[3]) * dx + (inv_cov[2] + inv_cov[6]) * dy));
+-    atomicAdd(&grad_gaussian_center[1], common_term * ((inv_cov[3] + inv_cov[1]) * dz + 2 * inv_cov[4] * dx + (inv_cov[5] + inv_cov[7]) * dy));
+-    atomicAdd(&grad_gaussian_center[2], common_term * ((inv_cov[6] + inv_cov[2]) * dz + (inv_cov[7] + inv_cov[5]) * dx + 2 * inv_cov[8] * dy));
+-}
+-
+-__forceinline__ __device__ void compute_grad_inv_covariance(
+-    float dz, float dx, float dy,
+-    float intensity_value,
+-    float grad_output_val,
+-    float* __restrict__ grad_inv_covariance) {
+-
+-    float grad_common = -0.5f * intensity_value * grad_output_val;
+-    atomicAdd(&grad_inv_covariance[0], grad_common * dz * dz);
+-    atomicAdd(&grad_inv_covariance[1], grad_common * dz * dx);
+-    atomicAdd(&grad_inv_covariance[2], grad_common * dz * dy);
+-    atomicAdd(&grad_inv_covariance[3], grad_common * dx * dz);
+-    atomicAdd(&grad_inv_covariance[4], grad_common * dx * dx);
+-    atomicAdd(&grad_inv_covariance[5], grad_common * dx * dy);
+-    atomicAdd(&grad_inv_covariance[6], grad_common * dy * dz);
+-    atomicAdd(&grad_inv_covariance[7], grad_common * dy * dx);
+-    atomicAdd(&grad_inv_covariance[8], grad_common * dy * dy);
+-}
+-
+-__global__ void compute_intensity_backward_kernel(
+-    const float* __restrict__ grad_output, 
+-    const float* __restrict__ grid_points,
+-    const float* __restrict__ inv_covariances,
+-    const float* __restrict__ gaussian_centers,
+-    const float* __restrict__ intensities,
+-    const float* __restrict__ scalings,
+-
+-    float* __restrict__ grad_gaussian_centers,
+-    float* __restrict__ grad_intensities, 
+-    float* __restrict__ grad_inv_covariances, // 
+-    int* work_queue,
+-    int* work_counter
+-){
+-
+-    __shared__ float inv_cov[256][9]; // 
+-    __shared__ float centers[256][3];
+-    __shared__ float scales[256][3];
+-
+-    int gaussian_idx;
+-    while ((gaussian_idx = atomicAdd(work_counter, 1)) < const_num_gaussians) {
+-        if (gaussian_idx >= const_num_gaussians) return;
+-
+-        for (int i = 0; i < 9; ++i) {
+-            inv_cov[threadIdx.x][i] = inv_covariances[gaussian_idx * 9 + i];
+-        }
+-
+-        centers[threadIdx.x][0] = gaussian_centers[gaussian_idx * 3];
+-        centers[threadIdx.x][1] = gaussian_centers[gaussian_idx * 3 + 1];
+-        centers[threadIdx.x][2] = gaussian_centers[gaussian_idx * 3 + 2];
+-
+-        scales[threadIdx.x][0] = scalings[gaussian_idx * 3];
+-        scales[threadIdx.x][1] = scalings[gaussian_idx * 3 + 1];
+-        scales[threadIdx.x][2] = scalings[gaussian_idx * 3 + 2];
+-        __syncthreads();
+-
+-        // Compute mean coordinates
+-        int center_idx = gaussian_idx * 3;
+-        float mean_z = centers[threadIdx.x][0] * (float)const_grid_size_z;
+-        float mean_x = centers[threadIdx.x][1] * (float)const_grid_size_x;
+-        float mean_y = centers[threadIdx.x][2] * (float)const_grid_size_y;
+-
+-        // 
+-        float coeff = 3.0;
+-        float norm_expand_z = coeff * scales[threadIdx.x][0];
+-        float norm_expand_x = coeff * scales[threadIdx.x][1];
+-        float norm_expand_y = coeff * scales[threadIdx.x][2];
+-
+-        float expand_z = norm_expand_z * const_grid_size_z;
+-        float expand_x = norm_expand_x * const_grid_size_x;
+-        float expand_y = norm_expand_y * const_grid_size_y;
+-
+-
+-        int z_start = max(0, (int)(mean_z - expand_z));
+-        int x_start = max(0, (int)(mean_x - expand_x));
+-        int y_start = max(0, (int)(mean_y - expand_y));
+-
+-        int z_end = min(const_grid_size_z-1, (int)(mean_z + expand_z));
+-        int x_end = min(const_grid_size_x-1, (int)(mean_x + expand_x));
+-        int y_end = min(const_grid_size_y-1, (int)(mean_y + expand_y));
+-
+-        int grid_xy = const_grid_size_x * const_grid_size_y;
+-        float intensity = intensities[gaussian_idx];
+-
+-        for (int z = z_start; z <= z_end; ++z){
+-            for (int x = x_start; x <= x_end; ++x) {
+-                for (int y = y_start; y <= y_end; ++y){
+-                    // Compute distance from the grid point to the Gaussian center
+-                    int grid_idx = 3 * (z * grid_xy + x * const_grid_size_y + y);
+-                    float dz = grid_points[grid_idx] - gaussian_centers[center_idx];
+-                    float dx = grid_points[grid_idx + 1] - gaussian_centers[center_idx + 1];
+-                    float dy = grid_points[grid_idx + 2] - gaussian_centers[center_idx + 2];
+-
+-                    // Compute the exponential term
+-                    float power = -0.5f * (
+-                        dz * (inv_cov[threadIdx.x][0] * dz + inv_cov[threadIdx.x][1] * dx + inv_cov[threadIdx.x][2] * dy) +
+-                        dx * (inv_cov[threadIdx.x][3] * dz + inv_cov[threadIdx.x][4] * dx + inv_cov[threadIdx.x][5] * dy) +
+-                        dy * (inv_cov[threadIdx.x][6] * dz + inv_cov[threadIdx.x][7] * dx + inv_cov[threadIdx.x][8] * dy)
+-                    );
+-
+-                    float grad_output_val = grad_output[z * grid_xy + x * const_grid_size_y + y];
+-                    
+-                    // Compute the intensity value
+-                    float intensity_value = intensity * __expf(power);
+-
+-                    // Compute gradient w.r.t. intensity
+-                    float grad_intensity = __expf(power) * grad_output_val;
+-                    atomicAdd(&grad_intensities[gaussian_idx], grad_intensity);
+-
+-                    // Gradient w.r.t. gaussian centers
+-                    compute_grad_gaussian_center(
+-                        dz, dx, dy,
+-                        inv_cov[threadIdx.x],
+-                        intensity_value,
+-                        grad_output_val,
+-                        &grad_gaussian_centers[center_idx]
+-                    );
+-
+-                    // Gradient w.r.t. inverse covariances
+-                    compute_grad_inv_covariance(
+-                        dz, dx, dy,
+-                        intensity_value,
+-                        grad_output_val,
+-                        &grad_inv_covariances[gaussian_idx * 9]
+-                    );
+-
+-                }
+-            }
+-        }
+-    }
++    torch::Tensor centers, torch::Tensor points, torch::Tensor intensity,
++    torch::Tensor inverse, torch::Tensor axis_std, torch::Tensor output) {
++    const int count = centers.size(0);
++    splat<false><<<(count + 127) / 128, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
++        count, output.size(1), output.size(2), output.size(3),
++        centers.data_ptr<float>(), points.data_ptr<float>(), intensity.data_ptr<float>(),
++        inverse.data_ptr<float>(), axis_std.data_ptr<float>(), output.data_ptr<float>(),
++        nullptr, nullptr, nullptr, nullptr);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return output;
+ }
+ 
+ std::vector<torch::Tensor> compute_intensity_backward(
+-    torch::Tensor grad_output,
+-    torch::Tensor gaussian_centers,
+-    torch::Tensor grid_points, //
+-    torch::Tensor intensities,
+-    torch::Tensor inv_covariances,
+-    torch::Tensor scalings, //
+-    torch::Tensor intensity_grid
+-){
+-    const int num_gaussians = gaussian_centers.size(0);
+-    const int grid_size_z = intensity_grid.size(1);
+-    const int grid_size_x = intensity_grid.size(2);
+-    const int grid_size_y = intensity_grid.size(3);
+-
+-    // 
+-    cudaMemcpyToSymbol(const_num_gaussians, &num_gaussians, sizeof(int));
+-    cudaMemcpyToSymbol(const_grid_size_z, &grid_size_z, sizeof(int));
+-    cudaMemcpyToSymbol(const_grid_size_x, &grid_size_x, sizeof(int));
+-    cudaMemcpyToSymbol(const_grid_size_y, &grid_size_y, sizeof(int));
+-
+-    auto grad_gaussian_centers = torch::zeros_like(gaussian_centers);
+-    auto grad_intensities = torch::zeros_like(intensities);
+-    auto grad_inv_covariances = torch::zeros_like(inv_covariances);
+-
+-    const int threads_per_block = 256;
+-    const int num_blocks = (num_gaussians + threads_per_block - 1) / threads_per_block;
+-
+-    // Initialize work queue and counter
+-    int* d_work_queue;
+-    int* d_work_counter;
+-    cudaMalloc(&d_work_queue, num_gaussians * sizeof(int));
+-    cudaMalloc(&d_work_counter, sizeof(int));
+-    cudaMemset(d_work_counter, 0, sizeof(int));
+-
+-    // Fill the work queue
+-    thrust::sequence(thrust::device, d_work_queue, d_work_queue + num_gaussians);
+-
+-    compute_intensity_backward_kernel<<<num_blocks, threads_per_block>>>(
+-        grad_output.data_ptr<float>(),
+-        grid_points.data_ptr<float>(),
+-        inv_covariances.data_ptr<float>(),
+-        gaussian_centers.data_ptr<float>(),
+-        intensities.data_ptr<float>(),
+-        scalings.data_ptr<float>(),
+-        grad_gaussian_centers.data_ptr<float>(),
+-        grad_intensities.data_ptr<float>(),
+-        grad_inv_covariances.data_ptr<float>(),
+-        d_work_queue,
+-        d_work_counter
+-    );
+-
+-    cudaFree(d_work_queue);
+-    cudaFree(d_work_counter);
+-
+-
+-    return {grad_gaussian_centers, grad_intensities, grad_inv_covariances, grad_output};
++    torch::Tensor grad_output, torch::Tensor centers, torch::Tensor points,
++    torch::Tensor intensity, torch::Tensor inverse, torch::Tensor axis_std, torch::Tensor output) {
++    auto grad_centers = torch::empty_like(centers);
++    auto grad_intensity = torch::empty_like(intensity);
++    auto grad_inverse = torch::empty_like(inverse);
++    const int count = centers.size(0);
++    splat<true><<<(count + 127) / 128, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
++        count, output.size(1), output.size(2), output.size(3),
++        centers.data_ptr<float>(), points.data_ptr<float>(), intensity.data_ptr<float>(),
++        inverse.data_ptr<float>(), axis_std.data_ptr<float>(), nullptr,
++        grad_output.data_ptr<float>(), grad_centers.data_ptr<float>(),
++        grad_intensity.data_ptr<float>(), grad_inverse.data_ptr<float>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return {grad_centers, grad_intensity, grad_inverse, grad_output};
+ }
+ 
+-
+-
+-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
+-    m.def("compute_intensity", &compute_intensity, "Compute Intensity (CUDA)");
+-    m.def("compute_intensity_backward", &compute_intensity_backward, "Compute intensity backward (CUDA)");
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
++    module.def("compute_intensity", &compute_intensity, "Compute intensity (CUDA)");
++    module.def("compute_intensity_backward", &compute_intensity_backward, "Compute intensity backward (CUDA)");
+ }
+-
+-
+diff --git a/models/feature_to_gaussian.py b/models/feature_to_gaussian.py
+index f4caeeb..7d9a9ce 100644
+--- a/models/feature_to_gaussian.py
++++ b/models/feature_to_gaussian.py
+@@ -88,7 +88,8 @@ class FeatureToGaussian(nn.Module):
+         rot_raw = self.rotation_mlp(feat_flat).view(B, -1, 4)
+         intensity_raw = self.opacity_mlp(feat_flat).view(B, -1, 1)
+ 
+-        means = torch.clamp(lr_points_expanded + torch.tanh(off_raw) / D_lr, min=0, max=1).view(B, -1, 3)
++        grid_size = feat.new_tensor((D_lr, H_lr, W_lr))
++        means = torch.clamp(lr_points_expanded + torch.tanh(off_raw) / grid_size, min=0, max=1).view(B, -1, 3)
+         scales = torch.clamp(F.softplus(scale_raw - s), min=1e-10, max=3)
+         R = self.quaternion_to_rotation_matrix(F.normalize(rot_raw, p=2, dim=-1))
+         intensity = torch.sigmoid(intensity_raw - i)
+@@ -98,4 +99,4 @@ class FeatureToGaussian(nn.Module):
+             "scales": scales,
+             "rotations": R,
+             "intensity": intensity,
+-        }
+\ No newline at end of file
++        }
+diff --git a/models/gaussian_to_vol.py b/models/gaussian_to_vol.py
+index 493d88a..5fd0cca 100644
+--- a/models/gaussian_to_vol.py
++++ b/models/gaussian_to_vol.py
+@@ -16,6 +16,7 @@ class GaussianToVol(nn.Module):
+     Computes per-voxel intensity by splatting Gaussians onto a
+     target coordinate grid using inverse covariance matrices.
+     """
++    def __init__(self):
+         super().__init__()
+     
+     def get_inv_covariance(self, scaling, rotations):
+@@ -30,7 +31,9 @@ class GaussianToVol(nn.Module):
+  
+         gaussian_centers = means.contiguous()
+         intensities = intensity.contiguous() 
+-        scales_flat = scales.contiguous()
++        # Axis-aligned standard deviations of the rotated covariance.
++        scale_variance = scales.square() + 1e-7
++        scales_flat = (rotations.square() @ scale_variance.unsqueeze(-1)).squeeze(-1).sqrt().contiguous()
+         
+         inv_covariance = self.get_inv_covariance(scales, rotations) 
+         inv_covariances = inv_covariance.view(-1, 9).contiguous()
+@@ -75,4 +78,4 @@ class GaussianToVol(nn.Module):
+ 
+             intensity_grid[i] = single_vol[0]  
+ 
+-        return intensity_grid.permute(0, 4, 1, 2, 3)
+\ No newline at end of file
++        return intensity_grid.permute(0, 4, 1, 2, 3)
+diff --git a/utils.py b/utils.py
+index 8294af4..f2ed686 100644
+--- a/utils.py
++++ b/utils.py
+@@ -6,12 +6,13 @@ Provides coordinate grid generation and cached image I/O.
+ import os
+ import torch
+ import numpy as np
+-import SimpleITK as sitk
+ from tqdm import tqdm
+ 
+ 
+ def read_img(in_path):
+     """Read all images from a directory, with caching support."""
++    import SimpleITK as sitk
++
+     if 'train' in in_path.lower():
+         cache_name = "train_data_cache.pt"
+     elif 'val' in in_path.lower():
+@@ -152,4 +153,4 @@ def merge_gaussian_dicts(dict1, dict2):
+         "scales": torch.cat([dict1["scales"], dict2["scales"]], dim=1),
+         "rotations": torch.cat([dict1["rotations"], dict2["rotations"]], dim=1),
+         "intensity": torch.cat([dict1["intensity"], dict2["intensity"]], dim=1),
+-    }
+\ No newline at end of file
++    }
