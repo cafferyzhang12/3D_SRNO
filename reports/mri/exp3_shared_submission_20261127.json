@@ -1,0 +1,61 @@
+{
+  "source_commit": "41bb23f",
+  "source_archive_sha256": "b436ade71c9c16a4a0313bd94d08af6b56daa9388e3fa21dea6fddeafe77e59f",
+  "study": "/gpfs/share/home/t2504041104/3D_SRNO_4/jetatlas_exp3_shared_20261127/runs/mri/exp3_shared_20261127",
+  "cancelled_pending_jobs": [
+    5362249,
+    5362250,
+    5362251,
+    5362252,
+    5362253,
+    5362254
+  ],
+  "protected_exp1": {
+    "train_job": 5362247,
+    "train_state": "RUNNING",
+    "val_job": 5362248,
+    "val_state": "PENDING",
+    "node": "gpua800n04",
+    "epoch": 24,
+    "batch": 1152,
+    "source_sha256_unchanged": "3e0da1af78f0280a2b0ae8439b526fbbcc160d3ed1f48974274e4865eaa43448",
+    "config_sha256_unchanged": "3fd9252e2c18201a256d00a80d077ea51dd2a3737ec647dd7882ad9c9141ac33"
+  },
+  "gate": {
+    "job": 5393972,
+    "state": "COMPLETED",
+    "exit_code": "0:0",
+    "pytest_passed": 363,
+    "elapsed": "00:02:18",
+    "same_checkpoint_pair_smoke_passed": true
+  },
+  "exp3": {
+    "job": 5393973,
+    "state": "RUNNING",
+    "phase": "TRAIN whitening and atlas preparation",
+    "node": "gpua800n15",
+    "bank_patches_observed": 601
+  },
+  "paired_val": {
+    "job": 5393974,
+    "state": "PENDING",
+    "dependency": "afterok:5393973",
+    "variants": [
+      "offline",
+      "online"
+    ],
+    "weights": "one frozen offline-selected exp3 checkpoint"
+  },
+  "resources": {
+    "qos": "high",
+    "gpus_per_job": 4,
+    "environment": "fundiff",
+    "excluded_node": "gpua800n04",
+    "epochs": 60,
+    "batch_per_gpu": 48,
+    "global_batch": 192
+  },
+  "exp2_resubmitted": false,
+  "exp4_training_resubmitted": false,
+  "test_used": false
+}

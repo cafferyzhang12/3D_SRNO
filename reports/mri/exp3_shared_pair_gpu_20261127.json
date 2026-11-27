@@ -1,0 +1,54 @@
+{
+  "identity": {
+    "checkpoint_sha256": "19739823a91d41d7b44973d9b1d48ddaecd31f5a7ddb30bfac0a2bdf0b03b9bf",
+    "source_checkpoint": "/gpfs/share/home/t2504041104/3D_SRNO_4/jetatlas_exp3_shared_20261127/outputs/v2-e2e-g948vyag/exp3/last.pt",
+    "frozen_checkpoint": "/gpfs/share/home/t2504041104/3D_SRNO_4/jetatlas_exp3_shared_20261127/runs/mri/exp3_shared_20261127/smoke_pair/checkpoint.pt",
+    "epoch": 1,
+    "weights": "ema",
+    "selection": "explicit_checkpoint_or_last_fallback",
+    "online_metrics_reselect_weights": false,
+    "inventory_sha256": "75dcafd23ce5142ad83c9fef28663f7647c57f2f13a929e3c02ebca2c3edb445",
+    "test_used": false,
+    "sampling": {
+      "steps": 4,
+      "sampler_type": "ode",
+      "solver": "heun",
+      "temperature": 0.1,
+      "tile_batch": 1,
+      "sigma": 0.08,
+      "inference_sigma": 0.0
+    },
+    "validation_seed": 42,
+    "world_size": 4
+  },
+  "results": {
+    "offline": {
+      "psnr": 20.812028222536178,
+      "ssim": 0.6443908637923424,
+      "lpips": 0.2920304834842682,
+      "fid": 276.8280852450477,
+      "local_variance_ratio": 0.5200858121866102,
+      "textured_region_ssim": 0.6346693158680415,
+      "pixel_count": 3072,
+      "slice_count": 3
+    },
+    "online": {
+      "psnr": 20.81202808344141,
+      "ssim": 0.6443908656764474,
+      "lpips": 0.2920297880967458,
+      "fid": 276.8280852450477,
+      "local_variance_ratio": 0.5200856005877822,
+      "textured_region_ssim": 0.6346693178020842,
+      "pixel_count": 3072,
+      "slice_count": 3
+    }
+  },
+  "online_minus_offline": {
+    "psnr": -1.3909476592743886e-07,
+    "ssim": 1.884104983140844e-09,
+    "lpips": -6.95387522398061e-07,
+    "fid": 0.0,
+    "local_variance_ratio": -2.1159882801491392e-07,
+    "textured_region_ssim": 1.934042703766181e-09
+  }
+}
