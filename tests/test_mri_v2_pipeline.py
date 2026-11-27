@@ -24,12 +24,19 @@ def config(i=1):
     return cfg
 
 
-def test_four_configs_have_identical_training_budget_and_clean_controls():
+def test_four_configs_share_epoch_budget_and_keep_clean_controls():
     cfgs=[config(i) for i in range(1,5)]
-    assert all(c['train']==cfgs[0]['train'] for c in cfgs)
+    for key in ('epochs', 'samples_per_epoch', 'learning_rate'):
+        assert all(c['train'][key]==cfgs[0]['train'][key] for c in cfgs)
     assert all('test' not in c['data'] for c in cfgs)
     assert [c['atlas_weight'] for c in cfgs]==[0,0,.05,.05]
     assert [c['online_atlas'] for c in cfgs]==[False,False,False,True]
+    for cfg in cfgs[::2]:
+        assert cfg['sigma_bridge']==cfg['train']['noise_weight']==cfg['train']['rollout_weight']==0
+        assert cfg['train']['batch_size']==48 and cfg['train']['workers']==6
+        assert cfg['sampling']['sampler_type']=='ode' and cfg['sampling']['steps']==1
+        assert cfg['model']['gradient_checkpointing']=='refinement_only'
+    assert cfgs[2]['jetatlas']['lr_dim']==9
 
 
 @pytest.mark.parametrize('i',[1,2])
@@ -169,3 +176,55 @@ def test_runtime_preparation_rejects_path_like_run_ids(monkeypatch,tmp_path,run_
     with pytest.raises(ValueError,match='run ID'):
         _prepare_tool().prepare('missing.json.gz',run_id)
     assert not (tmp_path/'runs').exists()
+
+
+@pytest.mark.parametrize('sigma,bridge_weight,noise_weight,expected_passes,expected_epsilon', [
+    (0., 0., .1, 1, 0),
+    (0., 1., .1, 2, 0),
+    (.08, 1., 0., 2, 0),
+    (.08, 0., .1, 2, 1),
+])
+def test_v2_objective_compact_forward(sigma, bridge_weight, noise_weight, expected_passes, expected_epsilon):
+    cfg = config()
+    cfg.update(sigma_bridge=sigma, frequency_split=True)
+    cfg['train'].update(bridge_weight=bridge_weight, noise_weight=noise_weight, rollout_weight=0.)
+    model = make_model(cfg)
+    objective = V2Objective(model, cfg)
+    lr = torch.rand(2, 1, 3, 8, 8)
+    hr = torch.rand(2, 1, 3, 32, 32)
+    calls = {'endpoint': [], 'refinement': [], 'epsilon': []}
+    for name in calls:
+        getattr(model, name).register_forward_hook(
+            lambda module, args, output, name=name: calls[name].append(output.shape[0]))
+    terms = objective(lr, hr)
+    terms['loss'].backward()
+    assert calls['endpoint'] == [len(lr)]*expected_passes
+    assert calls['refinement'] == [len(lr)]
+    assert calls['epsilon'] == [len(lr)]*expected_epsilon
+    assert ('noise_loss' in terms) == bool(expected_epsilon)
+    assert ('bridge_haar' in terms) == ('bridge_pixel' in terms) == bool(bridge_weight)
+    assert all(parameter.grad is not None for parameter in objective.parameters() if parameter.requires_grad)
+
+
+def test_explicit_rollout_uses_deterministic_prefix(monkeypatch):
+    from vemgsbm import frequency_bridge
+
+    cfg = config()
+    cfg.update(sigma_bridge=.08, frequency_split=True)
+    cfg['train'].update(bridge_weight=0., noise_weight=0., rollout_weight=.1, rollout_steps=2)
+    model = make_model(cfg)
+    calls = []
+    integrate = frequency_bridge.integrate_frequency_bridge
+
+    def checked_integrate(*args, **kwargs):
+        calls.append(kwargs)
+        return integrate(*args, **kwargs)
+
+    monkeypatch.setattr(frequency_bridge, 'integrate_frequency_bridge', checked_integrate)
+    terms = V2Objective(model, cfg)(torch.rand(2, 1, 3, 8, 8), torch.rand(2, 1, 3, 32, 32))
+    assert len(calls) == 1
+    assert calls[0].get('sigma_max', 0.) == 0.
+    assert 'curvature' not in calls[0]
+    assert 'rollout_haar' in terms and 'rollout_pixel' in terms
+    terms['loss'].backward()
+    assert model.endpoint.weight.grad.norm() > 0

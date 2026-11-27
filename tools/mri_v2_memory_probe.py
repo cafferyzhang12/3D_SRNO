@@ -1,7 +1,7 @@
 """A800 allocation-only full-size MRI v2 forward/backward memory calibration.
 
 Each candidate runs in a fresh process so OOM cannot contaminate later trials.
-All four run YAMLs receive the same microbatch/accumulation after successful
+The selected run YAMLs receive the same microbatch/accumulation after successful
 calibration. Source configs are never rewritten. Synthetic data checks memory
 and finite gradients; it does not estimate MRI quality or peak VAL memory.
 """
@@ -24,15 +24,18 @@ import yaml
 
 ROOT=Path(__file__).resolve().parents[1]
 DEFAULT_CANDIDATES=(8,16,32,48,64)
+DEFAULT_ARMS=(1,2,3,4)
 
 
-def config_paths(directory):
+def config_paths(directory, arms=DEFAULT_ARMS):
     directory=Path(directory).resolve()
     if directory == (ROOT/'configs').resolve():
         raise ValueError('Pass prepared run YAMLs; source configs may not be calibrated in place')
-    paths=[directory/f'exp{i}.yaml' for i in range(1,5)]
+    if not arms or len(set(arms)) != len(arms) or not set(arms).issubset(DEFAULT_ARMS):
+        raise ValueError('Choose distinct v2 arms in [1,4]')
+    paths=[directory/f'exp{i}.yaml' for i in arms]
     if not all(path.is_file() for path in paths):
-        raise FileNotFoundError('Expected exp1.yaml through exp4.yaml in --configs-dir')
+        raise FileNotFoundError('Expected selected run YAMLs in --configs-dir')
     return paths
 
 
@@ -53,12 +56,12 @@ def read_configs(paths):
     return configs
 
 
-def choose_budget(rows,candidates=DEFAULT_CANDIDATES,safety=.82,world_size=4):
+def choose_budget(rows,candidates=DEFAULT_CANDIDATES,safety=.82,world_size=4,arms=DEFAULT_ARMS):
     """Largest measured common batch with global update batch in [128,256]."""
     eligible=[]
     for batch in candidates:
         trial=[row for row in rows if row['batch']==batch]
-        if len(trial)!=4 or {row['arm'] for row in trial}!={1,2,3,4}:
+        if len(trial)!=len(arms) or {row['arm'] for row in trial}!=set(arms):
             continue
         if all(row.get('status')=='ok' and row['budget_peak_bytes'] <= safety*row['total_bytes'] for row in trial):
             accumulation=max(1,math.ceil(128/(world_size*batch)))
@@ -66,7 +69,7 @@ def choose_budget(rows,candidates=DEFAULT_CANDIDATES,safety=.82,world_size=4):
             if 128 <= effective <= 256:
                 eligible.append((batch,accumulation,effective))
     if not eligible:
-        raise RuntimeError('No common measured microbatch fits the 82% GPU memory ceiling and global batch128-256')
+        raise RuntimeError(f'No common microbatch fits {safety:.0%} GPU memory and global batch128-256')
     batch,accumulation,effective=max(eligible)
     return dict(batch_size=batch,accumulation_steps=accumulation,effective_global_batch=effective,
                 world_size=world_size,safety_fraction=safety)
@@ -108,13 +111,14 @@ def worker(config,batch,output,atlas_file):
     from vemgsbm.jetatlas import JetAtlasRegularizer
     from vemgsbm.mri_v2 import V2Objective,make_model
     from vemgsbm.mri_perceptual import load_extractors
+    from vemgsbm.mri_v2_train import _cuda_convolution_layout, _optimizer
+    from vemgsbm.runtime import setup
     from vemgsbm.training_state import ModelEMA
     torch.set_num_threads(4)
     cfg=yaml.safe_load(Path(config).read_text(encoding='utf-8'))
     device=torch.device('cuda',0)
     torch.cuda.set_device(device)
-    torch.manual_seed(43)
-    torch.cuda.manual_seed_all(43)
+    setup(43, str(device), cfg['train'].get('threads',4))
     total=torch.cuda.get_device_properties(device).total_memory
     torch.cuda.reset_peak_memory_stats(device)
     started=time.perf_counter()
@@ -124,6 +128,7 @@ def worker(config,batch,output,atlas_file):
     phase='setup'
     try:
         model=make_model(cfg).to(device).train()
+        _cuda_convolution_layout(model)
         model.set_band_statistics(dict(mean=torch.zeros(16),std=torch.ones(16)*.1))
         atlas=None
         if cfg.get('atlas_weight',0):
@@ -134,7 +139,7 @@ def worker(config,batch,output,atlas_file):
         paired.eval();extractor.eval()
         objective=V2Objective(model,cfg,atlas)
         parameters=[p for p in objective.parameters() if p.requires_grad]
-        optimizer=torch.optim.AdamW(parameters,lr=cfg['train']['learning_rate'],weight_decay=cfg['train'].get('weight_decay',1.e-4))
+        optimizer=_optimizer(parameters,cfg['train'],device)
         # Reserve the missing full-atlas buffers/router parameters and DDP buckets.
         # Query tensors retain full d8/PCA32/top3/site budgets; chart fit uses four
         # synthetic charts solely to bound fitting cost in this memory diagnostic.
@@ -191,9 +196,9 @@ def worker(config,batch,output,atlas_file):
     return result
 
 
-def run(configs_dir,output,*,candidates=DEFAULT_CANDIDATES,safety=.82,world_size=4):
+def run(configs_dir,output,*,candidates=DEFAULT_CANDIDATES,safety=.82,world_size=4,arms=DEFAULT_ARMS):
     import torch
-    paths=config_paths(configs_dir)
+    paths=config_paths(configs_dir,arms)
     configs=read_configs(paths)
     output=Path(output).resolve();output.parent.mkdir(parents=True,exist_ok=True)
     if not torch.cuda.is_available():
@@ -207,39 +212,24 @@ def run(configs_dir,output,*,candidates=DEFAULT_CANDIDATES,safety=.82,world_size
         raise RuntimeError('Formal calibration requires an allocated NVIDIA A800')
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError('Formal calibration requires bf16 support')
-    if not 0 < safety <= .82 or world_size!=4 or any(type(b) is not int or b<1 for b in candidates):
-        raise ValueError('Use safety<=.82, four ranks and positive candidate batches')
+    if not 0 < safety <= .90 or world_size!=4 or any(type(b) is not int or b<1 for b in candidates):
+        raise ValueError('Use safety<=.90, four ranks and positive candidate batches')
     rows=[]
     total=torch.cuda.get_device_properties(0).total_memory
-    # Probe 32 first. Expand to 48/64 only when the measured trajectory can fit;
-    # falling back through16/8 avoids repeated predictable OOM allocations.
-    order=[b for b in (32,16,8,48,64) if b in candidates]
-    order.extend(b for b in candidates if b not in order)
+    # Try the requested budget first. Workers isolate allocation failures,
+    # allowing a measured fallback without extrapolating from another shape.
+    order=sorted(set(candidates),reverse=True)
     with tempfile.TemporaryDirectory(dir=output.parent,prefix='memory_probe_') as temp:
-        atlas_file=Path(temp)/'tiny_train_atlas.pt'
-        torch.save(tiny_atlas_payload(configs[2]),atlas_file)
+        for arm,cfg in zip(arms,configs):
+            if cfg.get('atlas_weight',0):
+                torch.save(tiny_atlas_payload(cfg),Path(temp)/f'exp{arm}_atlas.pt')
         for batch in order:
-            # Once a larger common batch fits, smaller trials add no information.
-            if any(all(any(r['batch']==larger and r['arm']==arm and r['status']=='ok'
-                           and r['budget_peak_bytes']<=safety*r['total_bytes'] for r in rows)
-                       for arm in range(1,5)) for larger in candidates if larger>batch):
-                continue
-            if batch>32:
-                previous=[r for r in rows if r['status']=='ok' and r['batch']<batch]
-                by_arm={arm:[r for r in previous if r['arm']==arm] for arm in range(1,5)}
-                # Conservatively extrapolate total live memory, including fixed
-                # components, rather than assigning an invented measured peak.
-                predicted=max((max(r['budget_peak_bytes']/r['batch'] for r in arm_rows)*batch
-                               for arm_rows in by_arm.values() if arm_rows),default=math.inf)
-                if any(not arm_rows for arm_rows in by_arm.values()) or predicted>.9*total:
-                    for arm in range(1,5):
-                        rows.append(dict(arm=arm,batch=batch,status='skipped_predicted_oom',total_bytes=total,
-                                         prediction_only_bytes=None if not math.isfinite(predicted) else predicted))
-                    continue
-            for arm,path in enumerate(paths,1):
+            trial=[]
+            for arm,path in zip(arms,paths):
                 trial_file=Path(temp)/f'exp{arm}_b{batch}.json'
                 command=[sys.executable,str(Path(__file__).resolve()),'--worker','--config',str(path),
-                         '--batch',str(batch),'--output',str(trial_file),'--atlas-file',str(atlas_file)]
+                         '--batch',str(batch),'--output',str(trial_file),
+                         '--atlas-file',str(Path(temp)/f'exp{arm}_atlas.pt')]
                 completed=subprocess.run(command,cwd=ROOT,check=False,capture_output=True,text=True)
                 if trial_file.exists():
                     row=json.loads(trial_file.read_text(encoding='utf-8'))
@@ -248,11 +238,14 @@ def run(configs_dir,output,*,candidates=DEFAULT_CANDIDATES,safety=.82,world_size
                              error=f'Worker exit {completed.returncode}: {completed.stderr[-2000:]}')
                 row['arm']=arm
                 rows.append(row)
+                trial.append(row)
                 print(json.dumps(row,allow_nan=False),flush=True)
                 output.write_text(json.dumps(dict(status='running',trials=rows,configs_changed=False),indent=2),encoding='utf-8')
                 if row['status']=='error':
                     raise RuntimeError(f'Memory probe worker error for exp{arm}, batch{batch}: {row.get("error")}')
-    budget=choose_budget(rows,candidates,safety,world_size)
+            if all(row['status']=='ok' and row['budget_peak_bytes']<=safety*row['total_bytes'] for row in trial):
+                break
+    budget=choose_budget(rows,candidates,safety,world_size,arms)
     update_run_configs(paths,configs,budget)
     result=dict(status='ok',trials=rows,budget=budget,configs_changed=True,
         limitation='Synthetic forward/backward plus optimizer/EMA/extractor/DDP/full-atlas reserves; VAL inference peak measured separately')
@@ -264,6 +257,7 @@ def parser():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--configs-dir');p.add_argument('--output',required=True)
     p.add_argument('--candidates',type=lambda s:tuple(int(v) for v in s.split(',')),default=DEFAULT_CANDIDATES)
+    p.add_argument('--arms',type=int,nargs='+',default=DEFAULT_ARMS)
     p.add_argument('--safety',type=float,default=.82);p.add_argument('--world-size',type=int,default=4)
     p.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
     p.add_argument('--config',help=argparse.SUPPRESS);p.add_argument('--batch',type=int,help=argparse.SUPPRESS)
@@ -277,7 +271,7 @@ def main():
         result=worker(a.config,a.batch,a.output,a.atlas_file)
     else:
         if a.configs_dir is None:parser().error('--configs-dir is required')
-        result=run(a.configs_dir,a.output,candidates=a.candidates,safety=a.safety,world_size=a.world_size)
+        result=run(a.configs_dir,a.output,candidates=a.candidates,safety=a.safety,world_size=a.world_size,arms=a.arms)
     print(json.dumps(result,indent=2,allow_nan=False),flush=True)
 
 

@@ -1,4 +1,6 @@
 """Regression for the A800 SDPA batch-grid failure; CUDA checks run under sbatch."""
+import sys
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -38,8 +40,8 @@ def test_both_attention_layers_use_bounded_backend(layer,monkeypatch):
     import vemgsbm.hybrid as hybrid
     original=hybrid.batched_attention
     launches=[]
-    def bounded(q,k,v):
-        launches.append(len(q));return original(q,k,v,max_batch=3)
+    def bounded(q,k,v,**kwargs):
+        launches.append(len(q));return original(q,k,v,max_batch=3,**kwargs)
     monkeypatch.setattr(hybrid,'batched_attention',bounded)
     x=torch.randn(2,4,3,9,11,requires_grad=True)
     layer(x).square().mean().backward()
@@ -63,3 +65,31 @@ def test_original_cuda_cross_z_shape_forward_backward(dtype):
     torch.cuda.synchronize()
     assert result.shape==q.shape and torch.isfinite(result).all()
     assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in (q,k,v))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='A800 allocated GPU regression')
+def test_cuda_cross_slice_relative_bias_has_gradients():
+    attention = CrossSliceAttention(64, 4).cuda()
+    x = torch.randn(32, 64, 7, 24, 24, device='cuda', requires_grad=True)
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        output = attention(x)
+    output.square().mean().backward()
+    assert torch.isfinite(attention.relative_bias.grad).all()
+    assert attention.relative_bias.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or sys.platform != "linux",
+                    reason="Linux CUDA Inductor regression")
+def test_compiled_layers_can_backpropagate_through_eager_relative_attention():
+    attention = CrossSliceAttention(64, 4).cuda()
+
+    def block(value):
+        return attention(value.cos()).sin()
+
+    compiled = torch.compile(block)
+    x = torch.randn(4, 64, 7, 16, 16, device="cuda", requires_grad=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = compiled(x).square().mean()
+    loss.backward()
+    assert torch.isfinite(attention.relative_bias.grad).all()
+    assert attention.relative_bias.grad.abs().sum() > 0

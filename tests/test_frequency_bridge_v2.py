@@ -42,7 +42,8 @@ def test_arbitrary_steps_finite_terminal_and_ll_exact(steps, sampler):
         return target, torch.zeros_like(x)
     result = integrate_frequency_bridge(predict, initial, steps, sampler_type=sampler)
     torch.testing.assert_close(result, target)
-    assert all(0 < t < 1 for t in visited)
+    assert visited[0] == 0
+    assert all(0 <= t < 1 for t in visited)
     assert torch.isfinite(result).all()
 
 
@@ -53,7 +54,7 @@ def test_continuous_times_and_sde_rng_reproducible():
     def predict(x, t):
         return .1*x+target, torch.tanh(x)
     outputs = [integrate_frequency_bridge(predict, torch.zeros_like(target), 8,
-        sampler_type="sde", temperature=.2, generator=torch.Generator().manual_seed(16))
+        sigma_max=.08, sampler_type="sde", temperature=.2, generator=torch.Generator().manual_seed(16))
         for _ in range(2)]
     torch.testing.assert_close(*outputs, rtol=0, atol=0)
     torch.testing.assert_close(outputs[0][:, :1], outputs[1][:, :1])
@@ -69,8 +70,8 @@ def test_sde_and_ode_have_identical_ll_with_noise_sensitive_predictor():
     x = torch.zeros(2,16,1,2,2)
     def predict(state,t):
         return torch.cat((torch.ones_like(state[:,:1]), state[:,1:]),1), torch.zeros_like(state)
-    ode = integrate_frequency_bridge(predict,x,8)
-    sde = integrate_frequency_bridge(predict,x,8,sampler_type="sde",temperature=.3)
+    ode = integrate_frequency_bridge(predict,x,8,sigma_max=.08)
+    sde = integrate_frequency_bridge(predict,x,8,sigma_max=.08,sampler_type="sde",temperature=.3)
     torch.testing.assert_close(ode[:,:1],sde[:,:1])
     assert (sde[:,1:]-ode[:,1:]).square().sum() > 0
 
@@ -101,3 +102,28 @@ def test_multimodal_posterior_preserves_variance_and_more_steps_do_not_collapse(
         sampler_type="sde",temperature=.3,generator=torch.Generator().manual_seed(22))
     assert deterministic[:,1:].var() == 0
     assert stochastic[:,1:].var()/amplitude**2 > .98
+
+
+def test_deterministic_interpolation_and_rollout_follow_exact_linear_path(monkeypatch):
+    target = torch.randn(2, 16, 1, 2, 2, dtype=torch.float64)
+    initial = .25*torch.randn_like(target)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('The zero-sigma bridge does not sample noise')
+
+    monkeypatch.setattr(torch, 'randn_like', forbidden)
+    monkeypatch.setattr(torch, 'randn', forbidden)
+    sampled, times, epsilon = sample_frequency_bridge(target, time=.375, initial=initial)
+    assert not epsilon.count_nonzero()
+    torch.testing.assert_close(sampled, .625*initial+.375*target)
+    torch.testing.assert_close(frequency_velocity(sampled, target, None, times), target-initial)
+    with pytest.raises(ValueError, match='direct endpoint readout'):
+        frequency_velocity(target, target, None, 1.)
+
+    for solver in ('euler', 'heun'):
+        def predict(state, time):
+            torch.testing.assert_close(state, (1-time)*initial+time*target)
+            return target, None
+
+        result = integrate_frequency_bridge(predict, initial, 8, solver=solver, curvature=forbidden)
+        torch.testing.assert_close(result, target, rtol=0, atol=0)

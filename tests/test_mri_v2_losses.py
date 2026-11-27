@@ -2,8 +2,8 @@ import torch
 import pytest
 
 from vemgsbm.mri_metrics import mean_xy_ssim
-from vemgsbm.mri_v2_losses import (ReconstructionLoss, full_batch_ssim, gradient_diagnostics,
-                                  multiscale_ssim)
+from vemgsbm.mri_v2_losses import (ReconstructionLoss, fast_train_ssim, full_batch_ssim,
+                                  gradient_diagnostics, local_moments, multiscale_ssim)
 from vemgsbm.mri_v2_diagnostics import (local_variance_ratio, textured_region_ssim,
                                        noise_ceiling_estimate, upsample_xy, ssim_map)
 
@@ -24,6 +24,45 @@ def test_chunked_ssim_exact_value_and_gradient_on_full_batch():
     second, = torch.autograd.grad(exact, p)
     torch.testing.assert_close(first, second, atol=1.e-8, rtol=1.e-5)
     assert (first.flatten(2).norm(dim=-1) > 0).all()
+
+
+def test_float32_training_ssim_matches_exact_metric_and_gradient():
+    rng = torch.Generator().manual_seed(4)
+    y = texture()
+    p = (.8*y+.03*torch.randn(y.shape, generator=rng)).requires_grad_()
+    actual = fast_train_ssim(p, y)
+    exact = mean_xy_ssim(p, y)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.double(), exact, atol=2.e-5, rtol=0)
+    gradient, = torch.autograd.grad(actual, p)
+    expected, = torch.autograd.grad(exact, p)
+    torch.testing.assert_close(gradient, expected, atol=1.e-7, rtol=1.e-3)
+    assert (gradient.flatten(2).norm(dim=-1) > 0).all()
+
+
+def test_training_ssim_and_local_std_share_full_resolution_pool(monkeypatch):
+    import vemgsbm.mri_v2_losses as losses
+
+    y = texture()
+    p = (.9*y).requires_grad_()
+    _, vx = local_moments(p.double())
+    _, vy = local_moments(y.double())
+    expected = ((vx+1.e-8).sqrt()-(vy+1.e-8).sqrt()).abs().mean()
+    original = losses.F.avg_pool2d
+    windows = []
+
+    def track_pool(x, kernel_size, *args, **kwargs):
+        if kernel_size == 7 and x.shape[-2:] == p.shape[-2:]:
+            windows.append(x.shape)
+        return original(x, kernel_size, *args, **kwargs)
+
+    monkeypatch.setattr(losses.F, "avg_pool2d", track_pool)
+    terms = ReconstructionLoss()(p, y)
+    assert windows == [(6, 5, 32, 32)]
+    torch.testing.assert_close(terms["local_std"].double(), expected, atol=3.e-6, rtol=0)
+    gradient, = torch.autograd.grad(terms["local_std"], p)
+    assert torch.isfinite(gradient).all()
+    assert (gradient.flatten(2).norm(dim=-1) > 0).all()
 
 
 def test_all_loss_terms_have_finite_balanced_gradients():

@@ -16,7 +16,7 @@ from .runtime import atomic_save, build_models, fingerprint, load_checkpoint, pr
 
 def comparison_configs(checkpoint):
     cfg=checkpoint['config']
-    if (checkpoint.get('format_version')!=6 or cfg.get('online_atlas',False)
+    if (checkpoint.get('format_version')!=6 or checkpoint.get('next_batch',0) or cfg.get('online_atlas',False)
         or not cfg.get('frequency_split') or not cfg.get('atlas_weight',0)
         or checkpoint.get('jetatlas') is None or checkpoint.get('jetatlas_state') is None):
         raise ValueError('Paired evaluation requires an offline-selected exp3 checkpoint with trained router/atlas')

@@ -142,9 +142,7 @@ def _filename_indices(paths: Sequence[Path]) -> tuple[int, ...]:
     return tuple(range(len(paths)))
 
 
-def _png_header(path: Path):
-    with path.open("rb") as handle:
-        header = handle.read(26)
+def _png_bit_depth(header, path):
     if len(header) != 26 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
         raise ValueError(f"Invalid PNG header: {path}")
     bits = header[24]
@@ -153,41 +151,57 @@ def _png_header(path: Path):
     return bits
 
 
-def _read_raw(path: Path, channel_policy: str) -> tuple[np.ndarray, int]:
-    bits = _png_header(path)
-    with Image.open(path) as image:
-        if image.mode not in {"L", "RGB", "I", "I;16", "I;16B"}:
-            raise ValueError(f"Unsupported MRI PNG mode {image.mode!r}: {path}")
-        if image.mode == "RGB" and bits != 8:
-            raise ValueError(f"RGB 16-bit PNG cannot be decoded losslessly with Pillow: {path}")
-        raw = np.array(image, copy=True)
+def _png_header(path: Path):
+    with path.open("rb") as handle:
+        return _png_bit_depth(handle.read(26), path)
+
+
+def _read_raw(path: Path, channel_policy: str, *, fast_trusted=False) -> tuple[np.ndarray, int]:
+    with path.open("rb") as handle:
+        bits = _png_bit_depth(handle.read(26), path)
+        handle.seek(0)
+        with Image.open(handle) as image:
+            if image.mode not in {"L", "RGB", "I", "I;16", "I;16B"}:
+                raise ValueError(f"Unsupported MRI PNG mode {image.mode!r}: {path}")
+            if image.mode == "RGB" and bits != 8:
+                raise ValueError(f"RGB 16-bit PNG cannot be decoded losslessly with Pillow: {path}")
+            raw = np.asarray(image)
     if raw.ndim == 3:
         if channel_policy != "identical_rgb_to_gray" or raw.shape[-1] != 3:
             raise ValueError(f"Expected a single grayscale MRI channel: {path}")
-        if not (np.array_equal(raw[..., 0], raw[..., 1]) and np.array_equal(raw[..., 0], raw[..., 2])):
+        if not fast_trusted and not (np.array_equal(raw[..., 0], raw[..., 1])
+                                     and np.array_equal(raw[..., 0], raw[..., 2])):
             raise ValueError(f"MRI RGB channels differ: {path}")
         raw = raw[..., 0]
     if raw.ndim != 2 or raw.dtype.kind not in "ui" or min(raw.shape) < 1:
         raise ValueError(f"Expected a nonempty integer grayscale plane: {path}")
-    if raw.min() < 0 or raw.max() > 2 ** bits - 1:
+    if not fast_trusted and (raw.min() < 0 or raw.max() > 2 ** bits - 1):
         raise ValueError(f"Pixel values exceed encoded bit depth: {path}")
     return raw, bits
 
 
 def read_plane(path, normalization_scale=None, normalization_offset=0.0,
-               channel_policy="identical_rgb_to_gray", expected_bits=None) -> np.ndarray:
-    """Decode one lossless grayscale plane with a fixed intensity transform."""
+               channel_policy="identical_rgb_to_gray", expected_bits=None, *, fast_trusted=False) -> np.ndarray:
+    """Decode one lossless grayscale plane with a fixed intensity transform.
+
+    Indexed TRAIN patches may reuse the scan's RGB and encoded range checks.
+    """
     if channel_policy not in {"native", "identical_rgb_to_gray"}:
         raise ValueError(f"Unknown channel policy {channel_policy!r}")
-    raw, bits = _read_raw(Path(path), channel_policy)
+    raw, bits = _read_raw(Path(path), channel_policy, fast_trusted=fast_trusted)
     if expected_bits is not None and bits != expected_bits:
         raise ValueError(f"Image bit depth changed after indexing: {path}")
     scale = float(2 ** bits - 1 if normalization_scale is None else normalization_scale)
     offset = float(normalization_offset)
     if not math.isfinite(scale) or scale <= 0 or not math.isfinite(offset):
         raise ValueError("Normalization scale must be finite positive and offset must be finite")
-    plane = (raw.astype(np.float32) - offset) / scale
-    if not np.isfinite(plane).all() or plane.min() < 0 or plane.max() > 1:
+    trusted_unit_range = fast_trusted and offset == 0 and scale == 2 ** bits - 1
+    if trusted_unit_range:
+        plane = raw.astype(np.float32)
+        plane /= scale
+    else:
+        plane = (raw.astype(np.float32) - offset) / scale
+    if not trusted_unit_range and (not np.isfinite(plane).all() or plane.min() < 0 or plane.max() > 1):
         raise ValueError(f"Fixed normalization produced pixels outside [0,1]: {path}")
     return plane
 
@@ -444,7 +458,8 @@ def upsample_xy_patch(plane: np.ndarray, y0: int, x0: int, height: int, width: i
 
 class PairedMRIPatchDataset(Dataset):
     def __init__(self, root_lq, root_hq, split, scale=4, patch_size=(5, 128, 128),
-                 samples_per_volume=32, seed=42, cases=None, samples_per_epoch=None, **index_options):
+                 samples_per_volume=32, seed=42, cases=None, samples_per_epoch=None,
+                 return_base: bool = True, fast_trusted: bool = False, **index_options):
         if split not in {"train", "val", "test"}:
             raise ValueError("MRI split must be train, val, or test")
         if (len(patch_size) != 3 or any(not isinstance(size, int) or size < 1 for size in patch_size)
@@ -460,6 +475,8 @@ class PairedMRIPatchDataset(Dataset):
         self.split, self.scale, self.patch_size = split, scale, tuple(patch_size)
         self.samples_per_volume, self.seed, self.epoch = samples_per_volume, seed, 0
         self.samples_per_epoch = samples_per_epoch
+        self.return_base = return_base
+        self.fast_trusted = fast_trusted and split == "train"
         self._windows = []
         depth, height, width = self.patch_size
         for case in self.all_cases:
@@ -494,6 +511,10 @@ class PairedMRIPatchDataset(Dataset):
         self._case_order = rng.permutation(len(self.cases))
 
     def __getitem__(self, index):
+        if isinstance(index, tuple):
+            epoch, index = index
+            if epoch != self.epoch:
+                self.set_epoch(epoch)
         if index < 0 or index >= len(self):
             raise IndexError(index)
         case_index = (int(self._case_order[index % len(self.cases)]) if self.samples_per_epoch is not None
@@ -506,17 +527,21 @@ class PairedMRIPatchDataset(Dataset):
         y0 = int(rng.integers(case.lr_shape[0] - lr_height + 1))
         x0 = int(rng.integers(case.lr_shape[1] - lr_width + 1))
         low_frames, high_frames, base_frames = [], [], []
+        trusted = self.fast_trusted and bool(case.fingerprint)
         for position in range(z0, z0 + depth):
             low = read_plane(case.lq[position], case.normalization_scale, case.normalization_offset,
-                             case.channel_policy, case.bits)
+                             case.channel_policy, case.bits, fast_trusted=trusted)
             high = read_plane(case.hq[position], case.normalization_scale, case.normalization_offset,
-                              case.channel_policy, case.bits)
+                              case.channel_policy, case.bits, fast_trusted=trusted)
             if low.shape != case.lr_shape or high.shape != tuple(size * self.scale for size in case.lr_shape):
                 raise ValueError(f"MRI image shape changed after indexing: {case.lq[position]}, {case.hq[position]}")
             low_frames.append(low[y0:y0 + lr_height, x0:x0 + lr_width])
             high_frames.append(high[y0 * self.scale:y0 * self.scale + height, x0 * self.scale:x0 * self.scale + width])
-            base_frames.append(upsample_xy_patch(low, y0, x0, lr_height, lr_width, self.scale))
+            if self.return_base:
+                base_frames.append(upsample_xy_patch(low, y0, x0, lr_height, lr_width, self.scale))
         lr = torch.from_numpy(np.stack(low_frames)).unsqueeze(0)
         hr = torch.from_numpy(np.stack(high_frames)).unsqueeze(0)
-        base = torch.stack(base_frames).unsqueeze(0)
-        return {"hr": hr, "lr": lr, "base": base, "mask": torch.zeros_like(hr), "id": case.id}
+        item = {"hr": hr, "lr": lr, "id": case.id}
+        if self.return_base:
+            item.update(base=torch.stack(base_frames).unsqueeze(0), mask=torch.zeros_like(hr))
+        return item

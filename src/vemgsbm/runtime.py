@@ -153,7 +153,7 @@ def sampling_noise(config):
     sampling = config["sampling"]
     from .mri_v2 import is_v2
     if is_v2(config):
-        return (float(config.get('sigma_bridge',.08))*float(sampling.get('temperature',.1))
+        return (float(config.get('sigma_bridge',0.))*float(sampling.get('temperature',0.))
                 if sampling.get('sampler_type') == 'sde' else 0.)
     sampler = sampling.get("sampler_type", config.get("infer_sampler"))
     if sampler is not None:
@@ -199,6 +199,11 @@ def setup(seed, device_name="auto", threads=4):
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     if device_name.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable. Use --device cpu for a small smoke run.")
+    if device_name.startswith("cuda"):
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     return torch.device(device_name)
 
 

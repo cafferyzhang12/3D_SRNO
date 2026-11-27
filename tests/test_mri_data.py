@@ -132,6 +132,57 @@ def test_reading_redundant_rgb_and_fixed_uint16_range(tmp_path):
         read_plane(case16.lq[0], normalization_scale=10)
 
 
+def test_indexed_training_can_skip_base_and_reuse_png_validation(tmp_path, monkeypatch):
+    from vemgsbm import mri_data
+
+    lq, hq = make_case(tmp_path, rgb=True)
+    cases = index_cases(lq, hq, scale=2)
+    options = dict(cases=cases, scale=2, patch_size=(3, 8, 8))
+    expected = PairedMRIPatchDataset(lq, hq, "train", **options)[0]
+    dataset = PairedMRIPatchDataset(lq, hq, "train", **options, return_base=False, fast_trusted=True)
+    opens = []
+    original_open = Path.open
+
+    def tracked_open(path, *args, **kwargs):
+        if path.suffix == ".png":
+            opens.append(path)
+        return original_open(path, *args, **kwargs)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Indexed TRAIN patches should skip redundant validation and unused baseline")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", tracked_open)
+        patch.setattr(np, "array_equal", unexpected)
+        patch.setattr(mri_data, "upsample_xy_patch", unexpected)
+        actual = dataset[0]
+    assert actual.keys() == {"lr", "hr", "id"}
+    assert len(opens) == len(set(opens)) == 6
+    for key in ("lr", "hr"):
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+
+
+def test_persistent_workers_refresh_epoch_and_skip_completed_batches(tmp_path):
+    from torch.utils.data import DataLoader
+    from vemgsbm.mri_v2_train import EpochPatchSampler
+
+    lq, hq = make_case(tmp_path)
+    make_case(tmp_path, "case2")
+    dataset = PairedMRIPatchDataset(lq, hq, "train", scale=2, patch_size=(3, 8, 8),
+                                   samples_per_epoch=8, return_base=False)
+    sampler = EpochPatchSampler(dataset, num_replicas=1, rank=0, seed=7)
+    loader = DataLoader(dataset, batch_size=2, sampler=sampler, num_workers=1, persistent_workers=True)
+    first = list(loader)
+    sampler.set_progress(epoch=1, next_batch=2, batch_size=2)
+    resumed = list(loader)
+    expected = [dataset[index] for index in sampler]
+
+    assert len(first) == 4 and len(resumed) == 2
+    assert tuple(item for batch in resumed for item in batch["id"]) == tuple(item["id"] for item in expected)
+    torch.testing.assert_close(torch.cat([batch["hr"] for batch in resumed]),
+                               torch.stack([item["hr"] for item in expected]), rtol=0, atol=0)
+
+
 def test_legacy_cache_is_read_only_and_new_cache_is_invalidated(tmp_path, monkeypatch):
     from vemgsbm import mri_data
     lq, hq = make_case(tmp_path, count=3)

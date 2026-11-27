@@ -32,7 +32,7 @@ def index_mri_data(data):
     return cases
 
 
-def training_data(cfg, case_inventory=None):
+def training_data(cfg, case_inventory=None, *, return_base=True, fast_trusted=False):
     """Build datasets and a checkpoint identity from the selected data contract."""
     seed, data = cfg["train"]["seed"], cfg["data"]
     if data.get("kind", "volume_npy") == "paired_mri_png":
@@ -53,7 +53,8 @@ def training_data(cfg, case_inventory=None):
                 project_path(roots["root_lq"]), project_path(roots["root_hq"]), split,
                 scale=data["scale"], patch_size=tuple(data["patch_size"]),
                 samples_per_volume=cfg["train"]["train_samples" if split == "train" else "val_samples"],
-                samples_per_epoch=cfg["train"].get(budget_key), seed=seed, cases=cases[split])
+                samples_per_epoch=cfg["train"].get(budget_key), seed=seed, cases=cases[split],
+                return_base=return_base, fast_trusted=fast_trusted and split == "train")
             print(json.dumps({"split": split, "epoch_patches": len(dataset),
                               "skipped_cases": dataset.skipped_cases}), flush=True)
             datasets.append(dataset)

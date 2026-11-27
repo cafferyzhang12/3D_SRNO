@@ -49,6 +49,16 @@ def test_common_budget_uses_heaviest_arm_and_keeps_global_batch():
         m.choose_budget(limited[:-1])
 
 
+def test_selected_arms_can_raise_reservation_budget_after_measurement():
+    m=tool()
+    rows=[dict(batch=48,arm=arm,status='ok',budget_peak_bytes=821,total_bytes=1000)
+          for arm in (1,3)]
+    with pytest.raises(RuntimeError,match='82%'):
+        m.choose_budget(rows,candidates=(48,),arms=(1,3))
+    result=m.choose_budget(rows,candidates=(48,),arms=(1,3),safety=.85)
+    assert result['batch_size']==48 and result['effective_global_batch']==192
+
+
 def test_cuda_unavailable_reports_truth_and_does_not_rewrite_configs(monkeypatch,tmp_path):
     paths=run_configs(tmp_path)
     before={p:p.read_bytes() for p in paths}

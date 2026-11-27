@@ -24,7 +24,7 @@ data:
     val: data/private/scan_val.json
 base_interpolation: bicubic
 sigma_0: 0.0
-sigma_bridge: 0.08
+sigma_bridge: 0.0
 use_band_whitening: true
 model:
   architecture: HybridWaveletNAFNet25D
@@ -38,11 +38,12 @@ model:
   - 4
   window_size: 8
   heads: 4
-  refine_width: 16
-  gradient_checkpointing: true
+  refine_width: 32
+  gradient_checkpointing: refinement_only
+  refinement_chunk: 12
 train:
   epochs: 60
-  batch_size: 32
+  batch_size: 48
   accumulation_steps: 1
   train_samples: 1
   val_samples: 1
@@ -52,7 +53,7 @@ train:
   warmup_epochs: 3
   schedule_epochs: 60
   min_lr_ratio: 0.02
-  workers: 4
+  workers: 6
   threads: 4
   seed: 42
   validation_seed: 42
@@ -63,29 +64,31 @@ train:
   ema_decay: 0.999
   amp_dtype: bfloat16
   bridge_weight: 1.0
-  noise_weight: 0.05
-  rollout_fraction: 0.25
-  rollout_weight: 0.25
+  noise_weight: 0.0
+  rollout_weight: 0.0
+  compile: true
+  val_every_epochs: 2
+  save_every_updates: 500
   report_every_updates: 32
 loss:
   charbonnier: 1.0
-  ssim: 0.3
+  ssim: 0.5
   msssim: 0.1
-  fft_log: 0.01
-  fft_complex: 0.05
-  local_std: 0.3
+  fft_log: 0.005
+  fft_complex: 0.02
+  local_std: 0.03
   lpips: 0.0
-  ssim_chunk_slices: 4
 sampling:
-  steps: 8
+  steps: 1
   sampler_type: ode
-  solver: heun
-  temperature: 0.1
+  solver: euler
+  readout: endpoint
+  temperature: 0.0
   tile_batch: 4
-  sigma: 0.08
+  sigma: 0.0
   inference_sigma: 0.0
 path:
-  sigma: 0.08
+  sigma: 0.0
 perceptual:
   weights_dir: cache/perceptual/torch
   batch_size: 8
@@ -105,7 +108,7 @@ jetatlas:
   neighbor_weight: 0.1
   potential_weight: 0.02
   router_weight: 0.05
-  lr_dim: 1
+  lr_dim: 9
 inference_variant: endpoint_safe
 run_dir: runs/mri/v2/exp3
 frequency_split: true

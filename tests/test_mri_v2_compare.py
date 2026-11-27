@@ -22,7 +22,8 @@ def test_paired_configs_change_only_online_switch_and_preserve_source():
     assert ck==original and cfg['offline']['sampling']['steps']==8
 
 
-@pytest.mark.parametrize('field,value', [('format_version',5),('jetatlas',None),('jetatlas_state',None)])
+@pytest.mark.parametrize('field,value', [
+    ('format_version',5),('next_batch',2),('jetatlas',None),('jetatlas_state',None)])
 def test_untrained_or_legacy_geometry_is_rejected(field,value):
     ck=checkpoint();ck[field]=value
     with pytest.raises(ValueError,match='exp3 checkpoint'):comparison_configs(ck)

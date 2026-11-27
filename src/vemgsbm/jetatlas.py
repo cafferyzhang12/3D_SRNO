@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections import Counter
 
 import torch
 from torch import nn
@@ -25,6 +24,44 @@ def hf_patches(coefficients, stride=1):
     b, _, z, h, w = coefficients.shape
     planes = coefficients[:, 1:].permute(0, 2, 1, 3, 4).reshape(b*z, 15, h, w)
     return F.unfold(F.pad(planes, (1, 1, 1, 1), mode='replicate'), 3, stride=stride).transpose(1, 2).reshape(-1, 135)
+
+
+def _lr_grid(lr, lr_dim, grid_shape):
+    if lr.ndim != 5 or lr.shape[1] not in (1, lr_dim):
+        raise ValueError('LR router features must have B,1 or lr_dim,Z,Y,X shape')
+    if lr.shape[1] == 1 and lr_dim not in (1, 9):
+        raise ValueError('Native LR inputs support scalar or 3x3 router features')
+    if grid_shape is not None and tuple(lr.shape[2:]) != tuple(grid_shape):
+        lr = F.interpolate(lr,size=grid_shape,mode='trilinear',align_corners=False)
+    return lr
+
+
+def lr_router_rows(lr, lr_dim=9, *, grid_shape=None, stride=1):
+    """Raw LR router features aligned with hf_patches in BZYX row order."""
+    lr = _lr_grid(lr,lr_dim,grid_shape)
+    if lr.shape[1] == lr_dim:
+        return lr[:,:,:,::stride,::stride].movedim(1,-1).reshape(-1,lr_dim)
+    b,_,z,h,w = lr.shape
+    planes = lr.reshape(b*z,1,h,w)
+    columns = F.unfold(F.pad(planes,(1,1,1,1),mode='replicate'),3,stride=stride)
+    return columns.transpose(1,2).reshape(-1,lr_dim)
+
+
+def _site_rows(volume, sites, radius=0):
+    """Gather replicated XY neighborhoods at per-item flattened ZYX sites."""
+    _,_,_,h,w = volume.shape
+    batch = torch.arange(len(volume),device=sites.device)[:,None]
+    z = sites.div(h*w,rounding_mode='floor')
+    y = sites.div(w,rounding_mode='floor').remainder(h)
+    x = sites.remainder(w)
+    if radius == 0:
+        return volume.movedim(1,-1)[batch,z,y,x]
+    offsets = torch.arange(-radius,radius+1,device=sites.device)
+    width = len(offsets)
+    y = (y[...,None] + offsets.repeat_interleave(width)).clamp(0,h-1)
+    x = (x[...,None] + offsets.repeat(width)).clamp(0,w-1)
+    blocks = volume.movedim(1,-1)[batch[...,None],z[...,None],y,x]
+    return blocks.transpose(-1,-2).flatten(-2)
 
 
 def fold_hf_patches(patches, shape):
@@ -197,6 +234,53 @@ class SCJetAtlas(nn.Module):
         distances = torch.cdist(x,self.centers).square()
         return (-.5*distances/self.blend_bandwidth.square().clamp_min(1.e-10)).softmax(-1)
 
+    def _projection_jet(self, x, chart_ids, gn_steps, *, return_jacobian=True):
+        basis = self.basis[chart_ids]
+        center = self.centers[chart_ids]
+        intercept = center + self.offset[chart_ids]
+        linear = basis + self.linear[chart_ids]
+        form = self.quadratic[chart_ids]
+        radius = self.radius[chart_ids]
+        q_raw = (basis.mT @ (x-center)[...,None])[...,0]
+        q = smooth_bound(q_raw,radius)
+
+        def decode(coordinates, with_jacobian):
+            q_form = (coordinates[...,None,:] @ form.flatten(-2)).reshape_as(linear.mT)
+            value = intercept + ((linear+q_form.mT) @ coordinates[...,None])[...,0]
+            return value, linear + 2*q_form.mT if with_jacobian else None
+
+        if gn_steps:
+            projection,jacobian = decode(q,True)
+            gram = jacobian.mT @ jacobian
+            eye = torch.eye(self.intrinsic,device=x.device,dtype=x.dtype)
+            ridge = gram.diagonal(dim1=-2,dim2=-1).mean(-1).clamp_min(1.e-10)*1.e-6
+            root,_ = torch.linalg.cholesky_ex(gram+ridge[...,None,None]*eye)
+            rhs = jacobian.mT @ (x-projection)[...,None]
+            step = torch.cholesky_solve(rhs,root)[...,0]
+            q = q + smooth_bound(step,radius*.5)
+        projection,jacobian = decode(q,return_jacobian)
+        return projection,jacobian,form,q_raw/radius.clamp_min(1.e-8)
+
+    def _support(self, relative, chart_ids):
+        distance = (torch.logsumexp(8*(relative.square()+1.e-12).sqrt(),-1)
+                    -math.log(self.intrinsic))/8-1
+        confidence = torch.sigmoid(-4*distance)*(.1+.9*self.supported[chart_ids].to(relative))
+        return distance,confidence
+
+    def query_projection_only(self, x, chart_ids=None, gn_steps=1, *, return_tangent=False):
+        """Damped closest-point estimate with optional orthonormal tangent frame."""
+        if x.shape[-1] != self.dimension or gn_steps not in (0,1):
+            raise ValueError('Projection requires matching features and at most one GN step')
+        if chart_ids is None:
+            chart_ids = self.distribution(x).argmax(-1)
+        projection,jacobian,_,relative = self._projection_jet(x,chart_ids,gn_steps,return_jacobian=return_tangent)
+        distance,confidence = self._support(relative,chart_ids)
+        result = dict(projection=projection,support_distance=distance,confidence=confidence)
+        if return_tangent:
+            root,_ = torch.linalg.cholesky_ex(jacobian.mT @ jacobian)
+            result['tangent'] = torch.linalg.solve_triangular(root,jacobian.mT,upper=False).mT
+        return result
+
     def query_second_order(self, x, *, chart_ids=None, direction=None, gn_steps=2):
         if x.shape[-1] != self.dimension or not 0 <= gn_steps <= 2:
             raise ValueError('Invalid second-order feature query')
@@ -221,9 +305,7 @@ class SCJetAtlas(nn.Module):
                                           torch.einsum('...di,...d->...i',tangent,ambient_hessian_trace))
         # Signed soft support boundary distance, positive outside the measured box.
         relative = q_raw/self.radius[chart_ids].clamp_min(1.e-8)
-        support_distance = (torch.logsumexp(8*(relative.square()+1.e-12).sqrt(),-1)
-                            -math.log(self.intrinsic))/8-1
-        confidence = torch.sigmoid(-4*support_distance)*(.1+.9*self.supported[chart_ids].to(x))
+        support_distance,confidence = self._support(relative,chart_ids)
         result = dict(projection=projection,tangent=tangent,jacobian=jac,hessian=hessian,
             mean_curvature=mean_curvature,support_distance=support_distance,confidence=confidence,
             coordinates=q,chart_ids=chart_ids)
@@ -303,7 +385,7 @@ class JetAtlasRegularizer(nn.Module):
         self.pcas,self.atlases,self.routers = nn.ModuleList(pcas),nn.ModuleList(atlases),nn.ModuleList(routers)
         self.folds,self.settings = dict(folds),dict(settings)
         self.provenance = dict(provenance or {})
-        self.lr_dim = int(settings.get('lr_dim',1))
+        self.lr_dim = int(settings.get('lr_dim',routers[0].lr_dim))
         self.site_budget = int(settings.get('query_sites',128))
         if self.site_budget < 1:
             raise ValueError('Positive geometric site budget required')
@@ -331,7 +413,9 @@ class JetAtlasRegularizer(nn.Module):
             raise ValueError('Require intrinsic < PCA dimensions < 135')
         nfolds = len(set(folds.values()))
         pcas,atlases,routers = [],[],[]
-        lr_dim = int(settings.get('lr_dim',1))
+        if lr_features is not None and lr_features.ndim != 2:
+            raise ValueError('TRAIN LR bank features do not align with HF patches')
+        lr_dim = int(settings.setdefault('lr_dim',9 if lr_features is None else lr_features.shape[-1]))
         if lr_features is not None:
             if lr_features.shape != (len(features),lr_dim) or not lr_features.isfinite().all():
                 raise ValueError('TRAIN LR bank features do not align with HF patches')
@@ -361,12 +445,13 @@ class JetAtlasRegularizer(nn.Module):
     def from_payload(cls,payload):
         if payload.get('version') != cls.version or payload.get('provenance',{}).get('split') != 'train':
             raise ValueError('Expected a TRAIN-only JetAtlas v2 snapshot')
-        settings = payload['settings']
+        settings = dict(payload['settings'])
         pcas=[TrainPCA(p['mean'],p['basis']) for p in payload['pcas']]
         atlases=[SCJetAtlas(a) for a in payload['atlases']]
         routers=[]
         for atlas,pca,state in zip(atlases,pcas,payload['routers']):
-            router=SoftAtlasRouter(int(settings.get('lr_dim',1)),pca.basis.shape[1],atlas.chart_count,
+            lr_dim = int(settings.setdefault('lr_dim',state['network.0.weight'].shape[1]-pca.basis.shape[1]))
+            router=SoftAtlasRouter(lr_dim,pca.basis.shape[1],atlas.chart_count,
                 hidden=int(settings.get('router_hidden',64)),top_m=int(settings.get('top_m',3)))
             router.load_state_dict(state)
             routers.append(router)
@@ -380,37 +465,57 @@ class JetAtlasRegularizer(nn.Module):
             texture_neighbourhood='3x3 Haar HF = 12x12 HR',
             support_is_measured_not_guaranteed=True)
 
-    def _lr_rows(self, lr_features, coefficients):
-        b,_,z,h,w = coefficients.shape
-        if lr_features is None:
-            raise ValueError('LR features are required for leak-free online chart routing')
-        if lr_features.ndim != 5 or lr_features.shape[:2] != (b,self.lr_dim):
-            raise ValueError('LR router features must have B,lr_dim,Z,Y,X shape')
-        if tuple(lr_features.shape[2:]) != (z,h,w):
-            lr_features=F.interpolate(lr_features,size=(z,h,w),mode='trilinear',align_corners=False)
-        return lr_features.permute(0,2,3,4,1).reshape(-1,self.lr_dim)
-
     @staticmethod
+    def _quantiles(values, mask, fractions):
+        # Gradients and energies are nonnegative, so masked values sort first.
+        ordered = values.masked_fill(~mask,0).sort(dim=-1).values
+        count = mask.sum(-1,keepdim=True)
+        first = (values.shape[-1]-count).clamp_max(values.shape[-1]-1)
+        position = (count-1).clamp_min(0) * values.new_tensor(fractions)
+        lower = position.floor().long()
+        upper = position.ceil().long()
+        return ordered.gather(-1,first+lower).lerp(ordered.gather(-1,first+upper),position-lower)
+
+    @classmethod
     @torch.no_grad()
-    def _sample_sites(target, count, reference=None, grid_shape=None):
-        n=len(target)
+    def _sample_sites(cls, target, count, reference=None):
+        b,_,z,h,w = target.shape
+        n = z*h*w
         if count >= n:
-            return torch.arange(n,device=target.device)
-        from .spatial_atlas import _stratified_sites,_structure_labels
-        if reference is not None:
-            labels=_structure_labels(reference,grid_shape)
+            return torch.arange(n,device=target.device).expand(b,-1)
+        if reference is None:
+            energy = target[:,1:].square().mean(1).reshape(b*z,1,h,w)
+            energy = F.avg_pool2d(F.pad(energy,(1,1,1,1),mode='replicate'),3,stride=1).reshape(b,n)
+            nonzero = energy > 1.e-8
+            lo,hi = cls._quantiles(energy,nonzero,[.3,.9]).split(1,dim=-1)
+            labels = nonzero.long() + (nonzero & (energy>=lo)).long() + (nonzero & (energy>=hi)).long()
         else:
-            # Physical HF energy proxy is only a fallback for coefficient-only callers.
-            # With HR provided, use the established physical 7x7 variance/edge strata.
-            energy=target.square().mean(-1)
-            labels=torch.ones(n,dtype=torch.long,device=target.device)
-            labels[energy<=1.e-8]=0
-            nonzero=energy>1.e-8
-            if nonzero.any():
-                lo,hi=torch.quantile(energy[nonzero],energy.new_tensor([.3,.9]))
-                labels[(energy>=lo)&nonzero]=2
-                labels[(energy>=hi)&nonzero]=3
-        return _stratified_sites(labels,count,[.1,.2,.5,.2])
+            if reference.shape != (b,1,z,4*h,4*w):
+                raise ValueError('Structural JetAtlas sampling needs aligned B1ZYX HR at four times the Haar XY grid')
+            image = reference.reshape(b*z,1,4*h,4*w)
+            moments = F.pad(torch.cat((image,image.square()),1),(3,3,3,3),mode='replicate')
+            moments = F.avg_pool2d(F.avg_pool2d(moments,(7,1),stride=1),(1,7),stride=1)
+            mean,second = moments.split(1,dim=1)
+            variance = F.avg_pool2d((49/48*(second-mean.square())).clamp_min(0),4,stride=4).reshape(b,n)
+            gradient = (F.pad((image[...,1:,:]-image[...,:-1,:]).abs(),(0,0,0,1))
+                        + F.pad((image[...,1:]-image[...,:-1]).abs(),(0,1,0,0)))
+            gradient = F.avg_pool2d(gradient,4,stride=4).reshape(b,n)
+            foreground = F.avg_pool2d(image,4,stride=4).reshape(b,n) > 2/255
+            edge = foreground & (gradient>0) & (gradient>=cls._quantiles(gradient,foreground,[.9]))
+            labels = torch.where(edge,3,foreground.long()+(foreground & (variance>=1.e-4)).long())
+        fractions = [.1,.2,.5,.2]
+        limits = [math.floor(frac*count) for frac in fractions]
+        remainders = sorted(range(len(limits)),key=lambda i:fractions[i]*count-limits[i],reverse=True)
+        for index in remainders[:count-sum(limits)]:
+            limits[index] += 1
+        priorities = torch.rand(labels.shape,device=target.device)
+        selected = torch.zeros_like(labels,dtype=torch.bool)
+        for label,limit in enumerate(limits):
+            if limit:
+                scores,sites = priorities.masked_fill(labels!=label,-1).topk(limit,dim=-1)
+                selected |= torch.zeros_like(selected).scatter_(1,sites,scores>=0)
+        # Fill shortages from any remaining stratum without duplicate sites.
+        return (priorities+selected).topk(count,dim=-1).indices
 
     def forward(self,prediction,target,case_ids,lr_features=None,state=None,reference=None):
         # QR/SVD/Gram solves and distance kernels require float32 under bf16 AMP.
@@ -422,74 +527,90 @@ class JetAtlasRegularizer(nn.Module):
                 None if reference is None else reference.float())
 
     def _forward(self,prediction,target,case_ids,lr_features=None,state=None,reference=None):
-        if prediction.shape != target.shape or len(case_ids) != len(prediction) or any(c not in self.folds for c in case_ids):
+        if prediction.shape != target.shape or not case_ids or len(case_ids) != len(prediction) or any(c not in self.folds for c in case_ids):
             raise ValueError('TRAIN geometry needs paired coefficients and known cross-fit case IDs')
-        state=prediction if state is None else state
-        if state.shape != prediction.shape:
+        if prediction.ndim != 5 or prediction.shape[1] != 16:
+            raise ValueError('Expected B16ZYX orthonormal Haar coefficients')
+        if state is not None and state.shape != prediction.shape:
             raise ValueError('Bridge state and prediction must align')
-        pred_rows,truth_rows,state_rows=hf_patches(prediction),hf_patches(target.detach()),hf_patches(state)
-        lr_rows=self._lr_rows(lr_features,prediction)
-        sites_per_item=math.prod(prediction.shape[2:])
-        values={key:prediction.new_zeros(()) for key in ('jet_asym','jet_neighbor','jet_potential','router_kl')}
-        query_count=0
-        for b,case in enumerate(case_ids):
-            fold=self.folds[case]
-            pca,atlas,router=self.pcas[fold],self.atlases[fold],self.routers[fold]
-            sl=slice(b*sites_per_item,(b+1)*sites_per_item)
-            sites=self._sample_sites(truth_rows[sl],self.site_budget,
-                None if reference is None else reference[b:b+1],prediction.shape[2:])
-            x,y=pca(pred_rows[sl][sites]),pca(truth_rows[sl][sites])
-            s,lr=pca(state_rows[sl][sites]),lr_rows[sl][sites]
-            # Teacher geometry never enters network or online router input.
-            with torch.no_grad():
-                teacher=atlas.distribution(y)
-                query=atlas.query_second_order(y,chart_ids=teacher.argmax(-1))
-            asym,normal,_=jet_asymmetric_loss(x-y,query,
-                normal_weight=float(self.settings.get('normal_weight',1.)),
-                tangent_weight=float(self.settings.get('tangent_weight',.05)),
-                curvature_limit=float(self.settings.get('curvature_limit',1.)))
-            values['jet_asym']=values['jet_asym']+asym
-            values['router_kl']=values['router_kl']+router.distillation_loss(lr,s.detach(),teacher)
-            ids,weights=router.route(lr,s)
-            expanded=s[:,None].expand(-1,ids.shape[-1],-1)
-            local=atlas.query_second_order(expanded,chart_ids=ids)
-            surf=(expanded-local['projection']).square().mean(-1)
-            supp=F.softplus(local['support_distance']/float(self.settings.get('support_temperature',.25))).square()
-            potential=(weights*(float(self.settings.get('surface_weight',1.))*surf+
-                        float(self.settings.get('support_weight',.01))*supp)).sum(-1).mean()
-            values['jet_potential']=values['jet_potential']+potential
-            # Query positive XY neighbours using each anchor's fixed target geometry.
-            # Both corrected normal errors share that chart/frame, preventing basis-sign artefacts.
-            h,w=prediction.shape[-2:]
-            right=sites[sites.remainder(w)<w-1]
-            down=sites[sites.div(w,rounding_mode='floor').remainder(h)<h-1]
-            anchors=torch.cat((right,down))
-            neighbors=torch.cat((right+1,down+w))
-            if len(anchors):
-                with torch.no_grad():
-                    yn=pca(truth_rows[sl][anchors])
-                    nq=atlas.query_second_order(yn)
-                ea=pca(pred_rows[sl][anchors])-yn
-                eb=pca(pred_rows[sl][neighbors])-pca(truth_rows[sl][neighbors])
-                _,na,_=jet_asymmetric_loss(ea,nq)
-                _,nb,_=jet_asymmetric_loss(eb,nq)
-                values['jet_neighbor']=values['jet_neighbor']+(na-nb).square().mean()
-            query_count+=len(sites)
-        values={key:value/len(case_ids) for key,value in values.items()}
+        if lr_features is None or lr_features.ndim != 5 or len(lr_features) != len(prediction):
+            raise ValueError('Aligned LR features are required for leak-free chart routing')
+        lr_grid = _lr_grid(lr_features,self.lr_dim,prediction.shape[2:])
+        sites = self._sample_sites(target.detach(),self.site_budget,reference)
+        b,count = sites.shape
+        h,w = prediction.shape[-2:]
+        valid = torch.stack((sites.remainder(w)<w-1,sites.div(w,rounding_mode='floor').remainder(h)<h-1),-1)
+        neighbors = sites[...,None] + valid*sites.new_tensor([1,w])
+        locations = torch.cat((sites[...,None],neighbors),-1).reshape(b,-1)
+        pred_rows = _site_rows(prediction[:,1:],locations,1).reshape(b,count,3,135)
+        truth_rows = _site_rows(target.detach()[:,1:],locations,1).reshape_as(pred_rows)
+        state_rows = pred_rows[:,:,0] if state is None else _site_rows(state[:,1:],sites,1)
+        lr_rows = _site_rows(lr_grid,sites,int(lr_grid.shape[1]!=self.lr_dim))
+
+        groups = [[] for _ in self.atlases]
+        for index,case in enumerate(case_ids):
+            groups[self.folds[case]].append(index)
+        values = {key:prediction.new_zeros(()) for key in ('jet_asym','jet_neighbor','jet_potential','router_kl')}
+        for fold,indices in enumerate(groups):
+            if indices:
+                selected = torch.tensor(indices,device=prediction.device)
+                fold_values = self._forward_fold(fold,pred_rows[selected],truth_rows[selected],state_rows[selected],
+                                                 lr_rows[selected],valid[selected])
+                for key,value in fold_values.items():
+                    values[key] = values[key]+value*(len(indices)/b)
+            else:
+                # DDP requires every rank's absent-fold router parameters in the graph.
+                values['router_kl'] = values['router_kl'] + sum(
+                    parameter.reshape(-1)[0]*0 for parameter in self.routers[fold].parameters())
         values['loss']=(float(self.settings.get('asym_weight',1.))*values['jet_asym']+
             float(self.settings.get('neighbor_weight',.1))*values['jet_neighbor']+
             float(self.settings.get('potential_weight',.01))*values['jet_potential']+
             float(self.settings.get('router_weight',.01))*values['router_kl'])
-        values['jet_query_sites']=prediction.new_tensor(query_count)
+        values['jet_query_sites']=prediction.new_tensor(b*count)
         return values
+
+    def _forward_fold(self, fold, prediction, target, state, lr, valid):
+        pca,atlas,router = self.pcas[fold],self.atlases[fold],self.routers[fold]
+        y = pca(target[:,:,0]).flatten(0,1)
+        with torch.no_grad():
+            teacher = atlas.distribution(y)
+            _,jacobian,form,_ = atlas._projection_jet(y,teacher.argmax(-1),gn_steps=1)
+            tangent,triangle = torch.linalg.qr(jacobian,mode='reduced')
+        # Anchor, right and down error use one target chart and tangent frame.
+        error = ((prediction-target) @ pca.basis).flatten(0,1)
+        tangent_coordinates = tangent.mT @ error.mT
+        coordinates = torch.linalg.solve_triangular(triangle,tangent_coordinates,upper=True).mT
+        qform = (coordinates @ form.flatten(-2)).reshape(*coordinates.shape,error.shape[-1])
+        curvature = 2*(qform*coordinates[...,None]).sum(-2)
+        curvature = curvature - (curvature @ tangent) @ tangent.mT
+        curvature = safe_vector(curvature,float(self.settings.get('curvature_limit',1.)))
+        corrected = error-.5*curvature
+        normal = corrected-(corrected @ tangent) @ tangent.mT
+        asym = (float(self.settings.get('normal_weight',1.))*normal[:,0].square().mean()+
+            float(self.settings.get('tangent_weight',.05))*(tangent @ tangent_coordinates[...,:1]).square().mean())
+        neighbor_cost = (normal[:,:1]-normal[:,1:]).square().mean(-1).reshape_as(valid)
+        neighbor = ((neighbor_cost*valid).sum((1,2))/valid.sum((1,2)).clamp_min(1)).mean()
+
+        state = pca(state).flatten(0,1)
+        lr = lr.flatten(0,1)
+        distillation = router.distillation_loss(lr,state.detach(),teacher)
+        ids,weights = router.route(lr,state)
+        expanded = state[:,None].expand(-1,ids.shape[-1],-1)
+        local = atlas.query_projection_only(expanded,chart_ids=ids)
+        surface = (expanded-local['projection']).square().mean(-1)
+        support = F.softplus(local['support_distance']/float(self.settings.get('support_temperature',.25))).square()
+        potential = (weights*(float(self.settings.get('surface_weight',1.))*surface+
+                    float(self.settings.get('support_weight',.01))*support)).sum(-1).mean()
+        return dict(jet_asym=asym,jet_neighbor=neighbor,jet_potential=potential,router_kl=distillation)
 
     def _online_delta(self,coefficients,lr_features,*,tau_eb=None,noise_variance=.001,curvature=False,stride=1):
         rows=hf_patches(coefficients,stride=stride)
         b,_,z,h,w=coefficients.shape
-        lr=self._lr_rows(lr_features,coefficients).reshape(b,z,h,w,self.lr_dim)
-        lr=lr[:,:,::stride,::stride].reshape(-1,self.lr_dim)
+        if lr_features.ndim != 5 or len(lr_features) != b:
+            raise ValueError('Aligned LR features are required for leak-free chart routing')
+        lr=lr_router_rows(lr_features,self.lr_dim,grid_shape=(z,h,w),stride=stride)
         delta=torch.zeros_like(rows)
-        chunk=int(self.settings.get('query_chunk',256))
+        chunk=int(self.settings.get('query_chunk',4096))
         maximum=float(self.settings.get('max_geometry_update',.05))
         # All deployed routers were distilled against charts excluding the teacher case.
         for pca,atlas,router in zip(self.pcas,self.atlases,self.routers):
@@ -498,10 +619,11 @@ class JetAtlasRegularizer(nn.Module):
                 x=pca(rows[start:start+chunk])
                 ids,weights=router.route(lr[start:start+chunk],x)
                 expanded=x[:,None].expand(-1,ids.shape[-1],-1)
-                query=atlas.query_second_order(expanded,chart_ids=ids)
                 if curvature:
+                    query=atlas.query_second_order(expanded,chart_ids=ids)
                     change=safe_vector(query['mean_curvature'],float(self.settings.get('curvature_limit',1.)))
                 else:
+                    query=atlas.query_projection_only(expanded,chart_ids=ids,return_tangent=True)
                     change=empirical_bayes_refine(expanded,query,noise_variance,tau=tau_eb)-expanded
                 # Unsupported charts fade smoothly; no hard coordinate clipping.
                 change=(weights[...,None]*query['confidence'][...,None]*change).sum(1)

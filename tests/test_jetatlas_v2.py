@@ -3,9 +3,9 @@ import inspect
 import pytest
 import torch
 
-from vemgsbm.jetatlas import (SCJetAtlas, SoftAtlasRouter, case_folds,
+from vemgsbm.jetatlas import (JetAtlasRegularizer, SCJetAtlas, SoftAtlasRouter, case_folds,
     empirical_bayes_refine, fold_hf_patches, hf_patches, jet_asymmetric_loss,
-    jet_potential, smooth_bound)
+    jet_potential, lr_router_rows, smooth_bound)
 
 
 def parabola(dtype=torch.float64):
@@ -285,3 +285,89 @@ def test_sparse_curvature_constant_field_remains_constant():
     assert result.shape==x.shape and result.isfinite().all()
     torch.testing.assert_close(result,result[:,:,:,:1,:1].expand_as(result))
     assert result[:,:1].count_nonzero()==0 and result[:,1:].norm()>0
+
+
+def test_projection_only_matches_one_step_full_query_and_backpropagates():
+    atlas = parabola()
+    x = torch.tensor([[[.2,-.1,.3],[-.4,.2,-.3],[1.4,.2,.9]]],dtype=torch.float64,requires_grad=True)
+    ids = torch.zeros(x.shape[:-1],dtype=torch.long)
+    full = atlas.query_second_order(x,chart_ids=ids,gn_steps=1)
+    fast = atlas.query_projection_only(x,ids)
+    assert set(fast) == {'projection','support_distance','confidence'}
+    for key,value in fast.items():
+        torch.testing.assert_close(value,full[key],atol=1.e-10,rtol=1.e-10)
+    tangent = atlas.query_projection_only(x,ids,return_tangent=True)['tangent']
+    torch.testing.assert_close(tangent@tangent.mT,full['tangent']@full['tangent'].mT,
+                               atol=1.e-10,rtol=1.e-10)
+    fast_grad, = torch.autograd.grad(jet_potential(x,fast),x,retain_graph=True)
+    full_grad, = torch.autograd.grad(jet_potential(x,full),x)
+    torch.testing.assert_close(fast_grad,full_grad,atol=1.e-10,rtol=1.e-10)
+    assert fast_grad.isfinite().all() and fast_grad.norm()>0
+
+
+def test_router_lr_rows_use_replicated_neighborhoods_and_match_haar_order():
+    lr = torch.arange(24,dtype=torch.float32).reshape(2,1,2,2,3)
+    cells = lr_router_rows(lr).reshape(2,2,2,3,9)
+    torch.testing.assert_close(cells[0,0,0,0],torch.tensor([0.,0.,1.,0.,0.,1.,3.,3.,4.]))
+    torch.testing.assert_close(cells[...,4],lr[:,0])
+    torch.testing.assert_close(lr_router_rows(lr,stride=2),cells[:,:,::2,::2].reshape(-1,9))
+    torch.testing.assert_close(lr_router_rows(lr,1),lr.reshape(-1,1))
+
+
+def test_batched_structure_sampling_preserves_per_item_quotas_and_fills_shortages():
+    from vemgsbm.spatial_atlas import _structure_labels
+
+    reference = torch.zeros(2,1,1,64,64)
+    reference[0,:,:,:32,32:] = .4
+    generator = torch.Generator().manual_seed(12)
+    reference[0,:,:,32:] = torch.rand((1,1,32,64),generator=generator)*.8+.2
+    target = torch.zeros(2,16,1,16,16)
+    sites = JetAtlasRegularizer._sample_sites(target,20,reference)
+    quotas = torch.tensor([2,4,10,4])
+    for item,selected in enumerate(sites):
+        labels = _structure_labels(reference[item:item+1],target.shape[2:])
+        actual = labels[selected].bincount(minlength=4)
+        assert torch.all(actual >= torch.minimum(quotas,labels.bincount(minlength=4)))
+        assert len(selected.unique()) == 20
+
+
+def test_fold_batched_regularizer_matches_single_items_and_reuses_teacher(regularizer,monkeypatch):
+    old_atlas,coeff,rows,ids = regularizer
+    settings = dict(old_atlas.settings,lr_dim=9,query_sites=64)
+    lr = torch.rand(5,1,1,8,8)
+    model = JetAtlasRegularizer.fit_from_bank(rows,ids,settings,lr_router_rows(lr))
+    payload = model.payload()
+    assert JetAtlasRegularizer.from_payload(payload).lr_dim == 9
+    legacy_payload = old_atlas.payload()
+    legacy_payload['settings'] = {key:value for key,value in old_atlas.settings.items() if key!='lr_dim'}
+    assert JetAtlasRegularizer.from_payload(legacy_payload).lr_dim == 1
+
+    cases = ['c0','c2','c0','c2']
+    selected = torch.tensor([0,2,0,2])
+    target = coeff[selected]
+    prediction = (target+.01*torch.randn_like(target)).requires_grad_()
+    state = (.5*prediction.detach()).requires_grad_()
+    raw = lr[selected].requires_grad_()
+    reference = torch.rand(len(cases),1,1,32,32)
+    separate = [model(prediction[i:i+1],target[i:i+1],[c],raw[i:i+1],state[i:i+1],reference[i:i+1])
+                for i,c in enumerate(cases)]
+
+    visited = []
+    run_fold = model._forward_fold
+    def record_fold(fold,*args):
+        visited.append((fold,len(args[0])))
+        return run_fold(fold,*args)
+    def reject_full_query(*args,**kwargs):
+        pytest.fail('Training should use the Cholesky projection path')
+    monkeypatch.setattr(model,'_forward_fold',record_fold)
+    monkeypatch.setattr(SCJetAtlas,'query_second_order',reject_full_query)
+
+    batched = model(prediction,target,cases,raw,state,reference)
+    assert sorted(visited) == sorted((model.folds[case],2) for case in set(cases))
+    assert batched['jet_query_sites']==256
+    for key in set(batched)-{'jet_query_sites'}:
+        torch.testing.assert_close(batched[key],torch.stack([row[key] for row in separate]).mean())
+    batched['loss'].backward()
+    for tensor in (prediction,state,raw):
+        assert tensor.grad.isfinite().all() and tensor.grad.norm()>0
+    assert all(parameter.grad is not None for parameter in model.routers.parameters())

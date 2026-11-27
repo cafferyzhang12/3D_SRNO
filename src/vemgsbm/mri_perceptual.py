@@ -165,7 +165,7 @@ def frechet_distance(first, second):
 
 
 @torch.no_grad()
-def consume_case(volume, case, paired, features, predicted, reference, device, batch_size):
+def consume_case(volume, case, paired, features, predicted, reference, device, batch_size, *, observe=None):
     if tuple(volume.shape) != (len(case.hq), *[s * case.scale for s in case.lr_shape]):
         raise ValueError("Reconstruction does not match the complete reference case")
     lpips_sum = 0.
@@ -173,7 +173,10 @@ def consume_case(volume, case, paired, features, predicted, reference, device, b
         paths = case.hq[start:start + batch_size]
         truth = np.stack([read_plane(path, case.normalization_scale, case.normalization_offset,
                                     case.channel_policy, case.bits) for path in paths])
-        p_lp, p_fid = rgb_inputs(volume[start:start + len(paths)], device)
+        prediction = volume[start:start + len(paths)]
+        if observe is not None:
+            observe(prediction, truth)
+        p_lp, p_fid = rgb_inputs(prediction, device)
         y_lp, y_fid = rgb_inputs(truth, device)
         distances = paired(p_lp, y_lp).reshape(-1)
         if len(distances) != len(paths) or not torch.isfinite(distances).all():

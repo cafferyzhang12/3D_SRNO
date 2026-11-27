@@ -18,10 +18,16 @@ export TORCH_HOME="${MRI_PERCEPTUAL_WEIGHTS:-$PWD/cache/perceptual/torch}"
 "$GSBM_PYTHON" -m pytest -q --junitxml="reports/mri/${RUN_ID}_pytest.xml"
 "$GSBM_PYTHON" tools/mri_v2_prepare.py --inventory "$MRI_CASE_INVENTORY" --run-id "$RUN_ID"
 root="runs/mri/v2/$RUN_ID"
+read -r -a arms <<< "${V2_ARMS:-1 2 3 4}"
+if [[ -n "${MRI_V2_BASELINE_SOURCE:-}" ]]; then
+    "$GSBM_PYTHON" tools/mri_v2_benchmark.py --baseline-source "$MRI_V2_BASELINE_SOURCE" \
+        --device cuda --output "$root/benchmark_cuda.json"
+fi
 "$GSBM_PYTHON" -m vemgsbm.mri_perceptual prepare-weights --weights-dir "$TORCH_HOME" --device cuda
 "$GSBM_PYTHON" tools/mri_v2_smoke.py --device cuda --weights-dir "$TORCH_HOME" --require-perceptual --output "$root/smoke.json"
-"$GSBM_PYTHON" tools/mri_v2_memory_probe.py --configs-dir "$root" --output "$root/memory.json"
-gsbm_torchrun tools/mri_v2_ddp_smoke.py --configs-dir "$root" --output "$root/ddp_smoke.json"
+"$GSBM_PYTHON" tools/mri_v2_memory_probe.py --configs-dir "$root" --output "$root/memory.json" \
+    --candidates 8,16,32,48 --arms "${arms[@]}" --safety "${MRI_V2_MEMORY_SAFETY:-.82}"
+gsbm_torchrun tools/mri_v2_ddp_smoke.py --configs-dir "$root" --output "$root/ddp_smoke.json" --arms "${arms[@]}"
 legacy=()
 [[ -z "${MRI_LEGACY_CHECKPOINT:-}" ]] || legacy=(--checkpoint "$MRI_LEGACY_CHECKPOINT" --legacy-inventory "$MRI_CASE_INVENTORY")
 "$GSBM_PYTHON" tools/mri_ceiling_audit.py --config "$root/exp1.yaml" --inventory "$root/trainval_inventory.json.gz" \

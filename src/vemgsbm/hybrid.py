@@ -10,7 +10,7 @@ from .models import batch_time
 from .momentum.model import HaarXY
 
 
-def batched_attention(query, key, value, max_batch=16384):
+def batched_attention(query, key, value, max_batch=16384, *, attention_bias=None):
     """SDPA over independent sequences without exceeding CUDA launch grids.
 
     Cross-Z attention expands B*Y*X into SDPA's batch dimension. Fused CUDA
@@ -24,11 +24,15 @@ def batched_attention(query, key, value, max_batch=16384):
         raise ValueError('Expected attention tensors shaped batch,heads,tokens,features')
     if not (query.shape[0] == key.shape[0] == value.shape[0]) or query.shape[0] < 1:
         raise ValueError('Attention tensors require aligned nonempty sequence batches')
+    def attend(q, k, v):
+        if attention_bias is None:
+            return F.scaled_dot_product_attention(q, k, v)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attention_bias)
+
     if query.shape[0] <= max_batch:
-        return F.scaled_dot_product_attention(query,key,value)
-    return torch.cat([F.scaled_dot_product_attention(query[i:i+max_batch],
-        key[i:i+max_batch],value[i:i+max_batch])
-        for i in range(0,query.shape[0],max_batch)],dim=0)
+        return attend(query, key, value)
+    return torch.cat([attend(query[i:i+max_batch], key[i:i+max_batch], value[i:i+max_batch])
+                      for i in range(0, query.shape[0], max_batch)], dim=0)
 
 
 def _lanczos_axis(value, output, axis, radius=3):
@@ -68,7 +72,7 @@ class ChannelNorm(nn.Module):
 
     def forward(self, x):
         variance, mean = torch.var_mean(x, dim=1, keepdim=True, unbiased=False)
-        return (x-mean)*torch.rsqrt(variance+1.e-6)*self.weight+self.bias
+        return (x-mean)*torch.rsqrt(variance+1.e-6)*self.weight.to(x)+self.bias.to(x)
 
 
 class NAFBlock25D(nn.Module):
@@ -83,13 +87,18 @@ class NAFBlock25D(nn.Module):
         self.ffn_out = nn.Conv3d(channels, channels, 1)
         self.beta = nn.Parameter(torch.zeros(1,channels,1,1,1))
         self.gamma = nn.Parameter(torch.zeros(1,channels,1,1,1))
+        self.cross_z = nn.Conv3d(channels, channels, (3,1,1), padding=(1,0,0),
+                                 groups=channels, bias=False)
+        nn.init.zeros_(self.cross_z.weight)
 
     def forward(self, x):
-        a,b = self.depthwise(self.expand(self.norm1(x))).chunk(2,1)
+        normalized = self.norm1(x)
+        a,b = self.depthwise(self.expand(normalized)).chunk(2,1)
         gate = a*b
-        hidden = x+self.beta*self.project(gate*self.attention(gate.mean((-2,-1),keepdim=True)))
+        hidden = x+self.cross_z(normalized)
+        hidden = hidden+self.beta.to(hidden)*self.project(gate*self.attention(gate.mean((-2,-1),keepdim=True)))
         a,b = self.ffn_in(self.norm2(hidden)).chunk(2,1)
-        return hidden+self.gamma*self.ffn_out(a*b)
+        return hidden+self.gamma.to(hidden)*self.ffn_out(a*b)
 
 
 class WindowAttention25D(nn.Module):
@@ -122,27 +131,41 @@ class WindowAttention25D(nn.Module):
         attended = self.projection(attended).reshape(b*z,hp//size,wp//size,size,size,c)
         attended = attended.permute(0,5,1,3,2,4).reshape(b*z,c,hp,wp)
         attended = attended[...,top:top+h,left:left+w].reshape(b,z,c,h,w).permute(0,2,1,3,4)
-        return x+self.scale*attended
+        return x+self.scale.to(attended)*attended
 
 
 class CrossSliceAttention(nn.Module):
     """Attention across Z at each spatial site, without Z resampling."""
-    def __init__(self, channels, heads=4):
+    def __init__(self, channels, heads=4, max_offset=16):
         super().__init__()
         self.heads = math.gcd(channels,heads)
         self.norm = nn.LayerNorm(channels)
         self.qkv = nn.Linear(channels,3*channels)
         self.projection = nn.Linear(channels,channels)
         self.scale = nn.Parameter(torch.tensor(.1))
+        self.max_offset = max_offset
+        self.relative_bias = nn.Parameter(torch.zeros(self.heads, 2*max_offset+1))
 
+    def _attention_bias(self, z, query):
+        positions = torch.arange(z, device=query.device)
+        offsets = positions[None, :] - positions[:, None]
+        indices = offsets.clamp(-self.max_offset, self.max_offset) + self.max_offset
+        bias = self.relative_bias[:, indices].to(query).unsqueeze(0)
+        # Fused CUDA SDPA accepts a broadcast bias whose rows have aligned strides.
+        return F.pad(bias, (0, (-z) % 8))[..., :z] if query.is_cuda else bias
+
+    # Inductor can re-layout the additive bias in the CUDA SDPA backward.
+    # Keep the bias construction and its fused attention kernel in eager mode.
+    @torch.compiler.disable
     def forward(self,x):
         b,c,z,h,w = x.shape
         tokens = x.permute(0,3,4,2,1).reshape(b*h*w,z,c)
         qkv = self.qkv(self.norm(tokens)).reshape(b*h*w,z,3,self.heads,c//self.heads)
         q,k,v = qkv.permute(2,0,3,1,4).unbind(0)
-        attended = batched_attention(q,k,v).transpose(1,2).reshape_as(tokens)
+        attended = batched_attention(q, k, v, attention_bias=self._attention_bias(z, q))
+        attended = attended.transpose(1,2).reshape_as(tokens)
         attended = self.projection(attended).reshape(b,h,w,z,c).permute(0,4,3,1,2)
-        return x+self.scale*attended
+        return x+self.scale.to(attended)*attended
 
 
 class HybridConditionEncoder(nn.Module):
@@ -190,8 +213,15 @@ class PixelRefinement(nn.Module):
         planes = F.gelu(F.pixel_shuffle(self.first(planes),2))
         planes = F.gelu(F.pixel_shuffle(self.second(planes),2))
         features = planes.reshape(b,z,-1,4*h,4*w).permute(0,2,1,3,4)
-        reference = base if deterministic_reference is None else deterministic_reference
-        hidden = self.merge(torch.cat((features,reference,base),1))
+        reference = reconstruction if deterministic_reference is None else deterministic_reference
+        sources = (features, reference.to(features), base.to(features))
+        if features.is_contiguous(memory_format=torch.channels_last_3d):
+            # Singleton image channels can cause cat to choose NCDHW even
+            # when PixelShuffle already produced channel-last features.
+            combined = torch.cat([value.movedim(1, -1) for value in sources], -1).movedim(-1, 1)
+        else:
+            combined = torch.cat(sources, 1)
+        hidden = self.merge(combined)
         return reconstruction+self.output(self.naf(hidden))
 
 
@@ -200,9 +230,10 @@ class HybridWaveletNAFNet25D(nn.Module):
     predict_target = "x1"
 
     def __init__(self, widths=(48,96,128), blocks=(2,2,4), window_size=8, heads=4,
-                 refine_width=16, sigma_bridge=.08, use_band_whitening=True,
-                 frequency_split=True, sampler_type="ode", solver="heun", temperature=.1,
-                 gradient_checkpointing=False, base_interpolation="bicubic"):
+                 refine_width=32, sigma_bridge=0., use_band_whitening=True,
+                 frequency_split=True, sampler_type="ode", solver="heun", temperature=0.,
+                 gradient_checkpointing="refinement_only", base_interpolation="bicubic",
+                 refinement_chunk=12):
         super().__init__()
         if (len(widths) != 3 or len(blocks) != 3 or min(widths) < 2 or min(blocks) < 1
                 or window_size < 1 or heads < 1 or refine_width < 2):
@@ -211,6 +242,10 @@ class HybridWaveletNAFNet25D(nn.Module):
             raise ValueError("Unknown base interpolation")
         if not math.isfinite(sigma_bridge) or sigma_bridge < 0:
             raise ValueError("Invalid bridge sigma")
+        if type(gradient_checkpointing) is not bool and gradient_checkpointing != "refinement_only":
+            raise ValueError('gradient_checkpointing must be a boolean or "refinement_only"')
+        if refinement_chunk is not None and (type(refinement_chunk) is not int or refinement_chunk < 1):
+            raise ValueError('refinement_chunk must be a positive batch size or None')
         self.codec = HaarXY()
         self.mode,self.readout,self.spatial = "haar_bridge","endpoint",None
         self.sigma_0 = 0.
@@ -219,11 +254,16 @@ class HybridWaveletNAFNet25D(nn.Module):
         self.sampler_type,self.solver,self.temperature = sampler_type,solver,temperature
         self.base_interpolation = base_interpolation
         self.gradient_checkpointing = gradient_checkpointing
+        self.refinement_chunk = refinement_chunk
+        self._legacy_refinement = False
+        self.register_buffer("legacy_refinement", torch.tensor(False))
         self.eb_tau = .1
         self.register_buffer("band_mean",torch.zeros(16))
         self.register_buffer("band_std",torch.ones(16))
-        self.register_buffer("band_stats_ready",torch.tensor(not use_band_whitening))
-        self.lr_encoder = HybridConditionEncoder(widths,blocks,heads,window_size,gradient_checkpointing)
+        self._band_stats_ready = not use_band_whitening
+        self.register_buffer("band_stats_ready",torch.tensor(self._band_stats_ready))
+        self.lr_encoder = HybridConditionEncoder(widths, blocks, heads, window_size,
+                                                  gradient_checkpointing is True)
         a,b,c = widths
         self.state = nn.Conv3d(16,a,(1,3,3),padding=(0,1,1))
         self.time = nn.Sequential(nn.Linear(4,a),nn.SiLU(),nn.Linear(a,a))
@@ -241,16 +281,33 @@ class HybridWaveletNAFNet25D(nn.Module):
         for head in (self.ll_head,self.endpoint,self.epsilon):
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
+        self.epsilon.requires_grad_(bool(self.sigma_bridge))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Historical v2 weights predate both cross-Z additions. Zero keeps their
+        # computation unchanged and retains the original LL-conditioned head.
+        added = {prefix+name: parameter for name, parameter in self.named_parameters()
+                 if ".cross_z." in name or name.endswith(".relative_bias")}
+        historical = not any(key in state_dict for key in added)
+        if historical:
+            state_dict.update({key: torch.zeros_like(parameter) for key, parameter in added.items()})
+        state_dict.setdefault(prefix+"legacy_refinement", self.legacy_refinement.new_tensor(historical))
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+        self._legacy_refinement = bool(self.legacy_refinement)
+        self._band_stats_ready = bool(self.band_stats_ready)
 
     def _run(self,layer,x):
         return (checkpoint(layer,x,use_reentrant=False)
-                if self.gradient_checkpointing and self.training and torch.is_grad_enabled() else layer(x))
+                if self.gradient_checkpointing is True and self.training and torch.is_grad_enabled() else layer(x))
 
-    def forward(self,state,condition,time,direction=0,bound=None):
+    def forward(self,state,condition,time,direction=0,bound=None,*,predict_noise=None,trusted_time=False):
         if state.ndim != 5 or state.shape[1] != 16:
             raise ValueError("Expected B16ZYX Haar bridge state")
         low,middle,deep = condition
-        t = batch_time(time,state)[:,None]
+        t = (torch.as_tensor(time, device=state.device, dtype=state.dtype).reshape(-1)
+             if trusted_time else batch_time(time,state))[:,None]
         embedding = self.time(torch.cat((t,t.square(),(math.pi*t).sin(),(math.pi*t).cos()),1))
         a = self._run(self.first,self.state(state)+low+embedding[:,:,None,None,None])
         b = self._run(self.second,self.down1(a)+middle)
@@ -261,7 +318,10 @@ class HybridWaveletNAFNet25D(nn.Module):
         # The LL head has no access to the state or time, including in SDE mode.
         ll = self.ll_head(low)
         clean = torch.cat((ll,self.endpoint(hidden)),1)
-        noise = torch.cat((torch.zeros_like(ll),self.epsilon(hidden)),1)
+        if predict_noise is None:
+            predict_noise = bool(self.sigma_bridge)
+        noise = (torch.cat((torch.zeros_like(ll), self.epsilon(hidden)), 1) if predict_noise
+                 else clean.new_zeros(()).expand_as(clean))
         return clean,noise
 
     def zero_state(self,lr,base):
@@ -282,15 +342,16 @@ class HybridWaveletNAFNet25D(nn.Module):
         self.band_mean.copy_(mean.flatten())
         self.band_std.copy_(std.flatten())
         self.band_stats_ready.fill_(True)
+        self._band_stats_ready = True
 
     def normalize_haar(self,value):
-        if not bool(self.band_stats_ready):
+        if not self._band_stats_ready:
             raise ValueError("TRAIN Haar statistics must be fitted before use")
         return ((value-self.band_mean[None,:,None,None,None])/(self.band_std[None,:,None,None,None]+1.e-6)
                 if self.use_band_whitening else value)
 
     def denormalize_haar(self,value):
-        if not bool(self.band_stats_ready):
+        if not self._band_stats_ready:
             raise ValueError("TRAIN Haar statistics must be fitted before use")
         return (value*(self.band_std[None,:,None,None,None]+1.e-6)+self.band_mean[None,:,None,None,None]
                 if self.use_band_whitening else value)
@@ -298,33 +359,42 @@ class HybridWaveletNAFNet25D(nn.Module):
     def decode_prediction(self,coefficients,base,condition):
         physical = self.denormalize_haar(coefficients)
         reconstruction = base+self.codec.decode(physical)
-        # The pixel head conditions on LR and deterministic LL, so its low-band
-        # correction cannot depend on stochastic HF. It still refines every HR pixel.
-        ll_reference = base+self.codec.decode(torch.cat((physical[:,:1],torch.zeros_like(physical[:,1:])),1))
-        # Checkpoint the HR head, the main memory hotspot for 7x256x256 patches.
-        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
-            refined = checkpoint(self.refinement,reconstruction,base,condition[0],ll_reference,use_reentrant=False)
-        else:
-            refined = self.refinement(reconstruction,base,condition[0],ll_reference)
-        return refined
+        ll_reference = None
+        if self.sigma_bridge or self._legacy_refinement:
+            # Every pixel in a 4x4 block receives one quarter of its LL value.
+            ll = physical[:, :1].repeat_interleave(4, -2).repeat_interleave(4, -1)
+            ll_reference = base+.25*ll
+        low = condition[0]
+        if not (self.gradient_checkpointing and self.training and torch.is_grad_enabled()):
+            return self.refinement(reconstruction, base, low, ll_reference)
+        # Each item is independent in the HR head. Separate checkpoints keep
+        # both activation creation and backward recomputation bounded by chunk.
+        chunk = self.refinement_chunk
+        if chunk is None or len(reconstruction) <= chunk:
+            return checkpoint(self.refinement, reconstruction, base, low, ll_reference, use_reentrant=False)
+        inputs = [value.split(chunk) for value in (reconstruction, base, low)]
+        inputs.append((None,)*len(inputs[0]) if ll_reference is None else ll_reference.split(chunk))
+        return torch.cat([checkpoint(self.refinement, *batch, use_reentrant=False)
+                          for batch in zip(*inputs, strict=True)])
 
     @torch.no_grad()
-    def restore(self,lr,base,steps=8,sigma=None,generator=None,atlas=None,noise_steps=None,
+    def restore(self,lr,base=None,steps=8,sigma=None,generator=None,atlas=None,noise_steps=None,
                 sampler_type=None,solver=None,initial_state=None):
         from .frequency_bridge import integrate_frequency_bridge
         base = self.prepare_base(lr)
         state = self.initial_state(lr,base,generator) if initial_state is None else initial_state
-        if state.shape != self.zero_state(lr,base).shape:
+        if state.shape != (len(lr), 16, *lr.shape[2:]):
             raise ValueError("Initial state shape differs from native LR grid")
         condition = self.lr_encoder(lr)
         if self.frequency_split:
-            curvature = (lambda x,t:atlas.curvature_drift(x,lr)) if atlas is not None else None
+            curvature = ((lambda x,t:atlas.curvature_drift(x,lr))
+                         if atlas is not None and self.sigma_bridge else None)
             shrink = (lambda x,t:atlas.inference_refine(x,lr,tau_eb=self.eb_tau)
                       if t >= getattr(self,'online_geometry_start',1.) else x) if atlas is not None else None
-            residual = integrate_frequency_bridge(lambda x,t:self(x,condition,t),state,steps,
+            residual = integrate_frequency_bridge(lambda x,t:self(x,condition,t,trusted_time=True),state,steps,
                 sigma_max=self.sigma_bridge,sampler_type=sampler_type or self.sampler_type,
                 solver=solver or self.solver,temperature=self.temperature,generator=generator,
                 noise_steps=noise_steps,curvature=curvature,shrink=shrink)
         else:
-            residual,_ = self(state,condition,0.)
+            residual,_ = self(state,condition,0.,trusted_time=True)
         return self.decode_prediction(residual,base,condition)
