@@ -18,18 +18,18 @@ receipt="reports/mri/${RUN_ID}_v2_jobs.tsv"
 (set -o noclobber; : > "$receipt")
 gate=$(mri_slurm_submit "" scripts/mri_v2_gate.sbatch)
 printf 'gate\t%s\n' "$gate" >> "$receipt"
-previous="$gate"
+val_jobs=()
 for V2_ARM in "${arms[@]}"; do
     export V2_ARM
-    train=$(mri_slurm_submit "$previous" scripts/mri_v2_train.sbatch)
+    train=$(mri_slurm_submit "$gate" scripts/mri_v2_train.sbatch)
     printf 'exp%s_train\t%s\n' "$V2_ARM" "$train" >> "$receipt"
     eval_job=$(mri_slurm_submit "$train" scripts/mri_v2_eval.sbatch)
     printf 'exp%s_val\t%s\n' "$V2_ARM" "$eval_job" >> "$receipt"
-    # Serialize arms so the study uses four A800s rather than sixteen at once.
-    previous="$eval_job"
+    val_jobs+=("$eval_job")
 done
 if [[ -n "$MRI_TEST_MANIFEST" ]]; then
-    test_job=$(mri_slurm_submit "$previous" scripts/mri_v2_test.sbatch)
+    val_dependencies=$(IFS=:; printf '%s' "${val_jobs[*]}")
+    test_job=$(mri_slurm_submit "$val_dependencies" scripts/mri_v2_test.sbatch)
     printf 'test15\t%s\n' "$test_job" >> "$receipt"
 fi
 cat "$receipt"

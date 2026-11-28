@@ -17,7 +17,8 @@ def scheduler(tmp_path):
     scripts = tmp_path/"scripts"
     scripts.mkdir()
     source = Path(__file__).resolve().parents[1]/"scripts"
-    for p in ("submit_mri_haar.sh","submit_mri_haar_study.sh","submit_mri_confirmation.sh","mri_slurm_dependencies.sh"):
+    for p in ("submit_mri_haar.sh", "submit_mri_haar_study.sh", "submit_mri_confirmation.sh",
+              "submit_mri_v2_ablation.sh", "mri_slurm_dependencies.sh"):
         shutil.copyfile(source/p, scripts/p)
         subprocess.run([bash,"-n",f"scripts/{p}"], cwd=tmp_path,check=True)
     db = tmp_path/"db"
@@ -106,6 +107,21 @@ def test_submission_filters_controller_and_accounting(scheduler):
     assert result.returncode == 0, result.stderr
     rows = (db/"submitted").read_text().splitlines()
     assert "afterok:107" in rows[-2] and "--dependency" not in rows[-1]
+
+
+def test_v2_training_arms_run_independently_after_gate(scheduler, tmp_path):
+    run, db = scheduler
+    (tmp_path / "manifest.json").touch()
+    result = run("bash scripts/submit_mri_v2_ablation.sh", RUN_ID="parallel", V2_ARMS="1 3",
+                 MRI_CASE_INVENTORY="inventory.json.gz", MRI_TEST_MANIFEST="manifest.json")
+    assert result.returncode == 0, result.stderr
+    submitted = (db / "submitted").read_text().splitlines()
+    assert len(submitted) == 6
+    assert "--dependency=afterok:601 " in submitted[1]
+    assert "--dependency=afterok:602 " in submitted[2]
+    assert "--dependency=afterok:601 " in submitted[3]
+    assert "--dependency=afterok:604 " in submitted[4]
+    assert "--dependency=afterok:603:605 " in submitted[5]
 
 
 def test_real_submitters_use_live_dependencies(scheduler,tmp_path):
